@@ -3,10 +3,10 @@ use crate::db_tree_view::get_icon_for_node_type;
 use db::{DbNode, DbNodeType, GlobalDbState, ObjectView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, WeakEntity, Window, div, px, uniform_list,
+    AnyElement, App, AppContext, AsyncApp, Context, DragMoveEvent, Empty, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ListSizingBehavior,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, px, uniform_list,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -31,6 +31,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const DB_OBJECTS_ROW_NUMBER_WIDTH: Pixels = px(48.0);
+const DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH: Pixels = px(6.0);
+const DB_OBJECTS_MIN_COLUMN_WIDTH: Pixels = px(64.0);
+
+#[derive(Clone)]
+struct DbObjectsResizeColumn {
+    entity_id: EntityId,
+    col_ix: usize,
+}
+
+impl Render for DbObjectsResizeColumn {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ColumnResizeState {
+    col_ix: usize,
+    start_x: Pixels,
+    start_width: Pixels,
+}
 
 fn format_timestamp(ts: i64) -> String {
     use chrono::{DateTime, Local};
@@ -135,6 +156,7 @@ pub struct DatabaseObjects {
     ddl_preview_loading: bool,
     ddl_preview_table_name: Option<String>,
     ddl_preview_request_seq: u64,
+    resizing_column: Option<ColumnResizeState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -237,6 +259,7 @@ impl DatabaseObjects {
             ddl_preview_loading: false,
             ddl_preview_table_name: None,
             ddl_preview_request_seq: 0,
+            resizing_column: None,
             _subscriptions: vec![search_sub],
         }
     }
@@ -756,12 +779,147 @@ impl DatabaseObjects {
         )
     }
 
+    fn begin_column_resize(&mut self, col_ix: usize, start_x: Pixels) {
+        let Some(column) = self.columns.get(col_ix) else {
+            return;
+        };
+        if !column.resizable {
+            return;
+        }
+
+        self.resizing_column = Some(ColumnResizeState {
+            col_ix,
+            start_x,
+            start_width: column.width,
+        });
+    }
+
+    fn resize_column(&mut self, col_ix: usize, pointer_x: Pixels, cx: &mut Context<Self>) {
+        let Some(resizing) = self.resizing_column else {
+            return;
+        };
+        if resizing.col_ix != col_ix {
+            return;
+        }
+
+        let Some(column) = self.columns.get_mut(col_ix) else {
+            return;
+        };
+
+        let min_width = column.min_width.max(DB_OBJECTS_MIN_COLUMN_WIDTH);
+        let mut next_width = resizing.start_width + pointer_x - resizing.start_x;
+        if next_width < min_width {
+            next_width = min_width;
+        }
+        if next_width > column.max_width {
+            next_width = column.max_width;
+        }
+
+        if column.width != next_width {
+            column.width = next_width;
+            cx.notify();
+        }
+    }
+
+    fn finish_column_resize(&mut self, cx: &mut Context<Self>) {
+        if self.resizing_column.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn drag_resize_column(
+        &mut self,
+        col_ix: usize,
+        event: &DragMoveEvent<DbObjectsResizeColumn>,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = event.drag(cx);
+        if drag.entity_id != cx.entity_id() || drag.col_ix != col_ix {
+            return;
+        }
+        self.resize_column(col_ix, event.event.position.x, cx);
+    }
+
+    fn render_column_resize_indicator(
+        &self,
+        group_id: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w(px(1.0))
+            .h_full()
+            .bg(cx.theme().table_row_border)
+            .group_hover(group_id, |this| this.bg(cx.theme().border))
+            .into_any_element()
+    }
+
+    fn render_column_resize_handle(
+        &self,
+        col_ix: usize,
+        column: &Column,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !column.resizable {
+            return div().into_any_element();
+        }
+
+        let group_id = SharedString::from(format!("database-object-column-resize-{col_ix}"));
+
+        h_flex()
+            .id(("database-object-column-resize", col_ix))
+            .group(group_id.clone())
+            .occlude()
+            .cursor_col_resize()
+            .h_full()
+            .w(DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH)
+            .ml(-(DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH))
+            .items_center()
+            .justify_center()
+            .child(self.render_column_resize_indicator(&group_id, cx))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.begin_column_resize(col_ix, event.position.x);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DbObjectsResizeColumn>, _window, cx| {
+                    this.drag_resize_column(col_ix, event, cx);
+                },
+            ))
+            .on_drag(
+                DbObjectsResizeColumn {
+                    entity_id: cx.entity_id(),
+                    col_ix,
+                },
+                |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                },
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.finish_column_resize(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.finish_column_resize(cx);
+                }),
+            )
+            .into_any_element()
+    }
+
     fn render_header(
         &self,
         columns: &[Column],
         show_row_number: bool,
-        cx: &App,
-    ) -> impl IntoElement {
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut header = h_flex()
             .h(px(32.))
             .px_2()
@@ -789,25 +947,33 @@ impl DatabaseObjects {
             );
         }
 
-        for column in columns {
+        for (col_ix, column) in columns.iter().enumerate() {
             header = header.child(
                 div()
                     .w(column.width)
                     .h_full()
-                    .px_2()
+                    .flex()
+                    .items_center()
                     .text_sm()
                     .text_color(cx.theme().table_head_foreground)
                     .child(
                         div()
-                            .size_full()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .px_2()
                             .flex()
                             .items_center()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
                             .child(column.name.clone()),
-                    ),
+                    )
+                    .child(self.render_column_resize_handle(col_ix, column, cx)),
             );
         }
 
-        header
+        header.into_any_element()
     }
 
     fn render_row(
@@ -1158,6 +1324,7 @@ impl Clone for DatabaseObjects {
             ddl_preview_loading: self.ddl_preview_loading,
             ddl_preview_table_name: self.ddl_preview_table_name.clone(),
             ddl_preview_request_seq: self.ddl_preview_request_seq,
+            resizing_column: self.resizing_column,
             _subscriptions: vec![],
         }
     }
