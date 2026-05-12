@@ -2,11 +2,11 @@ use std::{panic::Location, rc::Rc};
 
 use crate::{StyledExt, scroll::ScrollbarHandle};
 
-use super::{Scrollbar, ScrollbarAxis};
+use super::{ScrollableMask, Scrollbar, ScrollbarAxis};
 use gpui::{
-    App, Div, Element, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    ScrollHandle, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder,
+    App, Axis, Div, Element, ElementId, InteractiveElement, IntoElement, ParentElement,
+    RenderOnce, ScrollHandle, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
+    Window, div, prelude::FluentBuilder,
 };
 
 /// A trait for elements that can be made scrollable with scrollbars.
@@ -48,10 +48,24 @@ pub trait ScrollableElement: InteractiveElement + Styled + ParentElement + Eleme
         Scrollable::new(self, ScrollbarAxis::Horizontal)
     }
 
+    /// Almost equivalent to [`StatefulInteractiveElement::overflow_x_scroll`], but adds a
+    /// horizontal scrollbar and isolates horizontal wheel gestures from nested vertical scrollers.
+    #[track_caller]
+    fn overflow_x_scrollbar_masked(self) -> Scrollable<Self> {
+        Scrollable::new(self, ScrollbarAxis::Horizontal).with_mask(Axis::Horizontal)
+    }
+
     /// Almost equivalent to [`StatefulInteractiveElement::overflow_y_scroll`], but adds Vertical scrollbar.
     #[track_caller]
     fn overflow_y_scrollbar(self) -> Scrollable<Self> {
         Scrollable::new(self, ScrollbarAxis::Vertical)
+    }
+
+    /// Almost equivalent to [`StatefulInteractiveElement::overflow_y_scroll`], but adds a
+    /// vertical scrollbar and isolates vertical wheel gestures from nested horizontal scrollers.
+    #[track_caller]
+    fn overflow_y_scrollbar_masked(self) -> Scrollable<Self> {
+        Scrollable::new(self, ScrollbarAxis::Vertical).with_mask(Axis::Vertical)
     }
 }
 
@@ -61,6 +75,7 @@ pub struct Scrollable<E: InteractiveElement + Styled + ParentElement + Element> 
     id: ElementId,
     element: E,
     axis: ScrollbarAxis,
+    mask_axis: Option<Axis>,
 }
 
 impl<E> Scrollable<E>
@@ -74,7 +89,13 @@ where
             id: ElementId::CodeLocation(*caller),
             element,
             axis: axis.into(),
+            mask_axis: None,
         }
+    }
+
+    fn with_mask(mut self, axis: Axis) -> Self {
+        self.mask_axis = Some(axis);
+        self
     }
 }
 
@@ -124,7 +145,7 @@ where
             ..Default::default()
         };
 
-        div()
+        let mut container = div()
             .id(self.id)
             .size_full()
             .refine_style(&style)
@@ -146,14 +167,19 @@ where
                             .size_auto()
                             .flex_1(),
                     ),
-            )
-            .child(render_scrollbar(
-                "scrollbar",
-                &scroll_handle,
-                self.axis,
-                window,
-                cx,
-            ))
+            );
+
+        if let Some(axis) = self.mask_axis {
+            container = container.child(ScrollableMask::new(axis, &scroll_handle));
+        }
+
+        container.child(render_scrollbar(
+            "scrollbar",
+            &scroll_handle,
+            self.axis,
+            window,
+            cx,
+        ))
     }
 }
 

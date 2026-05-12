@@ -97,7 +97,14 @@ impl DatabaseTabView {
             connections: connections.clone(),
             active_connection_id: active_conn_id,
         };
-        let sidebar = cx.new(|cx| DatabaseSidebar::new(window, cx, selector_context.clone()));
+        let sidebar = cx.new(|cx| {
+            DatabaseSidebar::new(
+                window,
+                cx,
+                selector_context.clone(),
+                objects_panel.clone(),
+            )
+        });
 
         // 注册 SQL 代码块操作
         Self::register_sql_code_block_actions(&sidebar, tab_container.clone(), &connections, cx);

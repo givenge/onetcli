@@ -3,12 +3,16 @@
 //! 包含温度、历史记录数量等模型相关参数的配置。
 //! 可在不同的聊天面板中复用。
 
+use crate::llm::{ProviderConfig, ReasoningEffort};
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     ParentElement, Render, Styled, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, h_flex,
+    ActiveTheme, Icon, IconName, Sizable, Size,
+    button::Button,
+    button::ButtonVariants,
+    h_flex,
     input::{Input, InputEvent, InputState},
     slider::{Slider, SliderEvent, SliderState},
     v_flex,
@@ -31,6 +35,10 @@ pub struct ModelSettings {
     pub history_count: usize,
     /// 最大输出 token 数
     pub max_tokens: usize,
+    /// 上下文窗口大小（近似 token）
+    pub context_window_size: usize,
+    /// 推理强度
+    pub reasoning_effort: ReasoningEffort,
 }
 
 impl Default for ModelSettings {
@@ -39,6 +47,8 @@ impl Default for ModelSettings {
             temperature: 0.7,
             history_count: 10,
             max_tokens: 2000,
+            context_window_size: 32000,
+            reasoning_effort: ReasoningEffort::Medium,
         }
     }
 }
@@ -63,8 +73,36 @@ impl ModelSettings {
 
     /// 设置最大输出 token 数
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
-        self.max_tokens = max_tokens.clamp(100, 8000);
+        self.max_tokens = max_tokens.max(100);
         self
+    }
+
+    pub fn with_context_window_size(mut self, context_window_size: usize) -> Self {
+        self.context_window_size = context_window_size.max(1024);
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub fn from_provider_config(config: &ProviderConfig) -> Self {
+        Self {
+            temperature: config.temperature.unwrap_or(0.7),
+            history_count: config.history_count.unwrap_or(10).clamp(0, 50) as usize,
+            max_tokens: config.max_tokens.unwrap_or(2000).max(100) as usize,
+            context_window_size: config.context_window_size.unwrap_or(32_000).max(1024) as usize,
+            reasoning_effort: config.reasoning_effort.unwrap_or(ReasoningEffort::Medium),
+        }
+    }
+
+    pub fn apply_to_provider_config(&self, config: &mut ProviderConfig) {
+        config.temperature = Some(self.temperature);
+        config.max_tokens = Some(self.max_tokens as i32);
+        config.reasoning_effort = Some(self.reasoning_effort);
+        config.history_count = Some(self.history_count as i32);
+        config.context_window_size = Some(self.context_window_size as i32);
     }
 }
 
@@ -98,6 +136,8 @@ pub struct ModelSettingsPanel {
 
     // 最大 token 输入
     max_tokens_input: Entity<InputState>,
+    // 上下文窗口输入
+    context_window_input: Entity<InputState>,
 
     // 标签文本
     labels: ModelSettingsLabels,
@@ -113,6 +153,10 @@ pub struct ModelSettingsLabels {
     pub history_desc: String,
     pub max_tokens_label: String,
     pub max_tokens_desc: String,
+    pub context_window_label: String,
+    pub context_window_desc: String,
+    pub reasoning_effort_label: String,
+    pub reasoning_effort_desc: String,
     pub footer_notice: String,
 }
 
@@ -126,6 +170,10 @@ impl Default for ModelSettingsLabels {
             history_desc: t!("AiChat.history_desc").to_string(),
             max_tokens_label: t!("AiChat.max_tokens_label").to_string(),
             max_tokens_desc: t!("AiChat.max_tokens_desc").to_string(),
+            context_window_label: t!("AiChat.context_window_label").to_string(),
+            context_window_desc: t!("AiChat.context_window_desc").to_string(),
+            reasoning_effort_label: t!("AiChat.reasoning_effort_label").to_string(),
+            reasoning_effort_desc: t!("AiChat.reasoning_effort_desc").to_string(),
             footer_notice: t!("AiChat.settings_footer_notice").to_string(),
         }
     }
@@ -190,6 +238,10 @@ impl ModelSettingsPanel {
         let max_tokens_input =
             cx.new(|cx| InputState::new(window, cx).default_value(settings.max_tokens.to_string()));
 
+        let context_window_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.context_window_size.to_string())
+        });
+
         // 订阅最大 token 输入事件
         cx.subscribe_in(
             &max_tokens_input,
@@ -198,7 +250,22 @@ impl ModelSettingsPanel {
                 if let InputEvent::Change = event {
                     let text = input.read(cx).text().to_string();
                     if let Ok(tokens) = text.parse::<usize>() {
-                        this.settings.max_tokens = tokens.clamp(100, 8000);
+                        this.settings.max_tokens = tokens.max(100);
+                        this.emit_change(cx);
+                    }
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe_in(
+            &context_window_input,
+            window,
+            |this, input, event, _window, cx| {
+                if let InputEvent::Change = event {
+                    let text = input.read(cx).text().to_string();
+                    if let Ok(tokens) = text.parse::<usize>() {
+                        this.settings.context_window_size = tokens.max(1024);
                         this.emit_change(cx);
                     }
                 }
@@ -212,6 +279,7 @@ impl ModelSettingsPanel {
             temperature_slider,
             history_input,
             max_tokens_input,
+            context_window_input,
             labels,
         }
     }
@@ -245,11 +313,24 @@ impl ModelSettingsPanel {
             input.set_value(settings.max_tokens.to_string(), window, cx);
         });
 
+        self.context_window_input.update(cx, |input, cx| {
+            input.set_value(settings.context_window_size.to_string(), window, cx);
+        });
+
         cx.notify();
     }
 
     fn emit_change(&self, cx: &mut Context<Self>) {
         cx.emit(ModelSettingsEvent::Changed(self.settings.clone()));
+    }
+
+    fn set_reasoning_effort(&mut self, effort: ReasoningEffort, cx: &mut Context<Self>) {
+        if self.settings.reasoning_effort == effort {
+            return;
+        }
+        self.settings.reasoning_effort = effort;
+        self.emit_change(cx);
+        cx.notify();
     }
 
     fn render_setting_row(
@@ -360,7 +441,59 @@ impl Render for ModelSettingsPanel {
                     cx,
                 ),
             )
+            .child(
+                self.render_setting_row(
+                    &self.labels.context_window_label,
+                    &self.labels.context_window_desc,
+                    div()
+                        .w(px(96.0))
+                        .child(Input::new(&self.context_window_input).with_size(Size::Small)),
+                    cx,
+                ),
+            )
             // 最大 token 数
+            .child(self.render_setting_row(
+                &self.labels.reasoning_effort_label,
+                &self.labels.reasoning_effort_desc,
+                {
+                    let mut low_button = Button::new("reasoning-low")
+                        .label(t!("AiChat.reasoning_effort_low").to_string())
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_reasoning_effort(ReasoningEffort::Low, cx);
+                        }));
+                    if self.settings.reasoning_effort == ReasoningEffort::Low {
+                        low_button = low_button.primary();
+                    }
+
+                    let mut medium_button = Button::new("reasoning-medium")
+                        .label(t!("AiChat.reasoning_effort_medium").to_string())
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_reasoning_effort(ReasoningEffort::Medium, cx);
+                        }));
+                    if self.settings.reasoning_effort == ReasoningEffort::Medium {
+                        medium_button = medium_button.primary();
+                    }
+
+                    let mut high_button = Button::new("reasoning-high")
+                        .label(t!("AiChat.reasoning_effort_high").to_string())
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_reasoning_effort(ReasoningEffort::High, cx);
+                        }));
+                    if self.settings.reasoning_effort == ReasoningEffort::High {
+                        high_button = high_button.primary();
+                    }
+
+                    h_flex()
+                        .gap_1()
+                        .child(low_button)
+                        .child(medium_button)
+                        .child(high_button)
+                },
+                cx,
+            ))
             .child(
                 self.render_setting_row(
                     &self.labels.max_tokens_label,

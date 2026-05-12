@@ -11,6 +11,7 @@ use gpui::{
     Pixels, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, Window, div, prelude::FluentBuilder, px,
 };
+use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use smol::Timer;
@@ -336,6 +337,7 @@ impl Render for Notification {
                             .icon(IconName::Close)
                             .ghost()
                             .xsmall()
+                            .tooltip(t!("Dock.Close"))
                             .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))),
                     ),
             )

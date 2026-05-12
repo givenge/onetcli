@@ -291,6 +291,7 @@ impl SqlWorkflowAgent {
                 .map(|v| v as u32)
                 .or(Some(4096)),
             temperature: ctx.provider_config.temperature.or(Some(0.7)),
+            reasoning_effort: ctx.provider_config.reasoning_effort,
             stream: Some(true),
             ..Default::default()
         };

@@ -505,6 +505,7 @@ fn legacy_terminal_settings(settings: &AppSettings) -> TerminalSettings {
         confirm_high_risk_command: settings.terminal_confirm_high_risk_command,
         builtin_highlights_initialized: false,
         custom_highlights: Vec::new(),
+        ..TerminalSettings::default()
     }
 }
 

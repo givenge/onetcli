@@ -323,6 +323,9 @@ pub struct RenderCache {
 
     /// 左边缘列指纹（用于检测脏区漏报导致的首列残字）
     left_edge_fingerprint: Vec<u64>,
+
+    /// 可见整行指纹（用于检测脏区漏报导致的残留内容）
+    visible_line_fingerprint: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -372,6 +375,7 @@ impl RenderCache {
             custom_cursor: rgb(0xFFFFFF).into(),
             last_selection: None,
             left_edge_fingerprint: vec![0; num_lines],
+            visible_line_fingerprint: vec![0; num_lines],
         }
     }
 
@@ -491,9 +495,9 @@ impl RenderCache {
             }
         }
 
-        // 首列兜底：检测左边缘变化但未被 damage 标记的行。
-        let edge_changed_lines = self.detect_left_edge_changed_lines(term, 4);
-        for line in &edge_changed_lines {
+        // 整行兜底：检测可见行变化但未被 damage 标记的行。
+        let changed_lines = self.detect_visible_line_changed_lines(term);
+        for line in &changed_lines {
             dirty_lines.insert(*line);
         }
 
@@ -518,6 +522,7 @@ impl RenderCache {
             },
         );
         self.left_edge_fingerprint.resize(num_lines, 0);
+        self.visible_line_fingerprint.resize(num_lines, 0);
     }
 
     fn rebuild_all_and_update_state(&mut self, term: &Term<GpuiEventProxy>) {
@@ -753,7 +758,6 @@ impl RenderCache {
             let code = cell.c as u32 as u64;
             let col = cell.point.column.0 as u64;
             let flags = cell.flags.bits() as u64;
-            // 仅用于变化检测，不追求密码学强度
             let piece = col.wrapping_shl(56) ^ code.wrapping_shl(24) ^ flags;
             current[line_idx] = current[line_idx]
                 .wrapping_mul(1099511628211)
@@ -761,6 +765,56 @@ impl RenderCache {
         }
 
         current
+    }
+
+    /// 计算并同步可见整行指纹，返回发生变化的行。
+    ///
+    /// 目的：在某些复杂 ANSI 序列下，`TermDamage::Partial` 可能未覆盖整行重绘、
+    /// 光标回退覆盖等场景。整行指纹用于兜底发现“内容已变但未标脏”的可见行，
+    /// 避免 `top` / `htop` / `watch` 这类交互式程序留下旧帧。
+    fn detect_visible_line_changed_lines(&mut self, term: &Term<GpuiEventProxy>) -> Vec<usize> {
+        if self.num_lines == 0 {
+            return Vec::new();
+        }
+
+        let mut current = vec![0_u64; self.num_lines];
+        let content = term.renderable_content();
+        let display_offset = content.display_offset;
+
+        for cell in content.display_iter {
+            let screen_line = cell.point.line.0 + display_offset as i32;
+            if screen_line < 0 || screen_line as usize >= self.num_lines {
+                continue;
+            }
+
+            let line_idx = screen_line as usize;
+            let code = cell.c as u32 as u64;
+            let col = cell.point.column.0 as u64;
+            let flags = cell.flags.bits() as u64;
+            let piece = col.wrapping_shl(56) ^ code.wrapping_shl(24) ^ flags;
+            current[line_idx] = current[line_idx]
+                .wrapping_mul(1099511628211)
+                .wrapping_add(piece.wrapping_add(1469598103934665603));
+        }
+
+        if self.visible_line_fingerprint.len() != self.num_lines {
+            self.visible_line_fingerprint.resize(self.num_lines, 0);
+        }
+
+        let mut changed = Vec::new();
+        for (line_idx, (old, new)) in self
+            .visible_line_fingerprint
+            .iter()
+            .zip(current.iter())
+            .enumerate()
+        {
+            if old != new {
+                changed.push(line_idx);
+            }
+        }
+
+        self.visible_line_fingerprint = current;
+        changed
     }
 
     fn build_line_cache(&mut self, line_idx: usize, mut cells: Vec<CellData>) {
@@ -1519,6 +1573,12 @@ fn indexed_color_to_hsla(idx: u8) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::{BlockRect, block_element_geometry};
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use tokio::sync::mpsc::unbounded_channel;
+    use terminal::pty_backend::GpuiEventProxy;
+    use terminal::TerminalEvent;
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
@@ -1623,5 +1683,53 @@ mod tests {
             assert_eq!(rects.len(), 1);
             assert_rect(&rects[0], 0.0, 1.0 - fraction, 1.0, fraction);
         }
+    }
+
+    struct TestDimensions;
+
+    impl Dimensions for TestDimensions {
+        fn total_lines(&self) -> usize {
+            24
+        }
+
+        fn screen_lines(&self) -> usize {
+            24
+        }
+
+        fn columns(&self) -> usize {
+            80
+        }
+    }
+
+    fn line_text(cache: &RenderCache, line: usize) -> String {
+        cache.lines[line]
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn visible_line_fingerprint_rebuilds_when_change_happens_beyond_prefix() {
+        let (event_tx, _event_rx) = unbounded_channel::<TerminalEvent>();
+        let event_proxy = GpuiEventProxy::new(event_tx);
+        let mut term = Term::new(TermConfig::default(), &TestDimensions, event_proxy);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        let addon_manager = AddonManager::new();
+        let theme = TerminalTheme::midnight();
+        let mut cache =
+            RenderCache::new(term.screen_lines(), term.columns(), term.colors().clone());
+
+        processor.advance(&mut term, b"abcd1111");
+        cache.update(&mut term, &addon_manager, &theme);
+        term.reset_damage();
+        assert_eq!(line_text(&cache, 0), "abcd1111");
+
+        processor.advance(&mut term, b"\rabcd2222");
+        term.reset_damage();
+
+        cache.update(&mut term, &addon_manager, &theme);
+
+        assert_eq!(line_text(&cache, 0), "abcd2222");
     }
 }

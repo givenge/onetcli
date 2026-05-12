@@ -1,6 +1,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod addon;
+mod ai_context;
 pub mod cd_completion;
 pub mod highlight_presets;
 pub mod history_prompt;

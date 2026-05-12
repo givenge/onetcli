@@ -27,7 +27,8 @@ pub use crate::agent::{
 pub use crate::ai_chat::{
     AiChatColors, AiChatPanel, AiChatPanelEvent, ChatMessageUI, ChatMessageUIGeneric, ChatRole,
     CodeBlockAction, CodeBlockActionBuilder, CodeBlockActionCallback, CodeBlockActionRegistry,
-    LanguageMatcher, MessageExtension, MessageVariant, NoExtension, ProviderItem,
+    ExternalAgentRequest, LanguageMatcher, MessageExtension, MessageVariant, NoExtension,
+    ProviderItem,
 };
 pub use crate::ai_chat::{
     ChatEngine, ChatMessageRenderer, ChatStreamProcessor, CoreStreamEvent, StreamError,

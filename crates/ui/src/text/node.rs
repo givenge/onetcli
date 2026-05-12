@@ -512,7 +512,9 @@ impl CodeBlock {
         span: Option<impl Into<Span>>,
     ) -> Self {
         let mut styles = vec![];
-        if let Some(lang) = &lang {
+        if code.is_ascii()
+            && let Some(lang) = &lang
+        {
             let mut highlighter = SyntaxHighlighter::new(&lang);
             highlighter.update(None, &Rope::from_str(code.as_str()), None);
             styles = highlighter.styles(&(0..code.len()), highlight_theme);
@@ -548,39 +550,85 @@ impl CodeBlock {
     ) -> AnyElement {
         let style = &node_cx.style;
         let has_actions = node_cx.code_block_actions.is_some();
+        let code = self.code();
+        let longest_line = code
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let content_width = ((longest_line.max(40) as f32) * 8.0 + 32.0).min(2400.0);
+        let scroll_id: ElementId = ("codeblock-scroll", options.ix).into();
+        let scroll_handle = window
+            .use_keyed_state(scroll_id.clone(), cx, |_, _| ScrollHandle::default())
+            .read(cx)
+            .clone();
 
         div()
             .when(!options.is_last, |this| this.pb(style.paragraph_gap))
             .child(
-                div()
-                    .id(("codeblock", options.ix))
-                    .p_3()
-                    // 当有按钮时，给顶部添加额外的边距避免遮挡内容
-                    .when(has_actions, |this| this.pt_8())
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().muted)
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(cx.theme().mono_font_size)
-                    .relative()
-                    .refine_style(&style.code_block)
-                    .child(Inline::new(
-                        "code",
-                        self.state.clone(),
-                        vec![],
-                        self.styles.clone(),
-                    ))
-                    .when_some(node_cx.code_block_actions.clone(), |this, actions| {
-                        this.child(
-                            div()
-                                .id("actions")
-                                .absolute()
-                                .top_2()
-                                .right_2()
-                                .bg(cx.theme().muted)
-                                .rounded(cx.theme().radius)
-                                .child(actions(&self, window, cx)),
-                        )
-                    }),
+                v_flex()
+                    .w_full()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .child(
+                                div()
+                                    .id(("codeblock-scroll-area", options.ix))
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .track_scroll(&scroll_handle)
+                                    .child(
+                                        div()
+                                            .id(("codeblock", options.ix))
+                                            .w(px(content_width))
+                                            .min_w_full()
+                                            .p_3()
+                                            .when(has_actions, |this| this.pt_8())
+                                            .rounded_t(cx.theme().radius)
+                                            .bg(cx.theme().muted)
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(cx.theme().mono_font_size)
+                                            .relative()
+                                            .refine_style(&style.code_block)
+                                            .child(Inline::new(
+                                                "code",
+                                                self.state.clone(),
+                                                vec![],
+                                                self.styles.clone(),
+                                            ))
+                                            .when_some(
+                                                node_cx.code_block_actions.clone(),
+                                                |this, actions| {
+                                                    this.child(
+                                                        div()
+                                                            .id("actions")
+                                                            .absolute()
+                                                            .top_2()
+                                                            .right_2()
+                                                            .bg(cx.theme().muted)
+                                                            .rounded(cx.theme().radius)
+                                                            .child(actions(&self, window, cx)),
+                                                    )
+                                                },
+                                            ),
+                                    ),
+                            )
+                            .child(ScrollableMask::new(Axis::Horizontal, &scroll_handle)),
+                    )
+                    .child(
+                        div()
+                            .id(scroll_id.clone())
+                            .w_full()
+                            .h(px(12.))
+                            .border_1()
+                            .border_t_0()
+                            .border_color(cx.theme().border)
+                            .rounded_b(cx.theme().radius)
+                            .overflow_hidden()
+                            .child(Scrollbar::horizontal(&scroll_handle).id(scroll_id)),
+                    ),
             )
             .into_any_element()
     }
@@ -1095,11 +1143,12 @@ impl BlockNode {
                                 div()
                                     .id(("table", options.ix))
                                     .w_full()
-                                    .overflow_hidden()
+                                    .overflow_x_scroll()
                                     .track_scroll(&scroll_handle)
                                     .child(
                                         div()
                                             .w(px(total_width))
+                                            .min_w_full()
                                             .border_1()
                                             .border_color(cx.theme().border)
                                             .rounded_t(cx.theme().radius)
@@ -1165,7 +1214,6 @@ impl BlockNode {
                                                                                         )
                                                                                 },
                                                                             )
-                                                                            .truncate()
                                                                             .child(
                                                                                 cell.children.render(
                                                                                     node_cx,

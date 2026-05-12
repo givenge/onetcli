@@ -528,6 +528,7 @@ fn render_inspector(
                         .icon(IconName::Close)
                         .small()
                         .ghost()
+                        .tooltip("关闭检查器")
                         .on_click(|_, window, cx| {
                             window.dispatch_action(Box::new(ToggleInspector), cx);
                         }),

@@ -93,6 +93,8 @@ impl AgentContext {
 pub enum AgentEvent {
     /// Progress indicator (e.g. "Analyzing query...").
     Progress(String),
+    /// Incremental thinking/reasoning content.
+    ThinkingDelta(String),
     /// Incremental text content.
     TextDelta(String),
     /// Agent finished successfully.

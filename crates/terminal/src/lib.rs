@@ -11,4 +11,6 @@ pub use pty_backend::{GpuiEventProxy, TerminalEvent};
 pub use serial_backend::SerialBackend;
 pub use ssh_backend::SshBackend;
 pub use terminal::TerminalScrollProxy;
-pub use types::{LocalConfig, TerminalBackend, TerminalSize};
+pub use types::{
+    ensure_utf8_locale_env, preferred_utf8_locale, LocalConfig, TerminalBackend, TerminalSize,
+};

@@ -47,7 +47,10 @@ use crate::pty_backend::{GpuiEventProxy, LocalPtyBackend};
 #[cfg(not(target_os = "windows"))]
 use crate::shell_integration::embedded_shell_integration_script;
 
-use crate::{LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalEvent, TerminalSize};
+use crate::{
+    ensure_utf8_locale_env, LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalEvent,
+    TerminalSize,
+};
 use ssh::{
     ChannelEvent, KeyboardInteractiveRequest, KeyboardInteractiveResponder,
     KeyboardInteractiveTarget, SshChannel, SshSessionManager,
@@ -77,6 +80,8 @@ pub enum TerminalModelEvent {
     ClipboardStore(String),
     /// 远程工作目录变更（OSC 7）
     WorkingDirChanged(String),
+    /// shell 命令执行完成（OSC 133;D）
+    CommandFinished(i32),
 }
 
 /// 终端连接状态
@@ -802,6 +807,7 @@ impl Terminal {
         // 合并用户环境变量与 Shell Integration 环境变量
         let mut env_pairs = env;
         env_pairs.extend(integration_env);
+        ensure_utf8_locale_env(&mut env_pairs);
 
         let pty_options = PtyOptions {
             shell: build_local_shell(shell, shell_args),
@@ -1448,6 +1454,7 @@ impl Terminal {
                 if let Some(last) = self.session_history.back_mut() {
                     last.exit_code = Some(exit_code);
                 }
+                cx.emit(TerminalModelEvent::CommandFinished(exit_code));
             }
             TerminalEvent::CommandRecorded(command) => {
                 self.record_history_entry(&command, cx);
@@ -1490,6 +1497,25 @@ impl Terminal {
     /// 获取当前工作目录（由 OSC 7 更新，仅 SSH 终端）
     pub fn current_working_dir(&self) -> Option<&str> {
         self.current_working_dir.as_deref()
+    }
+
+    pub fn recent_output(&self, max_lines: usize) -> String {
+        let max_lines = max_lines.max(1);
+        let term = self.term.lock();
+        let history_size = term.history_size() as i32;
+        let screen_lines = term.screen_lines() as i32;
+        let start_line = (-history_size).max(screen_lines - max_lines as i32);
+        let grid = term.grid();
+
+        (start_line..screen_lines)
+            .map(|line_index| {
+                let line = &grid[Line(line_index)];
+                let text: String = line[..].iter().map(|cell| cell.c).collect();
+                text.trim_end_matches(|c: char| c == ' ' || c == '\0')
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn history_suggestions(&self, prefix: &str, limit: usize) -> Vec<String> {

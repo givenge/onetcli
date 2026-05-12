@@ -53,6 +53,7 @@
 
 pub mod ask_ai;
 pub mod components;
+pub mod context_window;
 pub mod engine;
 mod panel;
 pub mod rendering;
@@ -82,4 +83,5 @@ pub use stream::{ChatStreamProcessor, StreamError, StreamEvent as CoreStreamEven
 pub use components::{ModelItem, ProviderItem};
 
 // 导出服务层
+pub use context_window::trim_messages_to_context_window;
 pub use services::{SessionError, SessionService, extract_session_name};

@@ -5,13 +5,14 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, MouseDownEvent,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    WeakEntity, Window, div, px, uniform_list,
+    ParentElement, Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, WeakEntity, Window, div, px, uniform_list,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
 use gpui_component::notification::Notification;
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     ActiveTheme, Icon, IconName, Sizable, Size, h_flex, table::Column, tooltip::Tooltip, v_flex,
 };
@@ -28,6 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
+
+const DB_OBJECTS_ROW_NUMBER_WIDTH: Pixels = px(48.0);
 
 fn format_timestamp(ts: i64) -> String {
     use chrono::{DateTime, Local};
@@ -128,10 +131,26 @@ pub struct DatabaseObjects {
     search_debouncer: Arc<Debouncer>,
     current_node: Option<DbNode>,
     selected_indices: HashSet<usize>,
+    ddl_preview_content: SharedString,
+    ddl_preview_loading: bool,
+    ddl_preview_table_name: Option<String>,
+    ddl_preview_request_seq: u64,
     _subscriptions: Vec<Subscription>,
 }
 
 impl DatabaseObjects {
+    fn stop_vertical_scroll_bubble(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        if delta.y != Pixels::ZERO && delta.y.abs() >= delta.x.abs() {
+            cx.stop_propagation();
+        }
+    }
+
     pub fn new(workspace: Option<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let loaded_data = cx.new(|_| ObjectView::default());
         let focus_handle = cx.focus_handle();
@@ -182,7 +201,7 @@ impl DatabaseObjects {
             if let Some(view) = result {
                 let columns = view.columns.clone();
                 let rows = view.rows.clone();
-                let db_node_type = view.db_node_type.clone();
+                let db_node_type = view.db_node_type;
                 entity
                     .update(cx, move |this, cx| {
                         this.loaded_data.update(cx, |data, _cx| {
@@ -214,6 +233,10 @@ impl DatabaseObjects {
             search_debouncer,
             current_node: None,
             selected_indices: HashSet::new(),
+            ddl_preview_content: SharedString::new_static(""),
+            ddl_preview_loading: false,
+            ddl_preview_table_name: None,
+            ddl_preview_request_seq: 0,
             _subscriptions: vec![search_sub],
         }
     }
@@ -259,6 +282,7 @@ impl DatabaseObjects {
 
         self.current_node = Some(node.clone());
         self.selected_indices.clear();
+        self.clear_ddl_preview(cx);
         let node_clone = node.clone();
         let storage_manager = cx.global::<GlobalStorageState>().storage.clone();
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -283,7 +307,7 @@ impl DatabaseObjects {
             if let Some(view) = result {
                 let columns = view.columns.clone();
                 let rows = view.rows.clone();
-                let db_node_type = view.db_node_type.clone();
+                let db_node_type = view.db_node_type;
                 entity
                     .update(cx, move |this, cx| {
                         let search_query = this.search_query.clone();
@@ -318,6 +342,98 @@ impl DatabaseObjects {
             self.selected_indices.clear();
             self.selected_indices.insert(row_ix);
         }
+    }
+
+    fn clear_ddl_preview(&mut self, cx: &mut Context<Self>) {
+        self.ddl_preview_loading = false;
+        self.ddl_preview_table_name = None;
+        self.ddl_preview_request_seq = self.ddl_preview_request_seq.saturating_add(1);
+        self.ddl_preview_content = SharedString::new_static("");
+        cx.notify();
+    }
+
+    fn set_ddl_preview_content(
+        &mut self,
+        table_name: Option<String>,
+        content: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ddl_preview_table_name = table_name;
+        self.ddl_preview_content = content.into().into();
+        cx.notify();
+    }
+
+    fn refresh_ddl_preview_for_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selected_indices.len() != 1 {
+            self.clear_ddl_preview(cx);
+            return;
+        }
+
+        let Some(row_ix) = self.selected_indices.iter().next().copied() else {
+            self.clear_ddl_preview(cx);
+            return;
+        };
+        let Some(node) = self.build_node_for_row(row_ix) else {
+            self.clear_ddl_preview(cx);
+            return;
+        };
+        if node.node_type != DbNodeType::Table {
+            self.clear_ddl_preview(cx);
+            return;
+        }
+
+        let Some(database) = node.get_database_name() else {
+            self.clear_ddl_preview(cx);
+            return;
+        };
+        let Some(table) = node.get_table_name() else {
+            self.clear_ddl_preview(cx);
+            return;
+        };
+
+        self.ddl_preview_request_seq = self.ddl_preview_request_seq.saturating_add(1);
+        let request_seq = self.ddl_preview_request_seq;
+        let schema = node.get_schema_name();
+        let connection_id = node.connection_id.clone();
+        let table_name = table.clone();
+        let global_state = cx.global::<GlobalDbState>().clone();
+        self.ddl_preview_loading = true;
+        self.ddl_preview_table_name = Some(table_name.clone());
+        self.ddl_preview_content = "Loading DDL...".into();
+
+        cx.spawn(async move |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = global_state
+                .export_table_create_sql(cx, connection_id, database, schema, table)
+                .await;
+
+            let _ = entity.update(cx, |this, cx| {
+                if this.ddl_preview_request_seq != request_seq {
+                    return;
+                }
+                this.ddl_preview_loading = false;
+                match result {
+                    Ok(ddl) if !ddl.trim().is_empty() => {
+                        this.set_ddl_preview_content(Some(table_name), ddl, cx);
+                    }
+                    Ok(_) => {
+                        this.set_ddl_preview_content(
+                            Some(table_name),
+                            "DDL preview is not available for this table.",
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.set_ddl_preview_content(
+                            Some(table_name),
+                            format!("Failed to load DDL:\n{err}"),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn apply_filter(&mut self) {
@@ -463,7 +579,7 @@ impl DatabaseObjects {
     }
 
     fn build_node_for_row(&self, row_ix: usize) -> Option<DbNode> {
-        let db_node_type = self.db_node_type.clone();
+        let db_node_type = self.db_node_type;
 
         let original_row = self.filtered_rows.get(row_ix).copied()?;
         let row_data = self.rows.get(original_row)?;
@@ -658,7 +774,7 @@ impl DatabaseObjects {
         if show_row_number {
             header = header.child(
                 div()
-                    .w(px(48.))
+                    .w(DB_OBJECTS_ROW_NUMBER_WIDTH)
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().table_head_foreground)
@@ -673,13 +789,10 @@ impl DatabaseObjects {
             );
         }
 
-        let is_last_column = columns.len();
-        for (col_ix, column) in columns.iter().enumerate() {
-            let is_last = col_ix == is_last_column - 1;
+        for column in columns {
             header = header.child(
                 div()
-                    .when(!is_last, |el| el.w(column.width))
-                    .when(is_last, |el| el.flex_1())
+                    .w(column.width)
                     .h_full()
                     .px_2()
                     .text_sm()
@@ -717,7 +830,7 @@ impl DatabaseObjects {
         if show_row_number {
             row = row.child(
                 div()
-                    .w(px(48.))
+                    .w(DB_OBJECTS_ROW_NUMBER_WIDTH)
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
@@ -725,7 +838,6 @@ impl DatabaseObjects {
             );
         }
 
-        let is_last_column = columns.len();
         for (col_ix, column) in columns.iter().enumerate() {
             let cell_value = row_values.get(col_ix).cloned().unwrap_or_default();
             let tooltip_text = cell_value.clone();
@@ -746,14 +858,11 @@ impl DatabaseObjects {
                 div().child(cell_value).into_any_element()
             };
 
-            // 最后一列使用 flex_1 自动填充剩余空间，其他列使用固定宽度
-            let is_last = col_ix == is_last_column - 1;
             let cell_id = SharedString::from(format!("cell-{}-{}", row_ix, col_ix));
             row = row.child(
                 div()
                     .id(cell_id)
-                    .when(!is_last, |el| el.w(column.width))
-                    .when(is_last, |el| el.flex_1())
+                    .w(column.width)
                     .px_2()
                     .overflow_hidden()
                     .text_ellipsis()
@@ -780,7 +889,7 @@ impl DatabaseObjects {
         let data_db_node_type = self.db_node_type;
         let node_type = current_node
             .as_ref()
-            .map(|n| n.node_type.clone())
+            .map(|n| n.node_type)
             .unwrap_or(DbNodeType::Connection);
         let database_type = current_node
             .as_ref()
@@ -873,6 +982,18 @@ impl DatabaseObjects {
 
         buttons
     }
+
+    fn table_content_width(&self, columns: &[Column], show_row_number: bool) -> Pixels {
+        let row_number_width = if show_row_number {
+            DB_OBJECTS_ROW_NUMBER_WIDTH
+        } else {
+            px(0.0)
+        };
+        let columns_width = columns
+            .iter()
+            .fold(px(0.0), |acc, column| acc + column.width);
+        row_number_width + columns_width + px(16.0)
+    }
 }
 
 impl Render for DatabaseObjects {
@@ -887,6 +1008,7 @@ impl Render for DatabaseObjects {
         let header = self.render_header(&columns, show_row_number, cx);
         let list_columns = columns.clone();
         let list_search_query = search_query.clone();
+        let table_width = self.table_content_width(&columns, show_row_number);
 
         v_flex()
             .size_full()
@@ -900,9 +1022,8 @@ impl Render for DatabaseObjects {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .children(toolbar_buttons)
-                    .child(div().flex_1())
                     .child({
-                        div().flex_1().child(
+                        div().flex_1().min_w(px(220.0)).child(
                             Input::new(&self.search_input)
                                 .prefix(
                                     Icon::new(IconName::Search)
@@ -916,76 +1037,102 @@ impl Render for DatabaseObjects {
                     .into_any_element(),
             )
             .child(
-                v_flex().size_full().gap_2().child(header).child(
-                    div().flex_1().overflow_hidden().child(
-                        uniform_list("database-objects-list", row_count, {
-                            cx.processor(
-                                move |state: &mut Self, range: Range<usize>, _window, cx| {
-                                    let db_node_type = state.db_node_type.clone();
-                                    let show_row_number = true;
-                                    range
-                                        .map(|list_ix| {
-                                            let Some(original_row) =
-                                                state.filtered_rows.get(list_ix).copied()
-                                            else {
-                                                return div().id(list_ix).into_any_element();
-                                            };
-                                            let Some(row_values) = state.rows.get(original_row)
-                                            else {
-                                                return div().id(list_ix).into_any_element();
-                                            };
+                div()
+                    .size_full()
+                    .overflow_x_scrollbar_masked()
+                    .child(
+                        v_flex()
+                            .w(table_width)
+                            .min_w(table_width)
+                            .h_full()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .child(header)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_y_scrollbar()
+                                    .on_scroll_wheel(cx.listener(Self::stop_vertical_scroll_bubble))
+                                    .child(
+                                        uniform_list("database-objects-list", row_count, {
+                                            cx.processor(
+                                                move |state: &mut Self,
+                                                      range: Range<usize>,
+                                                      _window,
+                                                      cx| {
+                                                    let db_node_type = state.db_node_type;
+                                                    let show_row_number = true;
+                                                    range
+                                                        .map(|list_ix| {
+                                                            let Some(original_row) = state
+                                                                .filtered_rows
+                                                                .get(list_ix)
+                                                                .copied()
+                                                            else {
+                                                                return div()
+                                                                    .id(list_ix)
+                                                                    .into_any_element();
+                                                            };
+                                                            let Some(row_values) =
+                                                                state.rows.get(original_row)
+                                                            else {
+                                                                return div()
+                                                                    .id(list_ix)
+                                                                    .into_any_element();
+                                                            };
 
-                                            let is_selected =
-                                                state.selected_indices.contains(&list_ix);
-                                            let row_ix = list_ix;
-                                            div()
-                                                    .id(list_ix)
-                                                    .cursor_pointer()
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(
-                                                            move |this,
-                                                                  event: &MouseDownEvent,
-                                                                  _window,
-                                                                  cx| {
-                                                                let multi_select =
-                                                                    event.modifiers.secondary();
-                                                                this.toggle_selection(
+                                                            let is_selected = state
+                                                                .selected_indices
+                                                                .contains(&list_ix);
+                                                            let row_ix = list_ix;
+                                                            div()
+                                                                .id(list_ix)
+                                                                .cursor_pointer()
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this,
+                                                                              event: &MouseDownEvent,
+                                                                              _window,
+                                                                              cx| {
+                                                                            let multi_select =
+                                                                                event.modifiers.secondary();
+                                                                            this.toggle_selection(
+                                                                                row_ix,
+                                                                                multi_select,
+                                                                            );
+                                                                            this.refresh_ddl_preview_for_selection(cx);
+                                                                            cx.notify();
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .on_double_click(cx.listener(
+                                                                    move |this, _, _window, cx| {
+                                                                        this.handle_row_double_click(row_ix, cx);
+                                                                    },
+                                                                ))
+                                                                .child(state.render_row(
                                                                     row_ix,
-                                                                    multi_select,
-                                                                );
-                                                                cx.notify();
-                                                            },
-                                                        ),
-                                                    )
-                                                    .on_double_click(cx.listener(
-                                                        move |this, _, _window, cx| {
-                                                            this.handle_row_double_click(
-                                                                row_ix, cx,
-                                                            );
-                                                        },
-                                                    ))
-                                                    .child(state.render_row(
-                                                        row_ix,
-                                                        row_values,
-                                                        &list_columns,
-                                                        show_row_number,
-                                                        is_selected,
-                                                        &list_search_query,
-                                                        db_node_type.clone(),
-                                                        cx,
-                                                    ))
-                                                    .into_any_element()
+                                                                    row_values,
+                                                                    &list_columns,
+                                                                    show_row_number,
+                                                                    is_selected,
+                                                                    &list_search_query,
+                                                                    db_node_type,
+                                                                    cx,
+                                                                ))
+                                                                .into_any_element()
+                                                        })
+                                                        .collect()
+                                                },
+                                            )
                                         })
-                                        .collect()
-                                },
-                            )
-                        })
-                        .flex_grow()
-                        .size_full()
-                        .with_sizing_behavior(ListSizingBehavior::Auto),
+                                        .flex_grow()
+                                        .size_full()
+                                        .with_sizing_behavior(ListSizingBehavior::Auto),
+                                    ),
+                            ),
                     ),
-                ),
             )
             .child(div().p_2().text_sm().child(title))
     }
@@ -998,7 +1145,7 @@ impl Clone for DatabaseObjects {
             columns: self.columns.clone(),
             rows: self.rows.clone(),
             filtered_rows: self.filtered_rows.clone(),
-            db_node_type: self.db_node_type.clone(),
+            db_node_type: self.db_node_type,
             focus_handle: self.focus_handle.clone(),
             workspace: self.workspace.clone(),
             search_input: self.search_input.clone(),
@@ -1007,12 +1154,30 @@ impl Clone for DatabaseObjects {
             search_debouncer: self.search_debouncer.clone(),
             current_node: self.current_node.clone(),
             selected_indices: self.selected_indices.clone(),
+            ddl_preview_content: self.ddl_preview_content.clone(),
+            ddl_preview_loading: self.ddl_preview_loading,
+            ddl_preview_table_name: self.ddl_preview_table_name.clone(),
+            ddl_preview_request_seq: self.ddl_preview_request_seq,
             _subscriptions: vec![],
         }
     }
 }
 
 impl EventEmitter<DatabaseObjectsEvent> for DatabaseObjects {}
+
+impl DatabaseObjects {
+    pub fn ddl_preview_content(&self) -> &SharedString {
+        &self.ddl_preview_content
+    }
+
+    pub fn ddl_preview_table_name(&self) -> Option<&str> {
+        self.ddl_preview_table_name.as_deref()
+    }
+
+    pub fn ddl_preview_loading(&self) -> bool {
+        self.ddl_preview_loading
+    }
+}
 
 impl Focusable for DatabaseObjects {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1027,7 +1192,6 @@ pub struct DatabaseObjectsPanel {
 impl DatabaseObjectsPanel {
     pub fn new(workspace: Option<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let database_objects = cx.new(|cx| DatabaseObjects::new(workspace, window, cx));
-
         Self { database_objects }
     }
 

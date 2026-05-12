@@ -2,6 +2,7 @@ use anyhow::Result;
 use gpui::{App, SharedString};
 use rusqlite::params;
 
+use crate::llm::ReasoningEffort;
 use crate::llm::chat_history::{MessageRepository, SessionRepository};
 use crate::storage::connection::SqliteConnection;
 use crate::storage::row_mapping::FromSqliteRow;
@@ -9,6 +10,24 @@ use crate::storage::traits::{Entity, Repository};
 use crate::storage::{GlobalStorageState, now};
 
 use super::types::{ProviderConfig, ProviderType};
+
+fn serialize_reasoning_effort(effort: Option<ReasoningEffort>) -> Option<&'static str> {
+    match effort {
+        Some(ReasoningEffort::Low) => Some("low"),
+        Some(ReasoningEffort::Medium) => Some("medium"),
+        Some(ReasoningEffort::High) => Some("high"),
+        None => None,
+    }
+}
+
+fn deserialize_reasoning_effort(value: Option<&str>) -> Option<ReasoningEffort> {
+    match value {
+        Some("low") => Some(ReasoningEffort::Low),
+        Some("medium") => Some(ReasoningEffort::Medium),
+        Some("high") => Some(ReasoningEffort::High),
+        _ => None,
+    }
+}
 
 struct ProviderConfigRow {
     id: i64,
@@ -21,6 +40,9 @@ struct ProviderConfigRow {
     models: Option<String>,
     max_tokens: Option<i32>,
     temperature: Option<f64>,
+    reasoning_effort: Option<String>,
+    history_count: Option<i32>,
+    context_window_size: Option<i32>,
     enabled: i32,
     is_default: i32,
     created_at: i64,
@@ -40,6 +62,9 @@ impl FromSqliteRow for ProviderConfigRow {
             models: row.get("models")?,
             max_tokens: row.get("max_tokens")?,
             temperature: row.get("temperature")?,
+            reasoning_effort: row.get("reasoning_effort")?,
+            history_count: row.get("history_count")?,
+            context_window_size: row.get("context_window_size")?,
             enabled: row.get("enabled")?,
             is_default: row.get("is_default")?,
             created_at: row.get("created_at")?,
@@ -77,6 +102,9 @@ impl TryFrom<ProviderConfigRow> for ProviderConfig {
             models,
             max_tokens: row.max_tokens,
             temperature: row.temperature.map(|t| t as f32),
+            reasoning_effort: deserialize_reasoning_effort(row.reasoning_effort.as_deref()),
+            history_count: row.history_count,
+            context_window_size: row.context_window_size,
             enabled: row.enabled != 0,
             is_default: row.is_default != 0,
             created_at: row.created_at,
@@ -128,6 +156,9 @@ impl ProviderRepository {
             models: Vec::new(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
+            history_count: None,
+            context_window_size: None,
             enabled: true,
             is_default: !has_default,
             created_at: now,
@@ -176,6 +207,9 @@ impl Repository for ProviderRepository {
         let models_json = serde_json::to_string(&models).unwrap_or_else(|_| "[]".to_string());
         let max_tokens = item.max_tokens;
         let temperature = item.temperature.map(|t| t as f64);
+        let reasoning_effort = serialize_reasoning_effort(item.reasoning_effort);
+        let history_count = item.history_count;
+        let context_window_size = item.context_window_size;
         let enabled = if item.enabled { 1i32 } else { 0i32 };
         let is_default = if item.is_default { 1i32 } else { 0i32 };
         let created_at = item.created_at;
@@ -183,9 +217,9 @@ impl Repository for ProviderRepository {
 
         self.conn.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO llm_providers (id, name, provider_type, api_key, api_base, api_version, model, models, max_tokens, temperature, enabled, is_default, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![id, name, provider_type, api_key, api_base, api_version, model, models_json, max_tokens, temperature, enabled, is_default, created_at, updated_at],
+                "INSERT INTO llm_providers (id, name, provider_type, api_key, api_base, api_version, model, models, max_tokens, temperature, reasoning_effort, history_count, context_window_size, enabled, is_default, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![id, name, provider_type, api_key, api_base, api_version, model, models_json, max_tokens, temperature, reasoning_effort, history_count, context_window_size, enabled, is_default, created_at, updated_at],
             )?;
             Ok(())
         })?;
@@ -209,14 +243,17 @@ impl Repository for ProviderRepository {
         let models_json = serde_json::to_string(&models).unwrap_or_else(|_| "[]".to_string());
         let max_tokens = item.max_tokens;
         let temperature = item.temperature.map(|t| t as f64);
+        let reasoning_effort = serialize_reasoning_effort(item.reasoning_effort);
+        let history_count = item.history_count;
+        let context_window_size = item.context_window_size;
         let enabled = if item.enabled { 1i32 } else { 0i32 };
         let is_default = if item.is_default { 1i32 } else { 0i32 };
         let updated_at = now();
 
         self.conn.with_connection(|conn| {
             conn.execute(
-                "UPDATE llm_providers SET name = ?1, provider_type = ?2, api_key = ?3, api_base = ?4, api_version = ?5, model = ?6, models = ?7, max_tokens = ?8, temperature = ?9, enabled = ?10, is_default = ?11, updated_at = ?12 WHERE id = ?13",
-                params![name, provider_type, api_key, api_base, api_version, model, models_json, max_tokens, temperature, enabled, is_default, updated_at, id],
+                "UPDATE llm_providers SET name = ?1, provider_type = ?2, api_key = ?3, api_base = ?4, api_version = ?5, model = ?6, models = ?7, max_tokens = ?8, temperature = ?9, reasoning_effort = ?10, history_count = ?11, context_window_size = ?12, enabled = ?13, is_default = ?14, updated_at = ?15 WHERE id = ?16",
+                params![name, provider_type, api_key, api_base, api_version, model, models_json, max_tokens, temperature, reasoning_effort, history_count, context_window_size, enabled, is_default, updated_at, id],
             )?;
             Ok(())
         })
@@ -232,7 +269,7 @@ impl Repository for ProviderRepository {
     fn get(&self, id: i64) -> Result<Option<Self::Entity>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, provider_type, api_key, api_base, api_version, model, models, max_tokens, temperature, enabled, is_default, created_at, updated_at FROM llm_providers WHERE id = ?1",
+                "SELECT id, name, provider_type, api_key, api_base, api_version, model, models, max_tokens, temperature, reasoning_effort, history_count, context_window_size, enabled, is_default, created_at, updated_at FROM llm_providers WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
@@ -247,7 +284,7 @@ impl Repository for ProviderRepository {
     fn list(&self) -> Result<Vec<Self::Entity>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, provider_type, api_key, api_base, api_version, model, models, max_tokens, temperature, enabled, is_default, created_at, updated_at FROM llm_providers ORDER BY created_at DESC",
+                "SELECT id, name, provider_type, api_key, api_base, api_version, model, models, max_tokens, temperature, reasoning_effort, history_count, context_window_size, enabled, is_default, created_at, updated_at FROM llm_providers ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map([], |row| ProviderConfigRow::from_row(row))?;
             let mut results = Vec::new();

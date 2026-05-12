@@ -28,6 +28,7 @@ use gpui::{
 use gpui_component::button::ButtonVariants;
 use gpui_component::{
     ActiveTheme, Icon, IconName, Sizable, Size, WindowExt as _,
+    avatar::Avatar,
     button::Button,
     chart::{BarChart, LineChart, PieChart},
     clipboard::Clipboard,
@@ -46,7 +47,7 @@ use one_core::cloud_sync::GlobalCloudUser;
 use one_core::gpui_tokio::Tokio;
 use one_core::llm::{
     Message, ProviderConfig, Role,
-    chat_history::{ChatSession, MessageRepository},
+    chat_history::{ChatSession, ChatSessionKind, MessageRepository},
     manager::GlobalProviderState,
     storage::ProviderRepository,
 };
@@ -64,6 +65,7 @@ use one_core::ai_chat::components::{
     SessionListHost,
 };
 use one_core::ai_chat::services::{SessionService, extract_session_name};
+use one_core::ai_chat::trim_messages_to_context_window;
 
 // ============================================================================
 // 事件定义
@@ -125,6 +127,42 @@ pub struct ChatPanel {
 }
 
 impl ChatPanel {
+    fn persist_provider_config(
+        &mut self,
+        provider_id: i64,
+        update: impl FnOnce(&mut ProviderConfig),
+    ) {
+        let repo = match self.storage_manager.get::<ProviderRepository>() {
+            Some(repo) => repo,
+            None => return,
+        };
+        let Ok(Some(mut config)) = repo.get(provider_id) else {
+            return;
+        };
+        update(&mut config);
+        let _ = repo.update(&config);
+    }
+
+    fn load_model_settings_for_provider(
+        &mut self,
+        provider_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repo = match self.storage_manager.get::<ProviderRepository>() {
+            Some(repo) => repo,
+            None => return,
+        };
+        let Ok(Some(config)) = repo.get(provider_id) else {
+            return;
+        };
+        let settings = ModelSettings::from_provider_config(&config);
+        self.model_settings = settings.clone();
+        self.ai_input.update(cx, |input, cx| {
+            input.set_model_settings(settings, window, cx)
+        });
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_with_options(window, cx, true, DbSelectorContext::default())
     }
@@ -165,9 +203,21 @@ impl ChatPanel {
                     }
                     AIInputEvent::ProviderChanged { provider_id } => {
                         this.provider_id = Some(provider_id.clone());
+                        if let Ok(provider_id) = provider_id.parse::<i64>() {
+                            this.load_model_settings_for_provider(provider_id, window, cx);
+                        }
                     }
                     AIInputEvent::ModelChanged { model } => {
                         this.selected_model = Some(model.clone());
+                        if let Some(provider_id) = this
+                            .provider_id
+                            .as_deref()
+                            .and_then(|value| value.parse::<i64>().ok())
+                        {
+                            this.persist_provider_config(provider_id, |config| {
+                                config.model = model.clone();
+                            });
+                        }
                     }
                     AIInputEvent::ExecuteSql {
                         sql,
@@ -189,7 +239,15 @@ impl ChatPanel {
                     }
                     AIInputEvent::SettingsChanged { settings } => {
                         this.model_settings = settings.clone();
-                        cx.notify();
+                        if let Some(provider_id) = this
+                            .provider_id
+                            .as_deref()
+                            .and_then(|value| value.parse::<i64>().ok())
+                        {
+                            this.persist_provider_config(provider_id, |config| {
+                                settings.apply_to_provider_config(config);
+                            });
+                        }
                     }
                     AIInputEvent::Cancel => {
                         this.cancel_current_operation(window, cx);
@@ -287,6 +345,13 @@ impl ChatPanel {
         self.ai_input.update(cx, |input, cx| {
             input.update_providers(items, window, cx);
         });
+        if let Some(provider_id) = self
+            .provider_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            self.load_model_settings_for_provider(provider_id, window, cx);
+        }
     }
 
     // ========================================================================
@@ -334,7 +399,7 @@ impl ChatPanel {
         let session_service = self.session_service.clone();
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let sessions = match session_service.list_sessions() {
+            let sessions = match session_service.list_sessions(ChatSessionKind::Sql) {
                 Ok(s) => s,
                 Err(_) => return,
             };
@@ -492,6 +557,8 @@ impl ChatPanel {
                             .map(|msg| {
                                 let role = match msg.role.as_str() {
                                     "assistant" => ChatRole::Assistant,
+                                    "system" => ChatRole::System,
+                                    "tool" => ChatRole::Assistant,
                                     _ => ChatRole::User,
                                 };
                                 ChatMessageUI::from_history(
@@ -564,6 +631,7 @@ impl ChatPanel {
             model: self.selected_model.clone().unwrap_or(base.model),
             max_tokens: Some(self.model_settings.max_tokens as i32),
             temperature: Some(self.model_settings.temperature),
+            reasoning_effort: Some(self.model_settings.reasoning_effort),
             ..base
         }
     }
@@ -664,6 +732,7 @@ impl ChatPanel {
 
         // 根据设置限制历史记录数量
         let history_count = self.model_settings.history_count;
+        let context_window_size = self.model_settings.context_window_size;
         let history: Vec<Message> = if history_count > 0 && !self.chat_history.is_empty() {
             let history_start = self.chat_history.len().saturating_sub(history_count);
             self.chat_history
@@ -674,6 +743,7 @@ impl ChatPanel {
         } else {
             self.chat_history.clone()
         };
+        let history = trim_messages_to_context_window(history, context_window_size);
 
         let ai_input = self.ai_input.clone();
         let session_id = self.session_id;
@@ -726,6 +796,7 @@ impl ChatPanel {
                 session_id,
                 &provider_id_str_clone,
                 t!("ChatPanel.sql_session_name").as_ref(),
+                ChatSessionKind::Sql,
             ) {
                 Ok(id) => {
                     if session_id.is_none() {
@@ -813,6 +884,8 @@ impl ChatPanel {
 
             // 处理 Agent 事件
             let mut full_content = String::new();
+            let mut full_thinking = String::new();
+            let thinking_msg_id = format!("{assistant_msg_id}-thinking");
             while let Some(event) = rx.recv().await {
                 match event {
                     AgentEvent::Progress(stage) => {
@@ -859,6 +932,32 @@ impl ChatPanel {
                             });
                         }
                     }
+                    AgentEvent::ThinkingDelta(delta) => {
+                        full_thinking.push_str(&delta);
+                        if let Some(entity) = this.upgrade() {
+                            let content_clone = full_thinking.clone();
+                            let msg_id = thinking_msg_id.clone();
+                            let _ = cx.update(|cx| {
+                                entity.update(cx, |panel, cx| {
+                                    if let Some(msg) =
+                                        panel.messages.iter_mut().find(|m| m.id == msg_id)
+                                    {
+                                        msg.is_streaming = true;
+                                        msg.variant = MessageVariant::Thinking;
+                                        msg.content = content_clone;
+                                    } else {
+                                        panel.messages.push(
+                                            ChatMessageUI::streaming_thinking()
+                                                .with_id(msg_id)
+                                                .with_content(content_clone),
+                                        );
+                                    }
+                                    panel.scroll_to_bottom_and_mark();
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    }
                     AgentEvent::Completed(result) => {
                         if let Some(entity) = this.upgrade() {
                             let final_content = if full_content.is_empty() {
@@ -871,6 +970,14 @@ impl ChatPanel {
                                 if let Some(window_id) = cx.active_window() {
                                     let _ = cx.update_window(window_id, |_, window, cx| {
                                         entity.update(cx, |content, cx| {
+                                            if let Some(msg) = content
+                                                .messages
+                                                .iter_mut()
+                                                .find(|m| m.id == thinking_msg_id)
+                                            {
+                                                msg.is_streaming = false;
+                                                msg.variant = MessageVariant::Thinking;
+                                            }
                                             if let Some(msg) =
                                                 content.messages.iter_mut().find(|m| m.id == msg_id)
                                             {
@@ -914,6 +1021,14 @@ impl ChatPanel {
                                 if let Some(window_id) = cx.active_window() {
                                     let _ = cx.update_window(window_id, |_, window, cx| {
                                         entity.update(cx, |content, cx| {
+                                            if let Some(msg) = content
+                                                .messages
+                                                .iter_mut()
+                                                .find(|m| m.id == thinking_msg_id)
+                                            {
+                                                msg.is_streaming = false;
+                                                msg.variant = MessageVariant::Thinking;
+                                            }
                                             if let Some(msg) =
                                                 content.messages.iter_mut().find(|m| m.id == msg_id)
                                             {
@@ -945,6 +1060,14 @@ impl ChatPanel {
                                 if let Some(window_id) = cx.active_window() {
                                     let _ = cx.update_window(window_id, |_, window, cx| {
                                         entity.update(cx, |content, cx| {
+                                            if let Some(msg) = content
+                                                .messages
+                                                .iter_mut()
+                                                .find(|m| m.id == thinking_msg_id)
+                                            {
+                                                msg.is_streaming = false;
+                                                msg.variant = MessageVariant::Thinking;
+                                            }
                                             if let Some(msg) =
                                                 content.messages.iter_mut().find(|m| m.id == msg_id)
                                             {
@@ -1372,6 +1495,7 @@ impl ChatPanel {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .p_4()
+                    .pr(px(28.0))
                     .pb_8()
                     .child(
                         v_flex()
@@ -1589,6 +1713,7 @@ impl ChatPanel {
                             .icon(IconName::Close)
                             .ghost()
                             .small()
+                            .tooltip("关闭面板")
                             .on_click(cx.listener(|_this, _event, _window, cx| {
                                 cx.emit(ChatPanelEvent::Close);
                             })),
@@ -1603,41 +1728,21 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match msg.role {
-            ChatRole::User => div()
-                .w_full()
-                .px_3()
-                .py_2()
-                .bg(cx.theme().accent)
-                .text_color(cx.theme().accent_foreground)
-                .rounded_lg()
-                .child(
-                    TextView::markdown(
-                        SharedString::from(format!("user-msg-{}", msg.id)),
-                        msg.content.clone(),
-                    )
-                    .selectable(true),
-                )
-                .into_any_element(),
+            ChatRole::User => one_core::ChatMessageRenderer::render_user_message(msg, cx),
             ChatRole::Assistant => match &msg.variant {
                 MessageVariant::Status { title, is_done } => {
                     self.render_status_message(&msg.id, title, *is_done, panel, cx)
                 }
+                MessageVariant::Thinking => {
+                    one_core::ChatMessageRenderer::render_thinking_message(msg, cx)
+                }
+                MessageVariant::ToolHistory { title } => {
+                    one_core::ChatMessageRenderer::render_tool_history_message(msg, title, cx)
+                }
                 MessageVariant::Text => self.render_assistant_message(msg, panel, cx),
                 MessageVariant::SqlResult => self.render_sql_result(&msg.id, cx),
             },
-            ChatRole::System => {
-                // 系统消息渲染为居中的灰色文本
-                h_flex()
-                    .w_full()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(msg.content.clone()),
-                    )
-                    .into_any_element()
-            }
+            ChatRole::System => one_core::ChatMessageRenderer::render_system_message(msg, cx),
         }
     }
 
@@ -1667,6 +1772,7 @@ impl ChatPanel {
             .justify_between()
             .gap_2()
             .py_1()
+            .px_10() // 为助手头像留出空间
             .child(
                 h_flex()
                     .gap_2()
@@ -1682,7 +1788,7 @@ impl ChatPanel {
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(title.to_string()),
                     ),
@@ -1741,104 +1847,115 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if msg.is_streaming && msg.content.is_empty() {
-            return div()
-                .w_full()
-                .py_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t!("ChatPanel.thinking")),
-                )
-                .into_any_element();
+            return one_core::ChatMessageRenderer::render_thinking(cx);
         }
 
         let panel_for_actions = panel.clone();
         let panel_for_render = panel.clone();
         let message_id = msg.id.clone();
 
-        div()
+        h_flex()
             .w_full()
+            .items_start()
+            .gap_2()
             .child(
-                div().w_full().p_3().child(
-                    TextView::markdown(
-                        SharedString::from(format!("ai-sql-msg-{}", msg.id)),
-                        msg.content.clone(),
-                    )
-                    .selectable(true)
-                    .code_block_actions({
-                        let message_id = message_id.clone();
-                        move |code_block, _window, _cx| {
-                            let block = SqlCodeBlock::from_code_block(code_block, 0);
-                            let is_sql = block.is_sql;
-                            let code = code_block.code();
-
-                            h_flex()
-                                .gap_1()
-                                .child(Clipboard::new("copy").value(code.clone()))
-                                .when(is_sql, {
-                                    let panel = panel_for_actions.clone();
-                                    let message_id = message_id.clone();
-                                    let block_for_action = block.clone();
-                                    move |this| {
-                                        this.child(
-                                            Button::new("run-sql")
-                                                .icon(IconName::SquareTerminal)
-                                                .ghost()
-                                                .xsmall()
-                                                .tooltip(t!("ChatSqlBlock.run").to_string())
-                                                .on_click({
-                                                    let panel = panel.clone();
-                                                    let message_id = message_id.clone();
-                                                    let block_for_action = block_for_action.clone();
-                                                    move |_, window, cx| {
-                                                        panel.update(cx, |p, cx| {
-                                                            p.run_sql_block_with_guard(
-                                                                &message_id,
-                                                                &block_for_action,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                }),
-                                        )
-                                    }
-                                })
-                                .into_any_element()
-                        }
-                    })
-                    .code_block_renderer({
-                        let message_id = message_id.clone();
-                        let panel_for_collapse = panel_for_render.clone();
-                        move |code_block, options, default_element, _window, cx| {
-                            if let Some(chart_block) = parse_chart_json_block(
-                                &code_block.code(),
-                                code_block.lang().as_deref().map(|v| &**v),
-                            ) {
-                                let content = panel_for_collapse.read(cx);
-                                return content.render_chart_block_container(
-                                    &chart_block,
-                                    default_element,
-                                    cx,
-                                );
-                            }
-
-                            let block = SqlCodeBlock::from_code_block(code_block, options.index);
-                            if !block.is_sql {
-                                return default_element;
-                            }
-
-                            let content = panel_for_collapse.read(cx);
-                            content.render_sql_block_container(
-                                &message_id,
-                                &block,
-                                default_element,
-                                &panel_for_collapse,
-                                cx,
+                Avatar::new()
+                    .placeholder(Icon::new(IconName::AI))
+                    .with_size(Size::Small)
+                    .bg(cx.theme().primary.opacity(0.1))
+                    .text_color(cx.theme().primary),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    div()
+                        .max_w(px(980.0))
+                        .bg(cx.theme().muted.opacity(0.3))
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.5))
+                        .rounded_lg()
+                        .child(
+                            TextView::markdown(
+                                SharedString::from(format!("ai-sql-msg-{}", msg.id)),
+                                msg.content.clone(),
                             )
-                        }
-                    }),
+                            .p_3()
+                            .selectable(true)
+                            .code_block_actions({
+                                let message_id = message_id.clone();
+                                move |code_block, _window, _cx| {
+                                    let block = SqlCodeBlock::from_code_block(code_block, 0);
+                                    let is_sql = block.is_sql;
+                                    let code = code_block.code();
+
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Clipboard::new("copy").value(code.clone()))
+                                        .when(is_sql, {
+                                            let panel = panel_for_actions.clone();
+                                            let message_id = message_id.clone();
+                                            let block_for_action = block.clone();
+                                            move |this| {
+                                                this.child(
+                                                    Button::new("run-sql")
+                                                        .icon(IconName::SquareTerminal)
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .tooltip(t!("ChatSqlBlock.run").to_string())
+                                                        .on_click({
+                                                            let panel = panel.clone();
+                                                            let message_id = message_id.clone();
+                                                            let block_for_action =
+                                                                block_for_action.clone();
+                                                            move |_, window, cx| {
+                                                                panel.update(cx, |p, cx| {
+                                                                    p.run_sql_block_with_guard(
+                                                                        &message_id,
+                                                                        &block_for_action,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
+                                                        }),
+                                                )
+                                            }
+                                        })
+                                        .into_any_element()
+                                }
+                            })
+                            .code_block_renderer({
+                                let message_id = message_id.clone();
+                                let panel_for_collapse = panel_for_render.clone();
+                                move |code_block, options, default_element, _window, cx| {
+                                    if let Some(chart_block) = parse_chart_json_block(
+                                        &code_block.code(),
+                                        code_block.lang().as_deref().map(|v| &**v),
+                                    ) {
+                                        let content = panel_for_collapse.read(cx);
+                                        return content.render_chart_block_container(
+                                            &chart_block,
+                                            default_element,
+                                            cx,
+                                        );
+                                    }
+
+                                    let block =
+                                        SqlCodeBlock::from_code_block(code_block, options.index);
+                                    if !block.is_sql {
+                                        return default_element;
+                                    }
+
+                                    let content = panel_for_collapse.read(cx);
+                                    content.render_sql_block_container(
+                                        &message_id,
+                                        &block,
+                                        default_element,
+                                        &panel_for_collapse,
+                                        cx,
+                                    )
+                                }
+                            }),
+                        ),
                 ),
             )
             .into_any_element()
@@ -2033,15 +2150,37 @@ impl ChatPanel {
             .into_any_element()
     }
 
-    fn render_sql_result(&self, msg_id: &str, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_sql_result(&self, msg_id: &str, cx: &mut Context<Self>) -> AnyElement {
         if let Some(result_view) = self.sql_result_views.get(msg_id) {
-            div().w_full().child(result_view.clone()).into_any_element()
-        } else {
-            div()
+            h_flex()
                 .w_full()
-                .text_sm()
-                .child(t!("ChatMessageList.loading"))
+                .items_start()
+                .gap_2()
+                .child(
+                    Avatar::new()
+                        .placeholder(Icon::new(IconName::AI))
+                        .with_size(Size::Small)
+                        .bg(cx.theme().primary.opacity(0.1))
+                        .text_color(cx.theme().primary),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().max_w(px(980.0)).child(result_view.clone())),
+                )
                 .into_any_element()
+        } else {
+            one_core::ChatMessageRenderer::render_assistant_shell(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("ChatMessageList.loading"))
+                    .into_any_element(),
+                cx,
+            )
         }
     }
 

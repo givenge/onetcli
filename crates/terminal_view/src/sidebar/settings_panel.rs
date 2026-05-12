@@ -629,6 +629,7 @@ impl SettingsPanel {
                     .icon(IconName::Close)
                     .ghost()
                     .xsmall()
+                    .tooltip(t!("Dock.Close"))
                     .on_click(cx.listener(|_this, _, _, cx| {
                         cx.emit(SettingsPanelEvent::Close);
                     })),

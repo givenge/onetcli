@@ -203,6 +203,34 @@ Please help me analyze this error and provide a solution."
     en: "Maximum number of tokens in the output."
     zh-CN: "模型输出的最大 token 数"
     zh-HK: "模型輸出的最大 token 數"
+  context_window_label:
+    en: "Context window"
+    zh-CN: "上下文窗口"
+    zh-HK: "上下文窗口"
+  context_window_desc:
+    en: "Approximate input token budget for chat history."
+    zh-CN: "历史上下文的近似输入 token 预算"
+    zh-HK: "歷史上下文的近似輸入 token 預算"
+  reasoning_effort_label:
+    en: "Reasoning"
+    zh-CN: "推理强度"
+    zh-HK: "推理強度"
+  reasoning_effort_desc:
+    en: "Controls how much deliberate reasoning the model uses."
+    zh-CN: "控制模型使用多强的推理深度"
+    zh-HK: "控制模型使用多強的推理深度"
+  reasoning_effort_low:
+    en: "Low"
+    zh-CN: "低"
+    zh-HK: "低"
+  reasoning_effort_medium:
+    en: "Medium"
+    zh-CN: "中"
+    zh-HK: "中"
+  reasoning_effort_high:
+    en: "High"
+    zh-CN: "高"
+    zh-HK: "高"
   settings_footer_notice:
     en: "Settings take effect immediately."
     zh-CN: "设置将立即生效"

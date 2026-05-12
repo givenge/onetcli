@@ -591,6 +591,9 @@ pub struct StoredConnection {
     pub name: String,
     pub connection_type: ConnectionType,
     pub params: String,
+    /// 同工作区内的卡片排序，越小越靠前
+    #[serde(default)]
+    pub sort_order: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<i64>,
     /// 已选中的数据库ID列表（JSON数组），None表示全选
@@ -688,6 +691,7 @@ impl StoredConnection {
             name,
             connection_type: ConnectionType::Database,
             params: serde_json::to_string(&params).expect("DbConnectionConfig 序列化不应失败"),
+            sort_order: 0,
             workspace_id,
             selected_databases: if let Some(database) = &params.database {
                 Some(format!("[\"{}\"]", database))
@@ -711,6 +715,7 @@ impl StoredConnection {
             name,
             connection_type: ConnectionType::SshSftp,
             params: serde_json::to_string(&params).expect("SshParams 序列化不应失败"),
+            sort_order: 0,
             workspace_id,
             selected_databases: None,
             remark: None,
@@ -730,6 +735,7 @@ impl StoredConnection {
             name,
             connection_type: ConnectionType::Redis,
             params: serde_json::to_string(&params).expect("RedisParams 序列化不应失败"),
+            sort_order: 0,
             workspace_id,
             selected_databases: None,
             remark: None,
@@ -749,6 +755,7 @@ impl StoredConnection {
             name,
             connection_type: ConnectionType::MongoDB,
             params: serde_json::to_string(&params).expect("MongoDBParams 序列化不应失败"),
+            sort_order: 0,
             workspace_id,
             selected_databases: None,
             remark: None,
@@ -780,6 +787,7 @@ impl StoredConnection {
             name,
             connection_type: ConnectionType::Serial,
             params: serde_json::to_string(&params).expect("SerialParams 序列化不应失败"),
+            sort_order: 0,
             workspace_id,
             selected_databases: None,
             remark: None,

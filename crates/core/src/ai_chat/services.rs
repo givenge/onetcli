@@ -3,7 +3,9 @@
 //! 提供 AI 聊天面板共用的服务功能：
 //! - SessionService: 会话持久化服务
 
-use crate::llm::chat_history::{ChatMessage, ChatSession, MessageRepository, SessionRepository};
+use crate::llm::chat_history::{
+    ChatMessage, ChatSession, ChatSessionKind, MessageRepository, SessionRepository,
+};
 use crate::storage::StorageManager;
 use crate::storage::traits::Repository;
 use rust_i18n::t;
@@ -56,13 +58,18 @@ impl SessionService {
     }
 
     /// 创建新会话
-    pub fn create_session(&self, name: String, provider_id: String) -> Result<i64, SessionError> {
+    pub fn create_session(
+        &self,
+        name: String,
+        provider_id: String,
+        session_kind: ChatSessionKind,
+    ) -> Result<i64, SessionError> {
         let session_repo = self
             .storage_manager
             .get::<SessionRepository>()
             .ok_or(SessionError::RepositoryNotAvailable)?;
 
-        let mut session = ChatSession::new(name, provider_id);
+        let mut session = ChatSession::new(name, provider_id, session_kind);
         session_repo
             .insert(&mut session)
             .map_err(|e| SessionError::StorageError(e.to_string()))
@@ -81,14 +88,17 @@ impl SessionService {
     }
 
     /// 列出所有会话
-    pub fn list_sessions(&self) -> Result<Vec<ChatSession>, SessionError> {
+    pub fn list_sessions(
+        &self,
+        session_kind: ChatSessionKind,
+    ) -> Result<Vec<ChatSession>, SessionError> {
         let session_repo = self
             .storage_manager
             .get::<SessionRepository>()
             .ok_or(SessionError::RepositoryNotAvailable)?;
 
         session_repo
-            .list()
+            .list_by_kind(session_kind)
             .map_err(|e| SessionError::StorageError(e.to_string()))
     }
 
@@ -152,6 +162,24 @@ impl SessionService {
             .map_err(|e| SessionError::StorageError(e.to_string()))
     }
 
+    /// 添加任意角色消息，用于持久化 UI 专属消息
+    pub fn add_message(
+        &self,
+        session_id: i64,
+        role: impl Into<String>,
+        content: String,
+    ) -> Result<i64, SessionError> {
+        let message_repo = self
+            .storage_manager
+            .get::<MessageRepository>()
+            .ok_or(SessionError::RepositoryNotAvailable)?;
+
+        let mut message = ChatMessage::new(session_id, role.into(), content);
+        message_repo
+            .insert(&mut message)
+            .map_err(|e| SessionError::StorageError(e.to_string()))
+    }
+
     /// 获取会话的所有消息
     pub fn get_messages(&self, session_id: i64) -> Result<Vec<ChatMessage>, SessionError> {
         let message_repo = self
@@ -170,16 +198,24 @@ impl SessionService {
         session_id: Option<i64>,
         provider_id: &str,
         default_name: &str,
+        session_kind: ChatSessionKind,
     ) -> Result<i64, SessionError> {
         if let Some(id) = session_id {
             // 验证会话存在
-            if self.get_session(id)?.is_some() {
+            if self
+                .get_session(id)?
+                .is_some_and(|session| session.session_kind == session_kind)
+            {
                 return Ok(id);
             }
         }
 
         // 创建新会话
-        self.create_session(default_name.to_string(), provider_id.to_string())
+        self.create_session(
+            default_name.to_string(),
+            provider_id.to_string(),
+            session_kind,
+        )
     }
 
     /// 获取存储管理器的引用

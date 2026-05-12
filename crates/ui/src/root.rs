@@ -176,12 +176,11 @@ impl Root {
 
             let size = sheet.size;
 
-            return Some(
-                div()
-                    .relative()
-                    .child(sheet)
-                    .on_prepaint(move |_, _, cx| root.update(cx, |r, _| r.sheet_size = Some(size))),
-            );
+            return Some(div().relative().child(sheet).on_prepaint(move |_, _, cx| {
+                cx.defer(move |cx| {
+                    root.update(cx, |r, _| r.sheet_size = Some(size));
+                })
+            }));
         }
 
         None

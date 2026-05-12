@@ -1834,6 +1834,22 @@ impl GlobalDbState {
         })
     }
 
+    /// Export table create SQL
+    pub async fn export_table_create_sql(
+        &self,
+        cx: &mut AsyncApp,
+        connection_id: String,
+        database: String,
+        schema: Option<String>,
+        table: String,
+    ) -> anyhow::Result<String> {
+        with_plugin_session_db!(self, cx, connection_id, database.clone(), |plugin, conn| {
+            plugin
+                .export_table_create_sql(&*conn, &database, schema.as_deref(), &table)
+                .await
+        })
+    }
+
     /// List indexes (with caching)
     pub async fn list_indexes(
         &self,

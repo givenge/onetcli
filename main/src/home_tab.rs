@@ -53,6 +53,44 @@ use crate::user_avatar::render_user_avatar;
 
 actions!(home_tab, [OpenConnectionQuickOpen, NewConnectionShortcut]);
 
+#[derive(Clone)]
+struct DragConnectionCard {
+    connection_id: i64,
+    workspace_id: Option<i64>,
+    name: SharedString,
+}
+
+impl DragConnectionCard {
+    fn new(connection_id: i64, workspace_id: Option<i64>, name: SharedString) -> Self {
+        Self {
+            connection_id,
+            workspace_id,
+            name,
+        }
+    }
+}
+
+impl Render for DragConnectionCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("drag-connection-card")
+            .cursor_grabbing()
+            .py_2()
+            .px_3()
+            .min_w(px(180.0))
+            .max_w(px(320.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .shadow_lg()
+            .opacity(0.9)
+            .child(self.name.clone())
+    }
+}
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         #[cfg(target_os = "macos")]
@@ -292,6 +330,82 @@ impl HomePage {
                     tracing::error!("Task join error: {}", e);
                 }
             }
+        })
+        .detach();
+    }
+
+    fn cards_reorder_enabled(&self, cx: &App) -> bool {
+        self.selected_filter == ConnectionType::All && self.search_query.read(cx).is_empty()
+    }
+
+    fn move_connection_card(
+        &mut self,
+        from_id: i64,
+        workspace_id: Option<i64>,
+        to_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if from_id == to_id {
+            return;
+        }
+
+        let mut ordered_ids: Vec<i64> = self
+            .connections
+            .iter()
+            .filter(|conn| conn.workspace_id == workspace_id)
+            .filter_map(|conn| conn.id)
+            .collect();
+
+        let Some(from_index) = ordered_ids.iter().position(|id| *id == from_id) else {
+            return;
+        };
+        let Some(to_index) = ordered_ids.iter().position(|id| *id == to_id) else {
+            return;
+        };
+
+        let moved = ordered_ids.remove(from_index);
+        ordered_ids.insert(to_index, moved);
+
+        for (index, id) in ordered_ids.iter().enumerate() {
+            if let Some(conn) = self
+                .connections
+                .iter_mut()
+                .find(|conn| conn.id == Some(*id))
+            {
+                conn.sort_order = index as i32 + 1;
+            }
+        }
+
+        self.connections.sort_by(|a, b| {
+            a.sort_order
+                .cmp(&b.sort_order)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        cx.notify();
+
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let should_sync = self.current_user.is_some() && crypto::has_master_key();
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = (|| {
+                let repo = storage
+                    .get::<ConnectionRepository>()
+                    .ok_or_else(|| anyhow::anyhow!("ConnectionRepository not found"))?;
+                repo.reorder_in_workspace(workspace_id, &ordered_ids)
+            })();
+
+            _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    if should_sync {
+                        tracing::info!("连接排序已更新，自动触发云同步");
+                        this.trigger_sync(cx);
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("保存连接排序失败: {}", err);
+                    this.load_connections(cx);
+                }
+            });
         })
         .detach();
     }
@@ -2168,7 +2282,8 @@ impl HomePage {
     fn render_content_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let search_query = self.search_query.read(cx).to_lowercase();
         let selected_id = self.selected_connection_id;
-        self.render_workspace_view(&search_query, selected_id, cx)
+        let reorder_enabled = self.cards_reorder_enabled(cx);
+        self.render_workspace_view(&search_query, selected_id, reorder_enabled, cx)
             .into_any_element()
     }
 
@@ -2176,6 +2291,7 @@ impl HomePage {
         &self,
         search_query: &str,
         selected_id: Option<i64>,
+        reorder_enabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workspaces_with_connections: Vec<_> = self
@@ -2229,6 +2345,7 @@ impl HomePage {
                         workspace,
                         connections,
                         selected_id,
+                        reorder_enabled,
                         cx,
                     ));
                 }
@@ -2240,6 +2357,7 @@ impl HomePage {
                         container = container.child(self.render_unassigned_section(
                             unassigned_connections,
                             selected_id,
+                            reorder_enabled,
                             cx,
                         ));
                     } else {
@@ -2247,6 +2365,7 @@ impl HomePage {
                         container = container.child(self.render_connections_grid(
                             unassigned_connections,
                             selected_id,
+                            reorder_enabled,
                             cx,
                         ));
                     }
@@ -2261,6 +2380,7 @@ impl HomePage {
         workspace: Workspace,
         connections: Vec<StoredConnection>,
         selected_id: Option<i64>,
+        reorder_enabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workspace_id = workspace.id;
@@ -2311,6 +2431,7 @@ impl HomePage {
                                 conn,
                                 workspace_id,
                                 selected_id,
+                                reorder_enabled,
                                 cx,
                             )),
                     );
@@ -2324,17 +2445,16 @@ impl HomePage {
         &self,
         connections: Vec<StoredConnection>,
         selected_id: Option<i64>,
+        reorder_enabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut container = div().flex().flex_wrap().w_full().gap_3();
 
         for conn in connections {
-            container = container.child(
-                div()
-                    .w(px(320.0))
-                    .flex_shrink_0()
-                    .child(self.render_connection_card(conn, None, selected_id, cx)),
-            );
+            container =
+                container.child(div().w(px(320.0)).flex_shrink_0().child(
+                    self.render_connection_card(conn, None, selected_id, reorder_enabled, cx),
+                ));
         }
         container
     }
@@ -2343,6 +2463,7 @@ impl HomePage {
         &self,
         connections: Vec<StoredConnection>,
         selected_id: Option<i64>,
+        reorder_enabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         v_flex()
@@ -2382,7 +2503,13 @@ impl HomePage {
                         div()
                             .w(px(320.0)) // 固定宽度，不增长
                             .flex_shrink_0() // 不收缩
-                            .child(self.render_connection_card(conn, None, selected_id, cx)),
+                            .child(self.render_connection_card(
+                                conn,
+                                None,
+                                selected_id,
+                                reorder_enabled,
+                                cx,
+                            )),
                     );
                 }
                 container
@@ -2394,9 +2521,11 @@ impl HomePage {
         conn: StoredConnection,
         workspace_id: Option<i64>,
         selected_id: Option<i64>,
+        reorder_enabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let conn_id = conn.id;
+        let card_conn_id = conn.id.unwrap_or(0);
         let clone_conn = conn.clone();
         let sftp_hover_conn = conn.clone();
         let edit_conn = conn.clone();
@@ -2408,6 +2537,7 @@ impl HomePage {
         let is_selected = selected_id == conn.id;
         let workspace =
             workspace_id.and_then(|id| self.workspaces.iter().find(|w| w.id == Some(id)).cloned());
+        let drag_name: SharedString = conn.name.clone().into();
 
         let is_active = conn
             .id
@@ -2445,6 +2575,22 @@ impl HomePage {
                     .shadow_lg()
                     .border_color(cx.theme().list_active_border)
             })
+            .drag_over::<DragConnectionCard>(move |el, drag, _, cx| {
+                if drag.workspace_id == workspace_id && drag.connection_id != card_conn_id {
+                    el.border_t_2().border_color(cx.theme().drag_border)
+                } else {
+                    el
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &DragConnectionCard, _, cx| {
+                if !reorder_enabled
+                    || drag.workspace_id != workspace_id
+                    || drag.connection_id == card_conn_id
+                {
+                    return;
+                }
+                this.move_connection_card(drag.connection_id, workspace_id, card_conn_id, cx);
+            }))
             .on_double_click(cx.listener(move |this, _, w, cx| {
                 // 如果主密钥未解锁且已设置过密码，拦截连接操作并弹出解锁对话框
                 if !crypto::has_master_key() && crypto::has_repo_password_set() {
@@ -2483,6 +2629,40 @@ impl HomePage {
                     .gap_1()
                     .group_hover("", |style| style.opacity(1.0))
                     .opacity(0.0)
+                    .when(reorder_enabled && conn_id.is_some(), |this| {
+                        let drag = DragConnectionCard::new(
+                            conn_id.unwrap_or(0),
+                            workspace_id,
+                            drag_name.clone(),
+                        );
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "drag-conn-{}",
+                                    conn.id.unwrap_or(0)
+                                )))
+                                .w(px(28.0))
+                                .h(px(28.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().background.opacity(0.9))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .cursor_grab()
+                                .on_drag(drag, |drag, _, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    cx.new(|_| drag.clone())
+                                })
+                                .child(
+                                    Icon::new(IconName::Menu)
+                                        .with_size(Size::Small)
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        )
+                    })
                     .when(conn.connection_type == ConnectionType::SshSftp, |this| {
                         this.child(
                             Button::new(SharedString::from(format!(

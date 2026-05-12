@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tracing::{debug, info};
 
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
@@ -15,7 +16,7 @@ use crate::pty_backend::{GpuiEventProxy, TerminalEvent};
 use crate::shell_integration::{
     embedded_shell_integration_script, normalized_shell_integration_script,
 };
-use crate::{TerminalBackend, TerminalSize};
+use crate::{preferred_utf8_locale, TerminalBackend, TerminalSize};
 
 /// 整个 shell integration 安装流程的硬超时，避免远端受限或挂死卡住连接。
 const SHELL_INTEGRATION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -244,9 +245,19 @@ impl SshBackend {
                                             let _ = event_tx.send(TerminalEvent::WorkingDirChanged(path));
                                         }
                                         OscEvent::PromptStart => {
+                                            debug!(
+                                                target: "terminal.agent.osc",
+                                                "ssh backend forwarding PromptStart"
+                                            );
                                             let _ = event_tx.send(TerminalEvent::PromptStart);
                                         }
                                         OscEvent::InputStart => {
+                                            debug!(
+                                                target: "terminal.agent.osc",
+                                                shell_ready,
+                                                init_sent,
+                                                "ssh backend forwarding InputStart"
+                                            );
                                             let _ = event_tx.send(TerminalEvent::InputStart);
                                             // 133;B: prompt 渲染完，用户可以输入了
                                             // 第一次收到时发送 init_commands
@@ -259,6 +270,11 @@ impl SshBackend {
                                         }
                                         OscEvent::CommandFinished { exit_code } => {
                                             // 133;D: 命令执行完毕
+                                            info!(
+                                                target: "terminal.agent.osc",
+                                                exit_code,
+                                                "ssh backend forwarding CommandFinished"
+                                            );
                                             let _ = event_tx.send(
                                                 TerminalEvent::CommandFinished { exit_code }
                                             );
@@ -519,11 +535,13 @@ impl SshBackend {
             channel.request_shell().await?;
             return Ok(());
         };
-
+        let locale = preferred_utf8_locale(&[]);
         channel.set_env("ONETCLI_SHELL_INTEGRATION", "1").await?;
         channel
             .set_env("ONETCLI_ORIG_ZDOTDIR", &setup.home_dir)
             .await?;
+        channel.set_env("LANG", &locale).await?;
+        channel.set_env("LC_CTYPE", &locale).await?;
 
         match setup.login_shell.as_deref().map(shell_basename) {
             Some("zsh") => {
@@ -558,7 +576,8 @@ impl SshBackend {
 mod tests {
     use super::*;
     use crate::osc::parse_osc_payload;
-    use anyhow::{Result, anyhow};
+    use crate::preferred_utf8_locale;
+    use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use ssh::SshConnectConfig;
     use std::collections::VecDeque;
@@ -740,6 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_ssh_channel_uses_dedicated_setup_channel_for_zsh() {
+        let locale = preferred_utf8_locale(&[]);
         let (setup_channel, setup_state) = MockChannel::new(
             [
                 ChannelEvent::Data(
@@ -772,6 +792,8 @@ mod tests {
             vec![
                 ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
                 ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
+                ChannelOp::SetEnv("LANG".into(), locale.clone()),
+                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
                 ChannelOp::SetEnv(
                     "ZDOTDIR".into(),
                     "/tmp/home/.config/onetcli/sessions/42/zsh".into(),
@@ -784,6 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_ssh_channel_execs_bash_wrapper_after_pty() {
+        let locale = preferred_utf8_locale(&[]);
         let (setup_channel, setup_state) = MockChannel::new(
             [
                 ChannelEvent::Data(
@@ -809,14 +832,16 @@ mod tests {
         );
         let interactive_ops = recorded_ops(&interactive_state);
         assert_eq!(
-            interactive_ops[0..3],
+            interactive_ops[0..5],
             [
                 ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
                 ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
+                ChannelOp::SetEnv("LANG".into(), locale.clone()),
+                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
                 ChannelOp::RequestPty,
             ]
         );
-        match interactive_ops.get(3) {
+        match interactive_ops.get(5) {
             Some(ChannelOp::Exec) => {}
             other => panic!("expected bash interactive channel to exec wrapper, got {other:?}"),
         }

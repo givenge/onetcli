@@ -222,6 +222,10 @@ impl MessageListRenderer {
                 MessageVariant::Status { title, is_done } => {
                     ChatMessageRenderer::render_status_message(&msg.id, title, *is_done, cx)
                 }
+                MessageVariant::Thinking => ChatMessageRenderer::render_thinking_message(msg, cx),
+                MessageVariant::ToolHistory { title } => {
+                    ChatMessageRenderer::render_tool_history_message(msg, title, cx)
+                }
                 MessageVariant::Text => Self::render_assistant_text_message(msg, cx),
                 MessageVariant::SqlResult => Self::render_sql_result_message(&msg.id, ctx, cx),
             },
@@ -232,36 +236,75 @@ impl MessageListRenderer {
     /// 渲染助手文本消息
     fn render_assistant_text_message(msg: &ChatMessageUI, cx: &App) -> AnyElement {
         use gpui::SharedString;
+        use gpui_component::avatar::Avatar;
         use gpui_component::text::TextView;
+        use gpui_component::{IconName, Sizable, Size};
 
         if msg.is_streaming && msg.content.is_empty() {
             return one_core::ChatMessageRenderer::render_thinking(cx);
         }
 
-        div()
+        h_flex()
             .w_full()
+            .items_start()
+            .gap_2()
             .child(
-                div().w_full().p_3().child(
-                    TextView::markdown(
-                        SharedString::from(format!("ai-sql-msg-{}", msg.id)),
-                        msg.content.clone(),
-                    )
-                    .selectable(true),
-                ),
+                Avatar::new()
+                    .placeholder(gpui_component::Icon::new(IconName::AI))
+                    .with_size(Size::Small)
+                    .bg(cx.theme().primary.opacity(0.1))
+                    .text_color(cx.theme().primary),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .max_w(px(820.0))
+                    .bg(cx.theme().muted.opacity(0.3))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .rounded_lg()
+                    .child(
+                        TextView::markdown(
+                            SharedString::from(format!("ai-sql-msg-{}", msg.id)),
+                            msg.content.clone(),
+                        )
+                        .p_3()
+                        .selectable(true),
+                    ),
             )
             .into_any_element()
     }
 
     /// 渲染 SQL 结果消息
-    fn render_sql_result_message(msg_id: &str, ctx: &MessageListContext, _cx: &App) -> AnyElement {
+    fn render_sql_result_message(msg_id: &str, ctx: &MessageListContext, cx: &App) -> AnyElement {
+        use gpui_component::avatar::Avatar;
+        use gpui_component::{Icon, IconName, Sizable, Size};
+
         if let Some(result_view) = ctx.sql_result_views.get(msg_id) {
-            div().w_full().child(result_view.clone()).into_any_element()
-        } else {
-            div()
+            h_flex()
                 .w_full()
-                .text_sm()
-                .child(t!("ChatMessageList.loading"))
+                .items_start()
+                .gap_2()
+                .child(
+                    Avatar::new()
+                        .placeholder(Icon::new(IconName::AI))
+                        .with_size(Size::Small)
+                        .bg(cx.theme().primary.opacity(0.1))
+                        .text_color(cx.theme().primary),
+                )
+                .child(div().min_w_0().max_w(px(980.0)).child(result_view.clone()))
                 .into_any_element()
+        } else {
+            one_core::ChatMessageRenderer::render_assistant_shell(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("ChatMessageList.loading"))
+                    .into_any_element(),
+                cx,
+            )
         }
     }
 

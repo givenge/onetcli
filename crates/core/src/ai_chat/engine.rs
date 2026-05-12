@@ -15,9 +15,11 @@ use uuid::Uuid;
 use crate::ai_chat::components::ModelSettings;
 use crate::ai_chat::panel::CodeBlockActionRegistry;
 use crate::ai_chat::services::{SessionService, extract_session_name};
-use crate::ai_chat::types::{ChatMessageUIGeneric, ChatRole, MessageExtension, NoExtension};
+use crate::ai_chat::types::{
+    ChatMessageUIGeneric, ChatRole, MessageExtension, MessageVariant, NoExtension,
+};
 use crate::llm::ProviderConfig;
-use crate::llm::chat_history::ChatSession;
+use crate::llm::chat_history::{ChatSession, ChatSessionKind};
 use crate::llm::storage::ProviderRepository;
 use crate::storage::StorageManager;
 use crate::storage::traits::Repository;
@@ -36,6 +38,8 @@ pub struct ChatEngine<E: MessageExtension + Default = NoExtension> {
     pub is_new_session: bool,
     /// 历史会话列表
     pub history_sessions: Vec<ChatSession>,
+    /// 当前面板对应的会话类型
+    pub session_kind: ChatSessionKind,
 
     /// 当前 Provider ID
     pub provider_id: Option<String>,
@@ -66,12 +70,13 @@ pub struct ChatEngine<E: MessageExtension + Default = NoExtension> {
 
 impl<E: MessageExtension + Default> ChatEngine<E> {
     /// 创建引擎
-    pub fn new(storage_manager: StorageManager) -> Self {
+    pub fn new(storage_manager: StorageManager, session_kind: ChatSessionKind) -> Self {
         Self {
             messages: Vec::new(),
             session_id: None,
             is_new_session: false,
             history_sessions: Vec::new(),
+            session_kind,
             provider_id: None,
             selected_model: None,
             provider_configs: Vec::new(),
@@ -97,10 +102,12 @@ impl<E: MessageExtension + Default> ChatEngine<E> {
             return Some(id);
         }
 
-        match self
-            .session_service
-            .ensure_session(None, provider_id, default_name)
-        {
+        match self.session_service.ensure_session(
+            None,
+            provider_id,
+            default_name,
+            self.session_kind,
+        ) {
             Ok(id) => {
                 self.session_id = Some(id);
                 self.is_new_session = true;
@@ -135,6 +142,11 @@ impl<E: MessageExtension + Default> ChatEngine<E> {
             .add_assistant_message(session_id, content);
     }
 
+    /// 持久化 UI 专属消息，不进入后续 LLM 上下文
+    pub fn persist_ui_message(&self, session_id: i64, role: &str, content: String) {
+        let _ = self.session_service.add_message(session_id, role, content);
+    }
+
     /// 开始新会话
     pub fn start_new_session(&mut self) {
         self.session_id = None;
@@ -156,6 +168,14 @@ impl<E: MessageExtension + Default> ChatEngine<E> {
         let msg_id = Uuid::new_v4().to_string();
         self.messages
             .push(ChatMessageUIGeneric::streaming_assistant().with_id(msg_id.clone()));
+        msg_id
+    }
+
+    /// 添加流式思考消息占位符，返回消息 ID
+    pub fn push_streaming_thinking(&mut self) -> String {
+        let msg_id = Uuid::new_v4().to_string();
+        self.messages
+            .push(ChatMessageUIGeneric::streaming_thinking().with_id(msg_id.clone()));
         msg_id
     }
 
@@ -262,14 +282,36 @@ impl<E: MessageExtension + Default> ChatEngine<E> {
     ) -> Vec<ChatMessageUIGeneric<E>> {
         messages
             .iter()
-            .map(|msg| {
-                let role = match msg.role.as_str() {
-                    "user" => ChatRole::User,
-                    "assistant" => ChatRole::Assistant,
-                    "system" => ChatRole::System,
-                    _ => ChatRole::User,
-                };
-                ChatMessageUIGeneric::from_history(msg.id.to_string(), role, msg.content.clone())
+            .map(|msg| match msg.role.as_str() {
+                "user" => ChatMessageUIGeneric::from_history(
+                    msg.id.to_string(),
+                    ChatRole::User,
+                    msg.content.clone(),
+                ),
+                "assistant" => ChatMessageUIGeneric::from_history(
+                    msg.id.to_string(),
+                    ChatRole::Assistant,
+                    msg.content.clone(),
+                ),
+                "system" => ChatMessageUIGeneric::from_history(
+                    msg.id.to_string(),
+                    ChatRole::System,
+                    msg.content.clone(),
+                ),
+                "thinking" => ChatMessageUIGeneric::thinking(msg.content.clone())
+                    .with_id(msg.id.to_string())
+                    .with_streaming(false),
+                "tool_history" => {
+                    ChatMessageUIGeneric::tool_history("工具执行记录", msg.content.clone())
+                        .with_id(msg.id.to_string())
+                        .with_streaming(false)
+                }
+                _ => ChatMessageUIGeneric::from_history(
+                    msg.id.to_string(),
+                    ChatRole::User,
+                    msg.content.clone(),
+                )
+                .with_variant(MessageVariant::Text),
             })
             .collect()
     }

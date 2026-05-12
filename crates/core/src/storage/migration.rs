@@ -14,6 +14,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "20260317000001",
         include_str!("../../migrations/20260317000001_connection_owner.sql"),
     ),
+    (
+        "20260416000001",
+        include_str!("../../migrations/20260416000001_connection_sort_order.sql"),
+    ),
+    (
+        "20260417000002",
+        include_str!("../../migrations/20260417000002_llm_provider_settings.sql"),
+    ),
+    (
+        "20260417000003",
+        include_str!("../../migrations/20260417000003_chat_session_kind.sql"),
+    ),
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<()> {

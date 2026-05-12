@@ -1,4 +1,7 @@
-use crate::highlight_presets::{builtin_highlight_rules, merge_builtin_highlight_rules};
+use crate::{
+    highlight_presets::{builtin_highlight_rules, merge_builtin_highlight_rules},
+    theme::default_monospace_font,
+};
 use gpui::{App, AppContext, Context, Entity, EventEmitter};
 use one_core::storage::get_config_dir;
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,8 @@ impl TerminalHighlightRule {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSettings {
     pub font_size: f32,
+    #[serde(default = "default_terminal_font_family")]
+    pub font_family: String,
     pub auto_copy: bool,
     pub enable_autocomplete: bool,
     pub middle_click_paste: bool,
@@ -51,6 +56,7 @@ impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
             font_size: 15.0,
+            font_family: default_terminal_font_family(),
             auto_copy: true,
             enable_autocomplete: true,
             middle_click_paste: true,
@@ -63,6 +69,10 @@ impl Default for TerminalSettings {
             custom_highlights: builtin_highlight_rules(),
         }
     }
+}
+
+fn default_terminal_font_family() -> String {
+    default_monospace_font().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,8 +220,8 @@ fn save_settings_to_path(path: &Path, settings: &TerminalSettings) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalHighlightRule, TerminalSettings, TerminalSettingsStore, load_settings_from_path,
-        resolve_initial_settings, save_settings_to_path,
+        default_terminal_font_family, load_settings_from_path, resolve_initial_settings,
+        save_settings_to_path, TerminalHighlightRule, TerminalSettings, TerminalSettingsStore,
     };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -229,6 +239,7 @@ mod tests {
         let path = temp_file_path("terminal-settings-round-trip");
         let settings = TerminalSettings {
             font_size: 18.0,
+            font_family: "Monaco".to_string(),
             auto_copy: false,
             enable_autocomplete: false,
             middle_click_paste: false,
@@ -252,6 +263,7 @@ mod tests {
         let path = temp_file_path("terminal-settings-legacy-seed");
         let legacy = TerminalSettings {
             font_size: 17.0,
+            font_family: "Menlo".to_string(),
             theme: "light".to_string(),
             sync_path_with_terminal: true,
             builtin_highlights_initialized: false,
@@ -346,5 +358,28 @@ mod tests {
         let loaded = load_settings_from_path(&path).expect("应读回 terminal settings");
 
         assert_eq!(loaded.custom_highlights, settings.custom_highlights);
+    }
+
+    #[test]
+    fn terminal_settings_loads_missing_font_family_with_default() {
+        let path = temp_file_path("terminal-settings-missing-font-family");
+        let legacy_json = r#"{
+  "font_size": 16.0,
+  "auto_copy": true,
+  "enable_autocomplete": true,
+  "middle_click_paste": true,
+  "sync_path_with_terminal": false,
+  "theme": "ocean",
+  "cursor_blink": false,
+  "confirm_multiline_paste": true,
+  "confirm_high_risk_command": true,
+  "builtin_highlights_initialized": true,
+  "custom_highlights": []
+}"#;
+        std::fs::write(&path, legacy_json).expect("应写入 legacy terminal settings");
+
+        let loaded = load_settings_from_path(&path).expect("应读回 legacy terminal settings");
+
+        assert_eq!(loaded.font_family, default_terminal_font_family());
     }
 }

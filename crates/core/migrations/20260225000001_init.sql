@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS connections (
     name TEXT NOT NULL,
     connection_type TEXT NOT NULL,
     params TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
     workspace_id INTEGER,
     selected_databases TEXT,
     remark TEXT,
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS connections (
 CREATE INDEX IF NOT EXISTS idx_connections_name ON connections(name);
 CREATE INDEX IF NOT EXISTS idx_connections_workspace ON connections(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_connections_cloud_id ON connections(cloud_id);
+CREATE INDEX IF NOT EXISTS idx_connections_sort_order ON connections(workspace_id, sort_order);
 
 -- Queries
 CREATE TABLE IF NOT EXISTS queries (
@@ -73,11 +75,13 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     provider_id TEXT NOT NULL,
+    session_kind TEXT NOT NULL DEFAULT 'ai',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_provider_id ON chat_sessions (provider_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_kind ON chat_sessions (session_kind);
 
 -- Chat Messages
 CREATE TABLE IF NOT EXISTS chat_messages (

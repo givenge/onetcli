@@ -42,6 +42,10 @@ pub enum ChatRole {
 pub enum MessageVariant {
     /// 普通文本
     Text,
+    /// 独立的思考/推理消息
+    Thinking,
+    /// 工具执行历史（默认折叠显示）
+    ToolHistory { title: String },
     /// SQL 结果（用于显示查询结果）
     SqlResult,
     /// 状态消息（用于显示处理进度）
@@ -134,6 +138,36 @@ impl<E: MessageExtension + Default> ChatMessageUIGeneric<E> {
         }
     }
 
+    /// 创建思考消息
+    pub fn thinking(content: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: ChatRole::Assistant,
+            content: content.into(),
+            variant: MessageVariant::Thinking,
+            is_streaming: false,
+            is_expanded: false,
+            cached_content_hash: None,
+            extension: E::default(),
+        }
+    }
+
+    /// 创建工具历史消息
+    pub fn tool_history(title: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: ChatRole::Assistant,
+            content: content.into(),
+            variant: MessageVariant::ToolHistory {
+                title: title.into(),
+            },
+            is_streaming: false,
+            is_expanded: false,
+            cached_content_hash: None,
+            extension: E::default(),
+        }
+    }
+
     /// 创建系统消息
     pub fn system(content: impl Into<String>) -> Self {
         Self {
@@ -174,6 +208,36 @@ impl<E: MessageExtension + Default> ChatMessageUIGeneric<E> {
             variant: MessageVariant::Text,
             is_streaming: true,
             is_expanded: true,
+            cached_content_hash: None,
+            extension: E::default(),
+        }
+    }
+
+    /// 创建流式思考消息
+    pub fn streaming_thinking() -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: ChatRole::Assistant,
+            content: String::new(),
+            variant: MessageVariant::Thinking,
+            is_streaming: true,
+            is_expanded: false,
+            cached_content_hash: None,
+            extension: E::default(),
+        }
+    }
+
+    /// 创建流式工具历史消息
+    pub fn streaming_tool_history(title: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: ChatRole::Assistant,
+            content: String::new(),
+            variant: MessageVariant::ToolHistory {
+                title: title.into(),
+            },
+            is_streaming: true,
+            is_expanded: false,
             cached_content_hash: None,
             extension: E::default(),
         }

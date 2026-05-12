@@ -115,24 +115,37 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
     preexec_functions+=(__onetcli_preexec_zsh)
     PROMPT="${PROMPT}"$'%{\033]133;B\007%}'
 else
-    __onetcli_precmd_bash() {
-        local exit_code="$?"
-        __ONETCLI_IN_PRECMD=1
-        __onetcli_precmd_common "$exit_code"
-        __ONETCLI_IN_PRECMD=0
+    # Bash: 捕获命令退出码并报告命令生命周期
+    #
+    # 重要：PROMPT_COMMAND 的顺序策略
+    # 1. 首先捕获退出码（$?），防止被后续命令修改
+    # 2. 然后执行用户原有的 PROMPT_COMMAND
+    # 3. 最后发送 OSC 133;D 信号
+    #
+    # 使用函数包装确保退出码捕获不受中断
+
+    __onetcli_save_exit_code() {
+        __ONETCLI_LAST_EXIT_CODE=$?
+    }
+
+    __onetcli_report_exit_code() {
+        __onetcli_precmd_common "${__ONETCLI_LAST_EXIT_CODE:-0}"
     }
 
     __onetcli_preexec_bash() {
-        [[ "${__ONETCLI_IN_PRECMD:-0}" == "1" ]] && return
+        # 避免在 integration 内部函数中误触发
         [[ "${BASH_COMMAND:-}" == __onetcli_* ]] && return
         __ONETCLI_COMMAND_STARTED=1
         __onetcli_command_start
     }
 
+    # 将 integration 钩子插入到 PROMPT_COMMAND 中
     if [[ -z "${PROMPT_COMMAND:-}" ]]; then
-        PROMPT_COMMAND='__onetcli_precmd_bash'
+        PROMPT_COMMAND='__onetcli_save_exit_code;__onetcli_report_exit_code'
     else
-        PROMPT_COMMAND="__onetcli_precmd_bash;${PROMPT_COMMAND}"
+        # 在用户 PROMPT_COMMAND 前后都插入钩子
+        # 前面的钩子捕获退出码，后面的钩子发送 OSC 信号
+        PROMPT_COMMAND="__onetcli_save_exit_code;${PROMPT_COMMAND};__onetcli_report_exit_code"
     fi
 
     PS1="${PS1}"$'\\[\033]133;B\007\\]'

@@ -355,6 +355,7 @@ impl CloudSyncService {
         let plain_data = ConnectionPlainData {
             name: conn.name.clone(),
             connection_type: conn.connection_type.to_string(),
+            sort_order: conn.sort_order,
             workspace_cloud_id: None, // 由调用者设置
             selected_databases: conn.selected_databases.clone(),
             remark: conn.remark.clone(),
@@ -435,6 +436,7 @@ impl CloudSyncService {
             id: None,
             name: plain_data.name,
             connection_type,
+            sort_order: plain_data.sort_order,
             workspace_id: None, // 由调用者根据 workspace_cloud_id 解析
             params,
             selected_databases: plain_data.selected_databases,

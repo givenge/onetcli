@@ -513,6 +513,7 @@ impl RenderOnce for Dialog {
                                     .small()
                                     .ghost()
                                     .icon(IconName::Close)
+                                    .tooltip(t!("Dock.Close"))
                                     .on_click({
                                         let on_cancel = self.on_cancel.clone();
                                         let on_close = self.on_close.clone();

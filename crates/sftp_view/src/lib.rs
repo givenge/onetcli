@@ -3392,6 +3392,7 @@ impl SftpView {
                             .icon(IconName::Close)
                             .ghost()
                             .xsmall()
+                            .tooltip(t!("Common.cancel").to_string())
                             .on_click(cx.listener(move |this, _, _window, cx| {
                                 this.cancel_transfer(task_id, cx);
                             })),

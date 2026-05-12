@@ -6,6 +6,7 @@ use gpui::{
     ParentElement, Pixels, RenderOnce, StyleRefinement, Styled, Window, WindowControlArea,
     anchored, div, point, prelude::FluentBuilder as _, px,
 };
+use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -239,6 +240,7 @@ impl RenderOnce for Sheet {
                                             .small()
                                             .ghost()
                                             .icon(IconName::Close)
+                                            .tooltip(t!("Dock.Close"))
                                             .on_click(move |_, window, cx| {
                                                 window.close_sheet(cx);
                                                 on_close(&ClickEvent::default(), window, cx);

@@ -161,6 +161,8 @@ impl LlmConnector {
             request.temperature = Some(temperature);
         }
 
+        request.reasoning_effort = config.reasoning_effort;
+
         request
     }
 }

@@ -186,6 +186,10 @@ impl AIInput {
             history_desc: t!("ModelSettings.history_desc").to_string(),
             max_tokens_label: t!("ModelSettings.max_tokens_label").to_string(),
             max_tokens_desc: t!("ModelSettings.max_tokens_desc").to_string(),
+            context_window_label: t!("ModelSettings.context_window_label").to_string(),
+            context_window_desc: t!("ModelSettings.context_window_desc").to_string(),
+            reasoning_effort_label: t!("ModelSettings.reasoning_effort_label").to_string(),
+            reasoning_effort_desc: t!("ModelSettings.reasoning_effort_desc").to_string(),
             footer_notice: t!("ModelSettings.footer_notice").to_string(),
         };
         let settings_panel = cx
@@ -294,6 +298,18 @@ impl AIInput {
     /// 获取模型设置
     pub fn get_model_settings(&self) -> &ModelSettings {
         &self.model_settings
+    }
+
+    pub fn set_model_settings(
+        &mut self,
+        settings: ModelSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_settings = settings.clone();
+        self.settings_panel
+            .update(cx, |panel, cx| panel.update_settings(settings, window, cx));
+        cx.notify();
     }
 
     pub fn update_providers(

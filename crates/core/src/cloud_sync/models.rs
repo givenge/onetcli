@@ -304,6 +304,9 @@ pub struct ConnectionPlainData {
     pub name: String,
     /// 连接类型
     pub connection_type: String,
+    /// 同工作区内排序
+    #[serde(default)]
+    pub sort_order: i32,
     /// 关联的工作空间云端 ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_cloud_id: Option<String>,

@@ -6037,7 +6037,7 @@ checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 
 [[package]]
 name = "main"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -10747,6 +10747,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "gpui",
  "gpui-component",
  "one-core",
@@ -10761,6 +10762,7 @@ dependencies = [
  "ssh",
  "terminal",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
 ]

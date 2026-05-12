@@ -554,6 +554,7 @@ impl Render for SearchPanel {
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
+                            .tooltip(t!("Dock.Close"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_action_escape(&Escape, window, cx);
                             })),
