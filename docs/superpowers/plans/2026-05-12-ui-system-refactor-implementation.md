@@ -22,7 +22,21 @@
 - 2026-05-13: Task 6 side chrome and new connection picker follow-up committed as `ba470ad6 refactor(ui): align side chrome and connection picker`.
 - 2026-05-13: Formatting cleanup committed as `5994e2d7 style: apply rustfmt cleanup`.
 - 2026-05-13: Native visual smoke verified from PID-launched `target/debug/onetcli`, avoiding the installed `com.onetcli.app` bundle.
+- 2026-05-13: ChatDB received a dedicated database-assistant icon in `c96f4b67 style(chatdb): add dedicated ChatDB icon`.
+- 2026-05-13: Surface polish continuation started for Database, Redis, MongoDB, SSH/SFTP, Terminal, and AI assistant views.
+- 2026-05-13: Surface polish verified with serial cargo checks and a PID-launched `target/debug/onetcli` screenshot; Computer Use app-name lookup still targets the installed bundle and must not be used for this smoke.
 - Remaining: continue any future surface-specific polish from screenshots launched through the debug binary PID, not by app bundle name.
+
+## Surface Polish Continuation
+
+This continuation keeps the original Task 6 behavior guardrails and focuses on the visible workbench interiors that still look inconsistent after the base chrome pass.
+
+- Database: reuse shared side-toolbar buttons, remove double borders in the context panel, and align DDL preview header/body chrome.
+- Redis and MongoDB: keep their tree/detail behavior unchanged while using the same active side-panel container as Database and Terminal.
+- Terminal and SSH: preserve terminal rendering, keyboard context, resize behavior, and command handling while aligning side-panel containment.
+- SFTP: keep path navigation, sorting, selection, drag/drop, context menus, and search filtering while aligning list header/search surfaces.
+- AI assistant and ChatDB: keep provider/model/session/message behavior unchanged while aligning headers, history sidebar, messages canvas, input frame, and assistant avatar/icon treatment.
+- Verification: run focused feature crate checks, `cargo fmt --check`, `git diff --check`, and a PID-launched `target/debug/onetcli` screenshot smoke when source checks pass.
 
 ---
 

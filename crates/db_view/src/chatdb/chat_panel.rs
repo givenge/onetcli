@@ -31,6 +31,7 @@ use gpui_component::{
     avatar::Avatar,
     button::Button,
     chart::{BarChart, LineChart, PieChart},
+    chrome,
     clipboard::Clipboard,
     dialog::DialogButtonProps,
     h_flex,
@@ -1488,15 +1489,16 @@ impl ChatPanel {
             .min_h_0()
             .w_full()
             .relative()
+            .bg(cx.theme().muted.opacity(0.28))
             .child(
                 div()
                     .id("chat-messages-scroll")
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    .p_4()
+                    .p_3()
                     .pr(px(28.0))
-                    .pb_8()
+                    .pb_6()
                     .child(
                         v_flex()
                             .w_full()
@@ -1576,9 +1578,6 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted;
-
         if self.session_list.is_none() {
             self.update_session_list(window, cx);
         }
@@ -1591,17 +1590,11 @@ impl ChatPanel {
             .min_h_0()
             .flex_shrink_0()
             .border_r_1()
-            .border_color(border)
-            .bg(muted)
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
             .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
+                chrome::panel_header(cx)
                     .justify_between()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(border)
                     .child(
                         div()
                             .text_sm()
@@ -1629,7 +1622,7 @@ impl ChatPanel {
                                 .w_full()
                                 .h_full()
                                 .border_1()
-                                .border_color(border)
+                                .border_color(cx.theme().border)
                                 .rounded(cx.theme().radius),
                         )
                     }),
@@ -1641,26 +1634,16 @@ impl ChatPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted;
-        let fg = cx.theme().foreground;
         let session_list = self.session_list.clone();
 
-        h_flex()
+        chrome::panel_header(cx)
             .flex_shrink_0()
-            .w_full()
-            .px_4()
-            .py_2()
-            .border_b_1()
-            .border_color(border)
-            .bg(muted)
-            .items_center()
             .justify_between()
             .child(
                 div()
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(fg)
+                    .text_color(cx.theme().foreground)
                     .child(t!("ChatPanel.title").to_string()),
             )
             .child(
@@ -1703,7 +1686,7 @@ impl ChatPanel {
                                         .w(px(280.0))
                                         .max_h(px(350.0))
                                         .border_1()
-                                        .border_color(border)
+                                        .border_color(cx.theme().border)
                                         .rounded(cx.theme().radius),
                                 )
                             }),
@@ -2185,7 +2168,14 @@ impl ChatPanel {
     }
 
     fn render_input(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().w_full().px_2().py_2().child(self.ai_input.clone())
+        div()
+            .w_full()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(_cx.theme().border)
+            .bg(_cx.theme().background)
+            .child(self.ai_input.clone())
     }
 }
 

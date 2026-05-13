@@ -15,6 +15,7 @@ use gpui_component::{
     ActiveTheme, Icon, IconName, IndexPath, Selectable, Sizable, Size as ComponentSize,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
+    chrome,
     clipboard::Clipboard,
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -2125,12 +2126,8 @@ impl Render for DbTreeView {
             .bg(cx.theme().sidebar)
             .child({
                 let view_for_collapse = cx.entity();
-                h_flex()
-                    .w_full()
-                    .p_1()
+                chrome::panel_header(cx)
                     .gap_1()
-                    .border_t_1()
-                    .border_color(cx.theme().sidebar_border)
                     .bg(cx.theme().sidebar)
                     .child(
                         div().flex_1().child(

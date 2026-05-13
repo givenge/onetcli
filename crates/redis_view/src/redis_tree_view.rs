@@ -11,6 +11,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, Size,
     button::{Button, ButtonVariants as _},
+    chrome,
     clipboard::Clipboard,
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -1593,12 +1594,9 @@ impl RedisTreeView {
         let _can_add = self.get_selected_db_context().is_some();
         let view_for_search = cx.entity().clone();
 
-        h_flex()
-            .w_full()
-            .p_1()
+        chrome::panel_header(cx)
             .gap_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
             .child(div().flex_1().child(Input::new(&self.search_state)))
             .child(
                 Button::new("search")

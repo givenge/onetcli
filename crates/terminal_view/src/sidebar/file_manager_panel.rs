@@ -1903,7 +1903,7 @@ impl FileManagerPanel {
         v_flex()
             .border_b_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+            .bg(cx.theme().muted)
             .child(
                 h_flex()
                     .h_9()
@@ -2198,7 +2198,7 @@ impl FileManagerPanel {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+            .bg(cx.theme().muted)
             .child(self.render_header_cell(&t!("FileManager.name"), SortColumn::Name, true, cx))
             .child(self.render_header_cell(&t!("FileManager.size"), SortColumn::Size, false, cx))
             .child(self.render_header_cell(
@@ -2523,7 +2523,7 @@ impl FileManagerPanel {
         v_flex()
             .border_t_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+            .bg(cx.theme().muted)
             .px_2()
             .py_1()
             .gap_1()

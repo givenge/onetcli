@@ -11,15 +11,15 @@ use crate::database_objects_tab::DatabaseObjectsPanel;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    Focusable, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, StyledExt, h_flex, v_flex};
 use one_core::ai_chat::CodeBlockAction;
 use one_core::ai_chat::ask_ai::{AskAiEvent, get_ask_ai_notifier};
-use one_core::layout::TOOLBAR_WIDTH;
+use one_ui::workbench;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPanel {
@@ -30,7 +30,7 @@ pub enum SidebarPanel {
 impl SidebarPanel {
     pub fn icon(&self) -> Icon {
         match self {
-            SidebarPanel::AiChat => IconName::AI.color(),
+            SidebarPanel::AiChat => IconName::ChatDB.color(),
             SidebarPanel::DdlPreview => IconName::Eye.color(),
         }
     }
@@ -138,46 +138,26 @@ impl DatabaseSidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active = self.active_panel == Some(panel);
-        let accent_color = cx.theme().accent;
         let accent_fg = cx.theme().accent_foreground;
         let muted_fg = cx.theme().muted_foreground;
-        let muted_bg = cx.theme().muted;
 
-        div()
-            .id(SharedString::from(format!("sidebar-btn-{:?}", panel)))
-            .w(px(36.0))
-            .h(px(36.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(is_active, |this| this.bg(accent_color))
-            .when(!is_active, |this| this.hover(|s| s.bg(muted_bg)))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.toggle_panel(panel, cx);
-            }))
-            .child(
-                Icon::new(panel.icon())
-                    .with_size(Size::Medium)
-                    .text_color(if is_active { accent_fg } else { muted_fg }),
-            )
+        workbench::side_toolbar_button(
+            SharedString::from(format!("database-sidebar-btn-{:?}", panel)),
+            is_active,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.toggle_panel(panel, cx);
+        }))
+        .child(
+            Icon::new(panel.icon())
+                .with_size(Size::Medium)
+                .text_color(if is_active { accent_fg } else { muted_fg }),
+        )
     }
 
     pub fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let border_color = cx.theme().border;
-        let muted_bg = cx.theme().muted;
-
-        v_flex()
-            .flex_shrink_0()
-            .w(TOOLBAR_WIDTH)
-            .h_full()
-            .bg(muted_bg)
-            .border_l_1()
-            .border_color(border_color)
-            .items_center()
-            .py_2()
-            .gap_1()
+        workbench::side_toolbar(cx)
             .child(self.render_toolbar_button(SidebarPanel::AiChat, window, cx))
             .child(self.render_toolbar_button(SidebarPanel::DdlPreview, window, cx))
             .into_any_element()
@@ -249,14 +229,8 @@ impl DatabaseSidebar {
             .size_full()
             .bg(cx.theme().background)
             .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .items_center()
+                workbench::workbench_toolbar(cx)
                     .justify_between()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().title_bar)
                     .child(
                         div()
                             .text_sm()
@@ -312,10 +286,9 @@ impl DatabaseSidebar {
                         .flex_shrink_0()
                         .child(
                             div().flex_1().overflow_y_scrollbar_masked().child(
-                                div()
+                                workbench::code_canvas(cx)
                                     .min_h_full()
                                     .p_3()
-                                    .bg(cx.theme().table_even)
                                     .border_t_1()
                                     .border_color(cx.theme().border)
                                     .child(content),
@@ -337,19 +310,12 @@ impl Focusable for DatabaseSidebar {
 
 impl Render for DatabaseSidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border_color = cx.theme().border;
-        let bg_color = cx.theme().background;
-
         div()
             .h_full()
             .flex_shrink_0()
             .when_some(self.active_panel, |this, panel| {
                 this.w_full().child(
-                    v_flex()
-                        .size_full()
-                        .border_l_1()
-                        .border_color(border_color)
-                        .bg(bg_color)
+                    workbench::side_panel_surface(cx)
                         .child(self.render_panel_content(panel, window, cx)),
                 )
             })

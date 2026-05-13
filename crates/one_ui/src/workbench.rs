@@ -63,6 +63,30 @@ pub fn workbench_toolbar(cx: &App) -> Div {
         .bg(cx.theme().muted)
 }
 
+pub fn side_panel_surface(cx: &App) -> Div {
+    v_flex()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .bg(cx.theme().background)
+}
+
+pub fn panel_body(cx: &App) -> Div {
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .bg(cx.theme().background)
+}
+
+pub fn code_canvas(cx: &App) -> Div {
+    div()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .bg(cx.theme().table_even)
+}
+
 pub fn side_toolbar(cx: &App) -> Div {
     v_flex()
         .flex_shrink_0()

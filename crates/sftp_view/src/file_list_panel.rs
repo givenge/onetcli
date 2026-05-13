@@ -344,9 +344,6 @@ impl FileListPanel {
         let total_count = self.items.len();
 
         chrome::panel_header(cx)
-            .h_8()
-            .min_h(px(32.0))
-            .px_2()
             .bg(cx.theme().background)
             .child(
                 Icon::new(IconName::Search)
@@ -375,13 +372,8 @@ impl FileListPanel {
         let sort_column = self.sort_column;
         let sort_order = self.sort_order;
 
-        h_flex()
-            .h_8()
-            .px_3()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+        chrome::panel_header(cx)
+            .bg(cx.theme().muted)
             .child(self.render_header_cell(
                 "Name",
                 SortColumn::Name,
@@ -1022,8 +1014,7 @@ impl Render for FileListPanel {
             filtered_count
         };
 
-        v_flex()
-            .size_full()
+        chrome::panel_surface(cx)
             .child(self.render_search_bar(cx))
             .child(self.render_header(cx))
             .child(

@@ -4,7 +4,7 @@ use gpui::{
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Window, div,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, v_flex};
+use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size};
 use one_core::ai_chat::ask_ai::{AskAiEvent, get_ask_ai_notifier};
 use one_core::ai_chat::{AiChatPanel, AiChatPanelEvent};
 use one_ui::workbench;
@@ -163,19 +163,12 @@ impl Focusable for MongoSidebar {
 
 impl Render for MongoSidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border_color = cx.theme().border;
-        let bg_color = cx.theme().background;
-
         div()
             .h_full()
             .flex_shrink_0()
             .when_some(self.active_panel, |this, panel| {
                 this.w_full().child(
-                    v_flex()
-                        .size_full()
-                        .border_l_1()
-                        .border_color(border_color)
-                        .bg(bg_color)
+                    workbench::side_panel_surface(cx)
                         .child(self.render_panel_content(panel, window, cx)),
                 )
             })

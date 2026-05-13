@@ -9,7 +9,7 @@ use gpui::{
     prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, WindowExt as _,
+    ActiveTheme, Icon, IconName, Sizable, Size, WindowExt as _, chrome,
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -1553,8 +1553,9 @@ impl Render for MongoTreeView {
                     .p_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .bg(cx.theme().sidebar)
                     .child(
-                        h_flex().items_center().justify_between().child(
+                        chrome::panel_header(cx).px_0().border_0().child(
                             h_flex()
                                 .items_center()
                                 .gap_1()
