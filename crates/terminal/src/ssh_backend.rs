@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tracing::{debug, info};
 
 use alacritty_terminal::sync::FairMutex;
@@ -16,7 +16,7 @@ use crate::pty_backend::{GpuiEventProxy, TerminalEvent};
 use crate::shell_integration::{
     embedded_shell_integration_script, normalized_shell_integration_script,
 };
-use crate::{preferred_utf8_locale, TerminalBackend, TerminalSize};
+use crate::{TerminalBackend, TerminalSize, preferred_utf8_locale};
 
 /// 整个 shell integration 安装流程的硬超时，避免远端受限或挂死卡住连接。
 const SHELL_INTEGRATION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -577,7 +577,7 @@ mod tests {
     use super::*;
     use crate::osc::parse_osc_payload;
     use crate::preferred_utf8_locale;
-    use anyhow::{anyhow, Result};
+    use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use ssh::SshConnectConfig;
     use std::collections::VecDeque;

@@ -1990,12 +1990,7 @@ where
             let size_pad = self.options.size.table_cell_padding();
             let (target_pt, target_pb, target_pl, target_pr) = match col_padding {
                 Some(p) => (p.top, p.bottom, p.left, p.right),
-                None => (
-                    size_pad.top,
-                    size_pad.bottom,
-                    size_pad.left,
-                    size_pad.right,
-                ),
+                None => (size_pad.top, size_pad.bottom, size_pad.left, size_pad.right),
             };
 
             // 选中时 border 占用内部空间会挤压内容区，减少等量 padding 补偿
@@ -2005,10 +2000,26 @@ where
             let has_r = border_right || is_single_select_active;
             let b = px(2.);
             cell = cell
-                .pt(if has_t { (target_pt - b).max(px(0.)) } else { target_pt })
-                .pb(if has_b { (target_pb - b).max(px(0.)) } else { target_pb })
-                .pl(if has_l { (target_pl - b).max(px(0.)) } else { target_pl })
-                .pr(if has_r { (target_pr - b).max(px(0.)) } else { target_pr });
+                .pt(if has_t {
+                    (target_pt - b).max(px(0.))
+                } else {
+                    target_pt
+                })
+                .pb(if has_b {
+                    (target_pb - b).max(px(0.))
+                } else {
+                    target_pb
+                })
+                .pl(if has_l {
+                    (target_pl - b).max(px(0.))
+                } else {
+                    target_pl
+                })
+                .pr(if has_r {
+                    (target_pr - b).max(px(0.))
+                } else {
+                    target_pr
+                });
         }
 
         cell

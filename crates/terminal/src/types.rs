@@ -111,11 +111,13 @@ mod tests {
 
         ensure_utf8_locale_env(&mut env);
 
-        assert!(env
-            .iter()
-            .any(|(key, value)| key == "LANG" && is_utf8_locale(value)));
-        assert!(env
-            .iter()
-            .any(|(key, value)| key == "LC_CTYPE" && is_utf8_locale(value)));
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "LANG" && is_utf8_locale(value))
+        );
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "LC_CTYPE" && is_utf8_locale(value))
+        );
     }
 }

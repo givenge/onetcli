@@ -4,9 +4,9 @@ use crate::{StyledExt, scroll::ScrollbarHandle};
 
 use super::{ScrollableMask, Scrollbar, ScrollbarAxis};
 use gpui::{
-    App, Axis, Div, Element, ElementId, InteractiveElement, IntoElement, ParentElement,
-    RenderOnce, ScrollHandle, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
-    Window, div, prelude::FluentBuilder,
+    App, Axis, Div, Element, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    ScrollHandle, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
+    prelude::FluentBuilder,
 };
 
 /// A trait for elements that can be made scrollable with scrollbars.

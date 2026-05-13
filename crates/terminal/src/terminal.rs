@@ -48,8 +48,8 @@ use crate::pty_backend::{GpuiEventProxy, LocalPtyBackend};
 use crate::shell_integration::embedded_shell_integration_script;
 
 use crate::{
-    ensure_utf8_locale_env, LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalEvent,
-    TerminalSize,
+    LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalEvent, TerminalSize,
+    ensure_utf8_locale_env,
 };
 use ssh::{
     ChannelEvent, KeyboardInteractiveRequest, KeyboardInteractiveResponder,

@@ -226,18 +226,22 @@ impl DatabaseSidebar {
         } else {
             div()
                 .min_w_full()
-                .child(v_flex().gap_1().children(ddl_text.lines().map(|line: &str| {
-                    div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .whitespace_nowrap()
-                        .child(if line.is_empty() {
-                            " ".to_string()
-                        } else {
-                            line.to_string()
-                        })
-                })))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .children(ddl_text.lines().map(|line: &str| {
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_sm()
+                                .text_color(cx.theme().foreground)
+                                .whitespace_nowrap()
+                                .child(if line.is_empty() {
+                                    " ".to_string()
+                                } else {
+                                    line.to_string()
+                                })
+                        })),
+                )
                 .into_any_element()
         };
 
@@ -300,30 +304,24 @@ impl DatabaseSidebar {
                     ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .overflow_x_scrollbar_masked()
-                    .child(
-                        v_flex()
-                            .w(ddl_content_width)
-                            .min_w(ddl_content_width)
-                            .h_full()
-                            .flex_shrink_0()
-                            .child(
+                div().flex_1().overflow_x_scrollbar_masked().child(
+                    v_flex()
+                        .w(ddl_content_width)
+                        .min_w(ddl_content_width)
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(
+                            div().flex_1().overflow_y_scrollbar_masked().child(
                                 div()
-                                    .flex_1()
-                                    .overflow_y_scrollbar_masked()
-                                    .child(
-                                        div()
-                                            .min_h_full()
-                                            .p_3()
-                                            .bg(cx.theme().table_even)
-                                            .border_t_1()
-                                            .border_color(cx.theme().border)
-                                            .child(content),
-                                    ),
+                                    .min_h_full()
+                                    .p_3()
+                                    .bg(cx.theme().table_even)
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(content),
                             ),
-                    ),
+                        ),
+                ),
             )
             .into_any_element()
     }

@@ -1,7 +1,7 @@
 pub mod edit_table;
 pub mod resize_handle;
-pub mod workbench;
 mod time;
+pub mod workbench;
 
 pub use edit_table::{
     CellCoord, CellEditor, CellRange, Column, ColumnFixed, ColumnSort, EditTable,

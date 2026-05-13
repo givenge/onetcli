@@ -220,8 +220,9 @@ fn save_settings_to_path(path: &Path, settings: &TerminalSettings) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
+        TerminalHighlightRule, TerminalSettings, TerminalSettingsStore,
         default_terminal_font_family, load_settings_from_path, resolve_initial_settings,
-        save_settings_to_path, TerminalHighlightRule, TerminalSettings, TerminalSettingsStore,
+        save_settings_to_path,
     };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

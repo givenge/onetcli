@@ -12,5 +12,5 @@ pub use serial_backend::SerialBackend;
 pub use ssh_backend::SshBackend;
 pub use terminal::TerminalScrollProxy;
 pub use types::{
-    ensure_utf8_locale_env, preferred_utf8_locale, LocalConfig, TerminalBackend, TerminalSize,
+    LocalConfig, TerminalBackend, TerminalSize, ensure_utf8_locale_env, preferred_utf8_locale,
 };

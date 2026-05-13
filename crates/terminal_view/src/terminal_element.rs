@@ -1576,9 +1576,9 @@ mod tests {
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::{Config as TermConfig, Term};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-    use tokio::sync::mpsc::unbounded_channel;
-    use terminal::pty_backend::GpuiEventProxy;
     use terminal::TerminalEvent;
+    use terminal::pty_backend::GpuiEventProxy;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5

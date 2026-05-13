@@ -12,11 +12,11 @@ use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
 use gpui_component::{
-    h_flex, kbd::Kbd, v_flex, ActiveTheme, BlinkCursor, Icon, IconName, Sizable, WindowExt,
+    ActiveTheme, BlinkCursor, Icon, IconName, Sizable, WindowExt, h_flex, kbd::Kbd, v_flex,
 };
 use one_core::gpui_tokio::Tokio;
 use one_core::llm::{
-    extract_stream_content, extract_stream_reasoning, ChatRequest, Message, MessageBlock, Role,
+    ChatRequest, Message, MessageBlock, Role, extract_stream_content, extract_stream_reasoning,
 };
 use std::borrow::Cow;
 use std::cell::{Cell as StdCell, RefCell};
@@ -57,8 +57,8 @@ use terminal::LocalConfig;
 use terminal::terminal::{
     ConnectionState, Terminal, TerminalConnectionKind, TerminalModelEvent, TerminalScrollProxy,
 };
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -4666,7 +4666,8 @@ impl Render for TerminalView {
             self.last_alt_screen = alt_screen;
             if alt_screen && self.last_size.is_some() {
                 tracing::info!(target: "terminal_residue", "nudge_resize fired on enter alt_screen");
-                self.terminal.update(cx, |terminal, _| terminal.nudge_resize());
+                self.terminal
+                    .update(cx, |terminal, _| terminal.nudge_resize());
             }
         }
 
@@ -5031,17 +5032,17 @@ impl Element for ResizeEventHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        UnbracketedPasteHazard, detect_unbracketed_paste_hazard, encode_mouse_modifiers,
-        has_trailing_line_continuation, has_unterminated_shell_quote, history_prompt_available,
-        history_prompt_dropdown_origin, history_prompt_overlay_bounds, mouse_button_code,
-        multiline_non_empty_line_count, sgr_mouse_button_report, sgr_mouse_wheel_report,
-        json_object_candidates, parse_terminal_agent_decision,
-        prepend_terminal_agent_system_prompt,
+        TerminalAgentDecision, UnbracketedPasteHazard, detect_unbracketed_paste_hazard,
+        encode_mouse_modifiers, has_trailing_line_continuation, has_unterminated_shell_quote,
+        history_prompt_available, history_prompt_dropdown_origin, history_prompt_overlay_bounds,
+        json_object_candidates, mouse_button_code, multiline_non_empty_line_count,
+        parse_terminal_agent_decision, prepend_terminal_agent_system_prompt,
+        sgr_mouse_button_report, sgr_mouse_wheel_report,
         should_defer_inline_history_prompt_input_to_text_system,
         should_dismiss_history_prompt_for_keystroke, should_dismiss_history_prompt_for_mouse,
         should_dismiss_history_prompt_for_scroll, should_reset_history_prompt_for_terminal_event,
         should_scroll_to_bottom_on_user_input, take_whole_scroll_lines,
-        terminal_agent_protocol_error_message, TerminalAgentDecision,
+        terminal_agent_protocol_error_message,
     };
     use crate::history_prompt::{HistoryPromptAccept, HistoryPromptState};
     use crate::llm::{Message, MessageBlock, Role};
@@ -5233,9 +5234,15 @@ mod tests {
     fn prepend_terminal_agent_system_prompt_moves_all_system_messages_to_front() {
         let messages = vec![
             Message::text(Role::User, "先列出 timer"),
-            Message::text(Role::Assistant, r#"{"type":"execute_command","command":"systemctl list-timers"}"#),
+            Message::text(
+                Role::Assistant,
+                r#"{"type":"execute_command","command":"systemctl list-timers"}"#,
+            ),
             Message::text(Role::System, "工具执行后追加的系统提示"),
-            Message::text(Role::User, "Tool `execute_command` result:\n```text\nok\n```"),
+            Message::text(
+                Role::User,
+                "Tool `execute_command` result:\n```text\nok\n```",
+            ),
         ];
 
         let merged = prepend_terminal_agent_system_prompt(messages);
