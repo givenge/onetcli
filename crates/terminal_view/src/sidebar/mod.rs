@@ -24,15 +24,15 @@ use crate::{
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div,
 };
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, v_flex};
-use one_core::layout::TOOLBAR_WIDTH;
 use one_core::storage::models::StoredConnection;
 use one_core::{
     AiChatPanel, AiChatPanelEvent, CodeBlockAction, ExternalAgentRequest, LanguageMatcher,
 };
+use one_ui::workbench;
 use rust_i18n::t;
 use ssh::SshSessionManager;
 use std::sync::Arc;
@@ -685,49 +685,30 @@ impl TerminalSidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active = self.active_panel == Some(panel);
-        let accent_color = self.colors.accent;
-        let accent_fg = self.colors.accent_foreground;
-        let muted_fg = self.colors.muted_foreground;
-        let muted_bg = self.colors.muted;
+        let accent_fg = cx.theme().accent_foreground;
+        let muted_fg = cx.theme().muted_foreground;
 
-        div()
-            .id(SharedString::from(format!("toolbar-btn-{:?}", panel)))
-            .w(px(36.0))
-            .h(px(36.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(is_active, |this| this.bg(accent_color))
-            .when(!is_active, |this| this.hover(|s| s.bg(muted_bg)))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.toggle_panel(panel, cx);
-            }))
-            .child(
-                Icon::new(panel.icon())
-                    .with_size(Size::Medium)
-                    .text_color(if is_active { accent_fg } else { muted_fg }),
-            )
+        workbench::side_toolbar_button(
+            SharedString::from(format!("toolbar-btn-{:?}", panel)),
+            is_active,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.toggle_panel(panel, cx);
+        }))
+        .child(
+            Icon::new(panel.icon())
+                .with_size(Size::Medium)
+                .text_color(if is_active { accent_fg } else { muted_fg }),
+        )
     }
 
     /// 渲染工具栏
     pub fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let border_color = self.colors.border;
-        let muted_bg = self.colors.background;
         let has_file_manager = self.file_manager_panel.is_some();
         let has_server_monitor = self.server_monitor_panel.is_some();
 
-        v_flex()
-            .flex_shrink_0()
-            .w(TOOLBAR_WIDTH)
-            .h_full()
-            .bg(muted_bg)
-            .border_l_1()
-            .border_color(border_color)
-            .items_center()
-            .py_2()
-            .gap_1()
+        workbench::side_toolbar(cx)
             .child(self.render_toolbar_button(SidebarPanel::Settings, window, cx))
             .child(self.render_toolbar_button(SidebarPanel::QuickCommand, window, cx))
             .child(self.render_toolbar_button(SidebarPanel::AiChat, window, cx))
