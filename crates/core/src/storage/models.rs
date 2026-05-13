@@ -110,7 +110,7 @@ impl ConnectionType {
             ConnectionType::SshSftp => IconName::TerminalColor,
             ConnectionType::Redis => IconName::Redis,
             ConnectionType::MongoDB => IconName::MongoDB,
-            ConnectionType::ChatDB => IconName::AI,
+            ConnectionType::ChatDB => IconName::ChatDB,
             ConnectionType::Serial => IconName::SerialPort,
         }
     }

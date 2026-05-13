@@ -1860,7 +1860,7 @@ impl ChatPanel {
             .gap_2()
             .child(
                 Avatar::new()
-                    .placeholder(Icon::new(IconName::AI))
+                    .placeholder(Icon::new(IconName::ChatDB))
                     .with_size(Size::Small)
                     .bg(cx.theme().primary.opacity(0.1))
                     .text_color(cx.theme().primary),
@@ -2158,7 +2158,7 @@ impl ChatPanel {
                 .gap_2()
                 .child(
                     Avatar::new()
-                        .placeholder(Icon::new(IconName::AI))
+                        .placeholder(Icon::new(IconName::ChatDB))
                         .with_size(Size::Small)
                         .bg(cx.theme().primary.opacity(0.1))
                         .text_color(cx.theme().primary),
@@ -2276,7 +2276,7 @@ impl TabContent for ChatPanel {
     }
 
     fn icon(&self, _cx: &App) -> Option<Icon> {
-        Some(IconName::Database.color().with_size(Size::Medium))
+        Some(IconName::ChatDB.color().with_size(Size::Medium))
     }
 
     fn closeable(&self, _cx: &App) -> bool {

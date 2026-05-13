@@ -250,7 +250,7 @@ impl MessageListRenderer {
             .gap_2()
             .child(
                 Avatar::new()
-                    .placeholder(gpui_component::Icon::new(IconName::AI))
+                    .placeholder(gpui_component::Icon::new(IconName::ChatDB))
                     .with_size(Size::Small)
                     .bg(cx.theme().primary.opacity(0.1))
                     .text_color(cx.theme().primary),
@@ -287,7 +287,7 @@ impl MessageListRenderer {
                 .gap_2()
                 .child(
                     Avatar::new()
-                        .placeholder(Icon::new(IconName::AI))
+                        .placeholder(Icon::new(IconName::ChatDB))
                         .with_size(Size::Small)
                         .bg(cx.theme().primary.opacity(0.1))
                         .text_color(cx.theme().primary),

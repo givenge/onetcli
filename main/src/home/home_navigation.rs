@@ -44,7 +44,7 @@ impl HomePage {
             )
             .child(
                 Button::new("rail-ai")
-                    .icon(IconName::AI)
+                    .icon(IconName::ChatDB.color())
                     .ghost()
                     .tooltip("ChatDB")
                     .on_click(cx.listener(|this, _, window, cx| {

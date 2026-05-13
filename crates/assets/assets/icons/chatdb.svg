@@ -1,0 +1,47 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="chatdb-bg" x1="18" y1="14" x2="110" y2="116" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#14B8A6"/>
+            <stop offset="1" stop-color="#2563EB"/>
+        </linearGradient>
+        <linearGradient id="chatdb-glow" x1="74" y1="52" x2="108" y2="88" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#ECFEFF"/>
+            <stop offset="1" stop-color="#A7F3D0"/>
+        </linearGradient>
+    </defs>
+
+    <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#chatdb-bg)"/>
+
+    <path
+        d="M32 42c0-8.3 13.4-15 30-15s30 6.7 30 15-13.4 15-30 15-30-6.7-30-15Z"
+        fill="none"
+        stroke="white"
+        stroke-width="6"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+    <path
+        d="M32 42v34c0 8.3 13.4 15 30 15 6.1 0 11.8-.9 16.5-2.5"
+        fill="none"
+        stroke="white"
+        stroke-width="6"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+    <path
+        d="M32 59c0 8.3 13.4 15 30 15 4.7 0 9.1-.5 13-1.5"
+        fill="none"
+        stroke="white"
+        stroke-width="6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity="0.82"/>
+    <path
+        d="M91 54l5 11.3 11 4.7-11 4.7L91 86l-5-11.3L75 70l11-4.7L91 54Z"
+        fill="url(#chatdb-glow)"
+        stroke="white"
+        stroke-width="4"
+        stroke-linejoin="round"/>
+    <path
+        d="M101 31l2.5 5.5 5.5 2.5-5.5 2.5L101 48l-2.5-5.5L93 40l5.5-2.5L101 31Z"
+        fill="white"
+        opacity="0.9"/>
+</svg>
