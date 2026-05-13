@@ -161,6 +161,22 @@ Home:
     en: Team
     zh-CN: 团队
     zh-HK: 團隊
+  empty_command_home:
+    en: No connections yet
+    zh-CN: 还没有连接
+    zh-HK: 還沒有連線
+  empty_command_home_hint:
+    en: Create a connection to start using your workspace.
+    zh-CN: 新建一个连接后即可开始使用工作区。
+    zh-HK: 新建一個連線後即可開始使用工作區。
+  filtered_empty:
+    en: No matching connections
+    zh-CN: 没有匹配的连接
+    zh-HK: 沒有匹配的連線
+  filtered_empty_hint:
+    en: Change the search text, connection type, or workspace filter.
+    zh-CN: 请调整搜索内容、连接类型或工作区筛选。
+    zh-HK: 請調整搜尋內容、連線類型或工作區篩選。
 
 # 团队同步
 TeamSync:

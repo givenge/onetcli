@@ -1,5 +1,12 @@
+pub(crate) mod connection_card;
+pub(crate) mod connection_card_actions;
+pub(crate) mod connection_card_parts;
 pub(crate) mod connection_display;
 pub(crate) mod home_connection_quick_open;
+pub(crate) mod home_content;
+pub(crate) mod home_navigation;
 pub(crate) mod home_strategy;
 pub(crate) mod home_tabs;
+pub(crate) mod home_toolbar;
+pub(crate) mod home_toolbar_filter;
 pub(crate) mod home_workspace_filter;
