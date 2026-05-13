@@ -10,6 +10,21 @@
 
 ---
 
+## Execution Progress
+
+- 2026-05-12: Task 1 committed as `e7e8662f refactor(ui): add shared chrome primitives`.
+- 2026-05-12: Task 2 committed as `70a3a83a refactor(ui): tune primary themes and story matrix`.
+- 2026-05-12: Task 3 committed as `dcb53a21 refactor(one-ui): add workbench shell helpers`.
+- 2026-05-12: Task 4 committed as `41ae80ee refactor(home): extract connection display helpers`.
+- 2026-05-13: Task 5 committed as `e1e18f9b refactor(home): build command home shell`.
+- 2026-05-13: Task 5 visual alignment follow-up committed as `eeec329c refactor(home): align command home visuals`.
+- 2026-05-13: Task 6 base workbench pass committed as `fb7ccfe0 refactor(ui): align workbench chrome`.
+- 2026-05-13: Task 6 side chrome and new connection picker follow-up committed as `ba470ad6 refactor(ui): align side chrome and connection picker`.
+- 2026-05-13: Formatting cleanup committed as `5994e2d7 style: apply rustfmt cleanup`.
+- Remaining: reliable native visual smoke still needs a launch path that cannot be confused with the installed `com.onetcli.app` bundle.
+
+---
+
 ## Scope And Guardrails
 
 - Keep storage models, repository APIs, connection opening, sync engine, auth, license, terminal execution, SFTP transfer, SQL execution, Redis commands, MongoDB commands, and ChatDB request semantics unchanged.
