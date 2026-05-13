@@ -3,6 +3,7 @@ use crate::home::connection_card_actions::{
 };
 use crate::home::connection_card_parts::{active_dot, connection_card_body};
 use crate::home::connection_display::has_team_badge;
+use crate::home::home_layout::{CARD_HEIGHT, CARD_PADDING_X, CARD_PADDING_Y, CARD_RADIUS};
 use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home_tab::HomePage;
 use gpui::{
@@ -110,26 +111,26 @@ fn connection_card_shell(
         .justify_center()
         .id(SharedString::from(format!("conn-card-{}", card_conn_id)))
         .w_full()
-        .h(px(90.))
-        .rounded(px(8.0))
+        .h(px(CARD_HEIGHT))
+        .rounded(px(CARD_RADIUS))
         .bg(cx.theme().background)
-        .p_3()
+        .px(px(CARD_PADDING_X))
+        .py(px(CARD_PADDING_Y))
         .border_1()
-        .rounded_lg()
         .relative()
         .overflow_hidden()
         .shadow_sm()
         .group("")
         .when(is_selected, |this| {
             this.border_color(cx.theme().list_active_border)
-                .shadow_lg()
-                .border_l_3()
+                .bg(cx.theme().list_active)
+                .shadow_md()
         })
         .when(!is_selected, |this| this.border_color(cx.theme().border))
         .cursor_pointer()
         .hover(|style| {
             style
-                .shadow_lg()
+                .shadow_md()
                 .border_color(cx.theme().list_active_border)
         })
 }

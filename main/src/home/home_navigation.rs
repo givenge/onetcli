@@ -1,9 +1,16 @@
+use crate::home::home_layout::{
+    NAV_ITEM_GAP, NAV_ITEM_HEIGHT, NAV_ITEM_ICON_SLOT, NAV_ITEM_PADDING_X, NAV_ITEM_RADIUS,
+    NAV_LIST_GAP, SIDEBAR_PADDING, SIDEBAR_WIDTH,
+};
 use crate::home_tab::HomePage;
 use crate::setting_tab::GlobalCurrentUser;
 use crate::user_avatar::render_user_avatar;
-use gpui::{Context, IntoElement, ParentElement as _, Styled as _, Window, div, px};
+use gpui::{
+    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+};
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Selectable as _,
+    ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     chrome, h_flex, v_flex,
 };
@@ -67,11 +74,10 @@ impl HomePage {
         }
 
         v_flex()
-            .w(px(184.0))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .gap_1()
-            .p_2()
+            .p(px(SIDEBAR_PADDING))
             .border_r_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
@@ -81,25 +87,61 @@ impl HomePage {
     }
 
     fn render_connection_type_buttons(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().gap_1().children(
+        v_flex().gap(px(NAV_LIST_GAP)).children(
             ConnectionType::all()
                 .into_iter()
                 .filter(|kind| *kind != ConnectionType::ChatDB)
                 .map(|kind| {
                     let selected = self.selected_filter == kind;
-                    Button::new(kind.label())
-                        .ghost()
-                        .selected(selected)
-                        .w_full()
-                        .justify_start()
-                        .icon(Icon::new(kind.icon()).color())
-                        .label(kind.label())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected_filter = kind;
-                            cx.notify();
-                        }))
+                    self.render_connection_type_row(kind, selected, cx)
                 }),
         )
+    }
+
+    fn render_connection_type_row(
+        &self,
+        kind: ConnectionType,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(SharedString::from(format!("connection-type-{}", kind)))
+            .w_full()
+            .h(px(NAV_ITEM_HEIGHT))
+            .items_center()
+            .gap(px(NAV_ITEM_GAP))
+            .px(px(NAV_ITEM_PADDING_X))
+            .rounded(px(NAV_ITEM_RADIUS))
+            .text_color(cx.theme().muted_foreground)
+            .cursor_pointer()
+            .when(selected, |this| {
+                this.bg(cx.theme().sidebar_accent)
+                    .text_color(cx.theme().sidebar_accent_foreground)
+            })
+            .when(!selected, |this| {
+                this.hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.55)))
+            })
+            .child(
+                div()
+                    .w(px(NAV_ITEM_ICON_SLOT))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(kind.icon()).color().with_size(Size::Medium)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(kind.label()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_filter = kind;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_navigation_user(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -1,3 +1,4 @@
+use crate::home::home_layout::SEARCH_WIDTH;
 use crate::home_tab::HomePage;
 use crate::license::{is_feature_enabled, show_upgrade_dialog};
 use gpui::{
@@ -58,7 +59,11 @@ impl HomePage {
         h_flex()
             .gap_1()
             .items_center()
-            .child(Input::new(&self.search_input).cleanable(true).w(px(260.0)))
+            .child(
+                Input::new(&self.search_input)
+                    .cleanable(true)
+                    .w(px(SEARCH_WIDTH)),
+            )
             .child(
                 Button::new("refresh-button")
                     .icon(IconName::Refresh)

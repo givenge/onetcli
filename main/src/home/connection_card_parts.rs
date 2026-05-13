@@ -1,4 +1,8 @@
 use crate::home::connection_display::{connection_icon, connection_subtitle};
+use crate::home::home_layout::{
+    ACTIVE_DOT_INSET, ACTIVE_DOT_SIZE, CARD_BODY_GAP, CARD_ICON_SIZE, CARD_ICON_TILE_SIZE,
+    CARD_RADIUS, CARD_TEXT_GAP,
+};
 use crate::home_tab::HomePage;
 use gpui::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
@@ -12,10 +16,10 @@ use rust_i18n::t;
 pub(super) fn active_dot(cx: &mut Context<HomePage>) -> impl IntoElement {
     div()
         .absolute()
-        .top(px(6.0))
-        .left(px(6.0))
-        .w(px(10.0))
-        .h(px(10.0))
+        .top(px(ACTIVE_DOT_INSET))
+        .left(px(ACTIVE_DOT_INSET))
+        .w(px(ACTIVE_DOT_SIZE))
+        .h(px(ACTIVE_DOT_SIZE))
         .rounded_full()
         .bg(cx.theme().success)
         .shadow_lg()
@@ -28,16 +32,19 @@ pub(super) fn connection_card_body(
 ) -> impl IntoElement {
     h_flex()
         .items_center()
-        .gap_2()
+        .gap(px(CARD_BODY_GAP))
         .w_full()
         .child(
             div()
-                .h(px(48.0))
-                .rounded(px(8.0))
+                .size(px(CARD_ICON_TILE_SIZE))
+                .rounded(px(CARD_RADIUS))
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(connection_icon(&conn).with_size(px(40.0))),
+                .bg(cx.theme().muted)
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.7))
+                .child(connection_icon(&conn).with_size(px(CARD_ICON_SIZE))),
         )
         .child(connection_card_text(conn, has_team, cx))
 }
@@ -50,7 +57,7 @@ fn connection_card_text(
     v_flex()
         .flex_1()
         .min_w_0()
-        .gap_0p5()
+        .gap(px(CARD_TEXT_GAP))
         .overflow_hidden()
         .child(connection_name_row(&conn, has_team, cx))
         .when_some(connection_subtitle(&conn), |this, conn_info| {
@@ -80,6 +87,7 @@ fn connection_name_row(
 ) -> impl IntoElement {
     let name_tooltip: SharedString = conn.name.clone().into();
     h_flex()
+        .items_center()
         .gap_1()
         .overflow_hidden()
         .child(

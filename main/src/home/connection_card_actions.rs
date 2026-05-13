@@ -1,3 +1,7 @@
+use crate::home::home_layout::{
+    CARD_ACTION_GAP, CARD_ACTION_GROUP_PADDING, CARD_ACTION_INSET, CARD_ACTION_RADIUS,
+    CARD_ACTION_SIZE,
+};
 use crate::home_tab::HomePage;
 use gpui::{
     AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
@@ -6,7 +10,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, Sizable as _, Size,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
 };
 use one_core::cloud_sync::can_edit_connection;
@@ -69,9 +73,15 @@ pub(super) fn connection_card_actions(
 
     h_flex()
         .absolute()
-        .top_2()
-        .right_2()
-        .gap_1()
+        .top(px(CARD_ACTION_INSET))
+        .right(px(CARD_ACTION_INSET))
+        .gap(px(CARD_ACTION_GAP))
+        .p(px(CARD_ACTION_GROUP_PADDING))
+        .rounded(px(CARD_ACTION_RADIUS))
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background.opacity(0.96))
+        .shadow_sm()
         .group_hover("", |style| style.opacity(1.0))
         .opacity(0.0)
         .when_some(drag, |this, drag| this.child(drag_handle(drag, cx)))
@@ -107,12 +117,12 @@ fn drag_handle(data: DragHandleData, cx: &mut Context<HomePage>) -> impl IntoEle
     let drag = DragConnectionCard::new(data.connection_id, data.workspace_id, data.name);
     div()
         .id(SharedString::from(format!("drag-conn-{}", data.button_id)))
-        .w(px(28.0))
-        .h(px(28.0))
+        .w(px(CARD_ACTION_SIZE))
+        .h(px(CARD_ACTION_SIZE))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
+        .rounded(px(CARD_ACTION_RADIUS))
         .bg(cx.theme().background.opacity(0.9))
         .border_1()
         .border_color(cx.theme().border)
@@ -136,7 +146,7 @@ fn sftp_button(conn: StoredConnection, cx: &mut Context<HomePage>) -> impl IntoE
     )))
     .icon(IconName::Folder1.color())
     .with_size(Size::Small)
-    .primary()
+    .custom(card_action_variant(cx))
     .tooltip(t!("Home.open_sftp"))
     .on_click(cx.listener(move |this, _, window, cx| {
         cx.stop_propagation();
@@ -151,7 +161,7 @@ fn duplicate_button(conn: StoredConnection, cx: &mut Context<HomePage>) -> impl 
     )))
     .icon(IconName::Copy)
     .with_size(Size::Small)
-    .primary()
+    .custom(card_action_variant(cx))
     .tooltip(t!("Home.duplicate_connection"))
     .on_click(cx.listener(move |this, _, window, cx| {
         cx.stop_propagation();
@@ -167,7 +177,7 @@ fn edit_button(conn: StoredConnection, cx: &mut Context<HomePage>) -> impl IntoE
     Button::new(SharedString::from(format!("edit-conn-{}", button_id)))
         .icon(IconName::Edit)
         .with_size(Size::Small)
-        .primary()
+        .custom(card_action_variant(cx))
         .tooltip(t!("Home.edit_connection"))
         .on_click(cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
@@ -209,7 +219,7 @@ fn delete_button(conn: StoredConnection, cx: &mut Context<HomePage>) -> impl Int
     Button::new(SharedString::from(format!("delete-conn-{}", button_id)))
         .icon(IconName::Remove)
         .with_size(Size::Small)
-        .danger()
+        .custom(card_danger_action_variant(cx))
         .tooltip(t!("Home.delete_connection"))
         .on_click(cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
@@ -218,4 +228,22 @@ fn delete_button(conn: StoredConnection, cx: &mut Context<HomePage>) -> impl Int
                 this.confirm_delete_connection(conn_id, conn_name, window, cx);
             }
         }))
+}
+
+fn card_action_variant(cx: &mut Context<HomePage>) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(cx.theme().background.opacity(0.94))
+        .foreground(cx.theme().muted_foreground)
+        .border(cx.theme().border)
+        .hover(cx.theme().accent)
+        .active(cx.theme().list_active)
+}
+
+fn card_danger_action_variant(cx: &mut Context<HomePage>) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(cx.theme().background.opacity(0.94))
+        .foreground(cx.theme().danger)
+        .border(cx.theme().border)
+        .hover(cx.theme().danger.opacity(0.12))
+        .active(cx.theme().danger.opacity(0.18))
 }
