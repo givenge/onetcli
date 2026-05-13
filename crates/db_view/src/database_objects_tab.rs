@@ -1,5 +1,8 @@
-use crate::database_view_plugin::{ToolbarButtonType, build_toolbar_buttons_for};
-use crate::db_tree_view::get_icon_for_node_type;
+use crate::database_view_plugin::{
+    ContextMenuEvent, ContextMenuItem, ToolbarButtonType, build_context_menu_for,
+    build_toolbar_buttons_for,
+};
+use crate::db_tree_view::{DbTreeViewEvent, SqlDumpMode, get_icon_for_node_type};
 use db::{DbNode, DbNodeType, GlobalDbState, ObjectView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -11,6 +14,7 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
+use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
@@ -19,8 +23,8 @@ use gpui_component::{
 use gpui_component::{InteractiveElementExt, WindowExt};
 use one_core::storage::manager::get_queries_dir;
 use one_core::storage::{
-    ConnectionRepository, DatabaseType, DbConnectionConfig, GlobalStorageState, StorageManager,
-    Workspace,
+    ActiveConnections, ConnectionRepository, DatabaseType, DbConnectionConfig, GlobalStorageState,
+    StorageManager, Workspace,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::debouncer::Debouncer;
@@ -75,8 +79,14 @@ pub enum DatabaseObjectsEvent {
     /// 新建数据库
     CreateDatabase { node: DbNode },
 
+    /// 打开数据库或 Schema 的 ER 图
+    OpenErDiagram { node: DbNode },
+
     /// 编辑数据库
     EditDatabase { node: DbNode },
+
+    /// 关闭数据库
+    CloseDatabase { node: DbNode },
 
     /// 删除数据库
     DeleteDatabase { node: DbNode },
@@ -93,8 +103,26 @@ pub enum DatabaseObjectsEvent {
     /// 设计表（新建或编辑）
     DesignTable { node: DbNode },
 
+    /// 重命名表
+    RenameTable { node: DbNode },
+
+    /// 创建备份表
+    CopyTable { node: DbNode },
+
+    /// 清空表
+    TruncateTable { node: DbNode },
+
     /// 删除表
     DeleteTable { node: DbNode },
+
+    /// 导入数据
+    ImportData { node: DbNode },
+
+    /// 导出表
+    ExportData { node: DbNode },
+
+    /// 转储 SQL 文件
+    DumpSqlFile { node: DbNode, mode: SqlDumpMode },
 
     /// 打开视图数据
     OpenViewData { node: DbNode },
@@ -113,6 +141,9 @@ pub enum DatabaseObjectsEvent {
 
     /// 删除查询
     DeleteQuery { node: DbNode },
+
+    /// 运行 SQL 文件
+    RunSqlFile { node: DbNode },
 
     /// 删除模式/Schema
     DeleteSchema { node: DbNode },
@@ -362,6 +393,15 @@ impl DatabaseObjects {
                 self.selected_indices.insert(row_ix);
             }
         } else if !self.selected_indices.contains(&row_ix) {
+            self.selected_indices.clear();
+            self.selected_indices.insert(row_ix);
+        }
+    }
+
+    fn select_context_row(&mut self, row_ix: usize) {
+        let is_single_selected =
+            self.selected_indices.len() == 1 && self.selected_indices.contains(&row_ix);
+        if !is_single_selected {
             self.selected_indices.clear();
             self.selected_indices.insert(row_ix);
         }
@@ -744,6 +784,245 @@ impl DatabaseObjects {
             .into_iter()
             .filter_map(|row_ix| self.build_node_for_row(row_ix))
             .collect()
+    }
+
+    fn event_for_tree_event(event: &DbTreeViewEvent, node: DbNode) -> Option<DatabaseObjectsEvent> {
+        match event {
+            DbTreeViewEvent::OpenTableData { .. } => {
+                Some(DatabaseObjectsEvent::OpenTableData { node })
+            }
+            DbTreeViewEvent::DesignTable { .. } => Some(DatabaseObjectsEvent::DesignTable { node }),
+            DbTreeViewEvent::RenameTable { .. } => Some(DatabaseObjectsEvent::RenameTable { node }),
+            DbTreeViewEvent::CopyTable { .. } => Some(DatabaseObjectsEvent::CopyTable { node }),
+            DbTreeViewEvent::TruncateTable { .. } => {
+                Some(DatabaseObjectsEvent::TruncateTable { node })
+            }
+            DbTreeViewEvent::DeleteTable { .. } => Some(DatabaseObjectsEvent::DeleteTable { node }),
+            DbTreeViewEvent::ImportData { .. } => Some(DatabaseObjectsEvent::ImportData { node }),
+            DbTreeViewEvent::ExportData { .. } => Some(DatabaseObjectsEvent::ExportData { node }),
+            DbTreeViewEvent::DumpSqlFile { mode, .. } => {
+                Some(DatabaseObjectsEvent::DumpSqlFile { node, mode: *mode })
+            }
+            DbTreeViewEvent::OpenViewData { .. } => {
+                Some(DatabaseObjectsEvent::OpenViewData { node })
+            }
+            DbTreeViewEvent::DeleteView { .. } => Some(DatabaseObjectsEvent::DeleteView { node }),
+            DbTreeViewEvent::CreateNewQuery { .. } => {
+                Some(DatabaseObjectsEvent::CreateNewQuery { node })
+            }
+            DbTreeViewEvent::OpenNamedQuery { .. } => {
+                Some(DatabaseObjectsEvent::OpenNamedQuery { node })
+            }
+            DbTreeViewEvent::RenameQuery { .. } => Some(DatabaseObjectsEvent::RenameQuery { node }),
+            DbTreeViewEvent::DeleteQuery { .. } => Some(DatabaseObjectsEvent::DeleteQuery { node }),
+            DbTreeViewEvent::CloseConnection { .. } => {
+                Some(DatabaseObjectsEvent::CloseConnection { node })
+            }
+            DbTreeViewEvent::DeleteConnection { .. } => {
+                Some(DatabaseObjectsEvent::DeleteConnection { node })
+            }
+            DbTreeViewEvent::CreateDatabase { .. } => {
+                Some(DatabaseObjectsEvent::CreateDatabase { node })
+            }
+            DbTreeViewEvent::OpenErDiagram { .. } => {
+                Some(DatabaseObjectsEvent::OpenErDiagram { node })
+            }
+            DbTreeViewEvent::EditDatabase { .. } => {
+                Some(DatabaseObjectsEvent::EditDatabase { node })
+            }
+            DbTreeViewEvent::CloseDatabase { .. } => {
+                Some(DatabaseObjectsEvent::CloseDatabase { node })
+            }
+            DbTreeViewEvent::DeleteDatabase { .. } => {
+                Some(DatabaseObjectsEvent::DeleteDatabase { node })
+            }
+            DbTreeViewEvent::CreateSchema { .. } => {
+                Some(DatabaseObjectsEvent::CreateSchema { node })
+            }
+            DbTreeViewEvent::DeleteSchema { .. } => {
+                Some(DatabaseObjectsEvent::DeleteSchema { node })
+            }
+            DbTreeViewEvent::RunSqlFile { .. } => Some(DatabaseObjectsEvent::RunSqlFile { node }),
+            _ => None,
+        }
+    }
+
+    fn context_menu_has_action(items: &[ContextMenuItem], node: &DbNode) -> bool {
+        items.iter().any(|item| match item {
+            ContextMenuItem::Item { event, .. } => match event {
+                ContextMenuEvent::TreeEvent(tree_event) => {
+                    Self::event_for_tree_event(tree_event, node.clone()).is_some()
+                }
+                ContextMenuEvent::Custom(_) => false,
+            },
+            ContextMenuItem::Submenu { items, .. } => Self::context_menu_has_action(items, node),
+            ContextMenuItem::Separator => false,
+        })
+    }
+
+    fn push_context_menu_item(
+        menu: PopupMenu,
+        item: PopupMenuItem,
+        pending_separator: &mut bool,
+    ) -> PopupMenu {
+        let menu = if *pending_separator {
+            *pending_separator = false;
+            menu.separator()
+        } else {
+            menu
+        };
+        menu.item(item)
+    }
+
+    fn context_menu_action_item(
+        label: String,
+        tree_event: DbTreeViewEvent,
+        requires_active: bool,
+        is_active: bool,
+        node: &DbNode,
+        view: &Entity<Self>,
+        window: &mut Window,
+    ) -> Option<PopupMenuItem> {
+        let objects_event = Self::event_for_tree_event(&tree_event, node.clone())?;
+        let view_ref = view.clone();
+        Some(
+            PopupMenuItem::new(label)
+                .disabled(requires_active && !is_active)
+                .on_click(window.listener_for(&view_ref, move |_this, _, _, cx| {
+                    cx.emit(objects_event.clone());
+                })),
+        )
+    }
+
+    fn context_menu_submenu_item(
+        label: String,
+        items: Vec<ContextMenuItem>,
+        is_active: bool,
+        node: DbNode,
+        view: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+        requires_active: bool,
+    ) -> Option<PopupMenuItem> {
+        if !Self::context_menu_has_action(&items, &node) {
+            return None;
+        }
+        let view_submenu = view.clone();
+        let submenu_node = node.clone();
+        let submenu_entity = PopupMenu::build(window, cx, move |submenu, window, cx| {
+            Self::render_context_menu_items(
+                submenu,
+                items.clone(),
+                is_active,
+                submenu_node.clone(),
+                &view_submenu,
+                window,
+                cx,
+            )
+        });
+        Some(PopupMenuItem::submenu(label, submenu_entity).disabled(requires_active && !is_active))
+    }
+
+    fn render_context_menu_items(
+        mut menu: PopupMenu,
+        items: Vec<ContextMenuItem>,
+        is_active: bool,
+        node: DbNode,
+        view: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let mut has_item = false;
+        let mut pending_separator = false;
+
+        for item in items {
+            let menu_item = match item {
+                ContextMenuItem::Item {
+                    label,
+                    event: ContextMenuEvent::TreeEvent(tree_event),
+                    requires_active,
+                } => Self::context_menu_action_item(
+                    label,
+                    tree_event,
+                    requires_active,
+                    is_active,
+                    &node,
+                    view,
+                    window,
+                ),
+                ContextMenuItem::Item { .. } => None,
+                ContextMenuItem::Separator => {
+                    if has_item {
+                        pending_separator = true;
+                    }
+                    continue;
+                }
+                ContextMenuItem::Submenu {
+                    label,
+                    items: sub_items,
+                    requires_active,
+                } => Self::context_menu_submenu_item(
+                    label,
+                    sub_items,
+                    is_active,
+                    node.clone(),
+                    view,
+                    window,
+                    cx,
+                    requires_active,
+                ),
+            };
+
+            let Some(menu_item) = menu_item else { continue };
+            menu = Self::push_context_menu_item(menu, menu_item, &mut pending_separator);
+            has_item = true;
+        }
+
+        menu
+    }
+
+    fn build_context_menu_for_row(
+        mut menu: PopupMenu,
+        row_ix: usize,
+        view: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let Some(node) = view.read(cx).build_node_for_row(row_ix) else {
+            return menu;
+        };
+        let refresh_node = view
+            .read(cx)
+            .current_node
+            .clone()
+            .unwrap_or_else(|| node.clone());
+        let is_active = node
+            .connection_id
+            .parse::<i64>()
+            .ok()
+            .map(|conn_id| cx.global::<ActiveConnections>().is_active(conn_id))
+            .unwrap_or(false);
+
+        let _ = view.update(cx, |this, cx| {
+            this.select_context_row(row_ix);
+            this.refresh_ddl_preview_for_selection(cx);
+            cx.notify();
+        });
+
+        let menu_items = build_context_menu_for(node.database_type, &node.id, node.node_type, cx);
+        menu = Self::render_context_menu_items(menu, menu_items, is_active, node, view, window, cx);
+
+        let view_ref = view.clone();
+        menu.item(
+            PopupMenuItem::new(t!("Common.refresh")).on_click(window.listener_for(
+                &view_ref,
+                move |_this, _, _, cx| {
+                    cx.emit(DatabaseObjectsEvent::Refresh {
+                        node: refresh_node.clone(),
+                    });
+                },
+            )),
+        )
     }
 
     fn batch_action_for_event(event: &DatabaseObjectsEvent) -> Option<DatabaseObjectsBatchAction> {
@@ -1175,6 +1454,7 @@ impl Render for DatabaseObjects {
         let list_columns = columns.clone();
         let list_search_query = search_query.clone();
         let table_width = self.table_content_width(&columns, show_row_number);
+        let view = cx.entity();
 
         v_flex()
             .size_full()
@@ -1251,6 +1531,7 @@ impl Render for DatabaseObjects {
                                                                 .selected_indices
                                                                 .contains(&list_ix);
                                                             let row_ix = list_ix;
+                                                            let row_view = view.clone();
                                                             div()
                                                                 .id(list_ix)
                                                                 .cursor_pointer()
@@ -1277,6 +1558,17 @@ impl Render for DatabaseObjects {
                                                                         this.handle_row_double_click(row_ix, cx);
                                                                     },
                                                                 ))
+                                                                .context_menu(
+                                                                    move |menu, window, cx| {
+                                                                        Self::build_context_menu_for_row(
+                                                                            menu,
+                                                                            row_ix,
+                                                                            &row_view,
+                                                                            window,
+                                                                            cx,
+                                                                        )
+                                                                    },
+                                                                )
                                                                 .child(state.render_row(
                                                                     row_ix,
                                                                     row_values,

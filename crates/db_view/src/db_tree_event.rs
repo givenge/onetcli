@@ -251,6 +251,7 @@ impl DatabaseEventHandler {
                                 node,
                                 global_state,
                                 tree_view.clone(),
+                                None,
                                 window,
                                 cx,
                             );
@@ -274,6 +275,7 @@ impl DatabaseEventHandler {
                                 node,
                                 global_state,
                                 tree_view.clone(),
+                                None,
                                 window,
                                 cx,
                             );
@@ -360,12 +362,24 @@ impl DatabaseEventHandler {
                             cx,
                         );
                     }
+                    DatabaseObjectsEvent::OpenErDiagram { node } => {
+                        Self::handle_open_er_diagram(node.clone(), tab_container, window, cx);
+                    }
                     DatabaseObjectsEvent::EditDatabase { node } => {
                         Self::handle_edit_database(
                             node.clone(),
                             global_state,
                             tree_view,
                             Some(objects_panel.clone()),
+                            window,
+                            cx,
+                        );
+                    }
+                    DatabaseObjectsEvent::CloseDatabase { node } => {
+                        Self::handle_close_database(
+                            node.clone(),
+                            global_state,
+                            tree_view,
                             window,
                             cx,
                         );
@@ -414,6 +428,36 @@ impl DatabaseEventHandler {
                             cx,
                         );
                     }
+                    DatabaseObjectsEvent::RenameTable { node } => {
+                        Self::handle_rename_table(
+                            node.clone(),
+                            global_state,
+                            tree_view,
+                            Some(objects_panel.clone()),
+                            window,
+                            cx,
+                        );
+                    }
+                    DatabaseObjectsEvent::CopyTable { node } => {
+                        Self::handle_copy_table(
+                            node.clone(),
+                            global_state,
+                            tree_view,
+                            objects_panel.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                    DatabaseObjectsEvent::TruncateTable { node } => {
+                        Self::handle_truncate_table(
+                            node.clone(),
+                            global_state,
+                            tree_view,
+                            Some(objects_panel.clone()),
+                            window,
+                            cx,
+                        );
+                    }
                     DatabaseObjectsEvent::DeleteTable { node } => {
                         Self::handle_delete_table(
                             node.clone(),
@@ -423,6 +467,15 @@ impl DatabaseEventHandler {
                             window,
                             cx,
                         );
+                    }
+                    DatabaseObjectsEvent::ImportData { node } => {
+                        Self::handle_import_data(node.clone(), window, cx);
+                    }
+                    DatabaseObjectsEvent::ExportData { node } => {
+                        Self::handle_export_data(node.clone(), global_state, window, cx);
+                    }
+                    DatabaseObjectsEvent::DumpSqlFile { node, mode } => {
+                        Self::handle_dump_sql_file(node.clone(), *mode, global_state, window, cx);
                     }
                     DatabaseObjectsEvent::OpenViewData { node } => {
                         Self::handle_open_view_data(node.clone(), tab_container, window, cx);
@@ -460,6 +513,9 @@ impl DatabaseEventHandler {
                             window,
                             cx,
                         );
+                    }
+                    DatabaseObjectsEvent::RunSqlFile { node } => {
+                        Self::handle_run_sql_file(node.clone(), global_state, window, cx);
                     }
                     DatabaseObjectsEvent::DeleteSchema { node } => {
                         Self::handle_delete_schema(
@@ -2694,6 +2750,7 @@ impl DatabaseEventHandler {
         node: DbNode,
         global_state: GlobalDbState,
         tree_view: Entity<DbTreeView>,
+        objects_panel: Option<Entity<DatabaseObjectsPanel>>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2721,6 +2778,7 @@ impl DatabaseEventHandler {
             let state = global_state.clone();
             let input = input_state.clone();
             let tree = tree_view.clone();
+            let panel = objects_panel.clone();
 
             dialog
                 .overlay(false)
@@ -2764,6 +2822,7 @@ impl DatabaseEventHandler {
                     let meta = meta.clone();
                     let state = state.clone();
                     let tree = tree.clone();
+                    let panel = panel.clone();
 
                     cx.spawn(async move |cx: &mut AsyncApp| {
                         let old_name_log = old_name.clone();
@@ -2785,11 +2844,17 @@ impl DatabaseEventHandler {
                             .await;
                         match task {
                             Ok(_) => {
+                                let state_for_refresh = state.clone();
                                 let _ = cx.update(|cx| {
                                     // 刷新数据库节点以显示新表名
                                     tree.update(cx, |tree, cx| {
                                         tree.refresh_tree(db_node_id, cx);
                                     });
+                                    if let Some(panel) = panel {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.refresh(state_for_refresh, cx);
+                                        });
+                                    }
                                     Self::show_success_async(
                                         cx,
                                         t!(
@@ -3013,6 +3078,7 @@ impl DatabaseEventHandler {
         node: DbNode,
         global_state: GlobalDbState,
         _tree_view: Entity<DbTreeView>,
+        objects_panel: Option<Entity<DatabaseObjectsPanel>>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -3026,6 +3092,7 @@ impl DatabaseEventHandler {
             let meta = metadata.clone();
             let state = global_state.clone();
             let tbl_name_display = table_name.clone();
+            let panel = objects_panel.clone();
 
             dialog
                 .overlay(false)
@@ -3049,6 +3116,7 @@ impl DatabaseEventHandler {
                     let meta = meta.clone();
                     let state = state.clone();
                     let tbl_name_log = tbl_name.clone();
+                    let panel = panel.clone();
 
                     cx.spawn(async move |cx: &mut AsyncApp| {
                         let database = meta
@@ -3061,7 +3129,13 @@ impl DatabaseEventHandler {
 
                         match task {
                             Ok(_) => {
+                                let state_for_refresh = state.clone();
                                 let _ = cx.update(|cx| {
+                                    if let Some(panel) = panel {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.refresh(state_for_refresh, cx);
+                                        });
+                                    }
                                     Self::show_success_async(
                                         cx,
                                         t!(
