@@ -88,6 +88,7 @@ impl Gallery {
                     StoryContainer::panel::<TagStory>(window, cx),
                     StoryContainer::panel::<TextareaStory>(window, cx),
                     StoryContainer::panel::<ThemeColorsStory>(window, cx),
+                    StoryContainer::panel::<DesignSystemStory>(window, cx),
                     StoryContainer::panel::<ToggleStory>(window, cx),
                     StoryContainer::panel::<TooltipStory>(window, cx),
                     StoryContainer::panel::<TreeStory>(window, cx),

@@ -357,7 +357,7 @@ pub struct ThemeConfigColors {
     #[serde(rename = "warning.foreground")]
     pub warning_foreground: Option<SharedString>,
     /// Overlay background color.
-    #[serde(rename = "overlay")]
+    #[serde(rename = "overlay.background", alias = "overlay")]
     pub overlay: Option<SharedString>,
     /// Window border color.
     ///
@@ -698,5 +698,97 @@ impl Theme {
 
         self.colors.apply_config(&config, &default_theme.colors);
         self.mode = config.mode;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::ThemeSet;
+
+    const REQUIRED_THEME_KEYS: &[&str] = &[
+        "background",
+        "foreground",
+        "border",
+        "muted.background",
+        "muted.foreground",
+        "secondary.background",
+        "secondary.foreground",
+        "secondary.hover.background",
+        "secondary.active.background",
+        "primary.background",
+        "primary.foreground",
+        "primary.hover.background",
+        "primary.active.background",
+        "danger.background",
+        "danger.foreground",
+        "danger.hover.background",
+        "danger.active.background",
+        "warning.background",
+        "warning.foreground",
+        "warning.hover.background",
+        "warning.active.background",
+        "success.background",
+        "success.foreground",
+        "success.hover.background",
+        "success.active.background",
+        "sidebar.background",
+        "sidebar.foreground",
+        "sidebar.border",
+        "sidebar.accent.background",
+        "sidebar.accent.foreground",
+        "tab.background",
+        "tab.active.background",
+        "tab.active.foreground",
+        "tab_bar.background",
+        "table.background",
+        "table.head.background",
+        "table.head.foreground",
+        "table.hover.background",
+        "table.active.background",
+        "table.active.border",
+        "table.row.border",
+        "popover.background",
+        "popover.foreground",
+        "overlay.background",
+        "ring",
+        "input.border",
+    ];
+
+    #[test]
+    fn default_light_and_classic_dark_define_required_ui_tokens() {
+        let value: Value = serde_json::from_str(include_str!("default-theme.json")).unwrap();
+        let themes = value["themes"].as_array().unwrap();
+
+        for name in ["Default Light", "macOS Classic Dark"] {
+            let theme = themes
+                .iter()
+                .find(|theme| theme["name"] == name)
+                .unwrap_or_else(|| panic!("missing theme {name}"));
+            let colors = theme["colors"].as_object().unwrap();
+            for key in REQUIRED_THEME_KEYS {
+                assert!(colors.contains_key(*key), "{name} missing color key {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_background_token_populates_overlay_color() {
+        let theme_set: ThemeSet = serde_json::from_str(include_str!("default-theme.json")).unwrap();
+
+        for (name, expected_overlay) in [
+            ("Default Light", "#11182780"),
+            ("macOS Classic Dark", "#00000099"),
+        ] {
+            let theme = theme_set
+                .themes
+                .iter()
+                .find(|theme| theme.name == name)
+                .unwrap_or_else(|| panic!("missing theme {name}"));
+            let overlay = theme.colors.overlay.as_ref().map(ToString::to_string);
+
+            assert_eq!(Some(expected_overlay.to_string()), overlay);
+        }
     }
 }
