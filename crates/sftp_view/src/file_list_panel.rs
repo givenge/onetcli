@@ -4,7 +4,7 @@ use gpui::{
     div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, InteractiveElementExt, Sizable, Size, h_flex,
+    ActiveTheme, Icon, IconName, InteractiveElementExt, Sizable, Size, chrome, h_flex,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     tooltip::Tooltip,
@@ -343,13 +343,10 @@ impl FileListPanel {
         let filtered_count = self.filtered_indices.len();
         let total_count = self.items.len();
 
-        h_flex()
+        chrome::panel_header(cx)
             .h_8()
+            .min_h(px(32.0))
             .px_2()
-            .gap_2()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
             .bg(cx.theme().background)
             .child(
                 Icon::new(IconName::Search)

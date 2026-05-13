@@ -48,6 +48,7 @@ use one_core::layout::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WID
 use one_core::storage::models::{ActiveConnections, StoredConnection};
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_ui::resize_handle::{HandlePlacement, ResizePanel, resize_handle};
+use one_ui::workbench;
 use rust_i18n::t;
 use serde::Deserialize;
 use sftp::{RusshSftpClient, SftpClient};
@@ -4669,10 +4670,7 @@ impl Render for TerminalView {
             }
         }
 
-        div()
-            .size_full()
-            .flex()
-            .flex_row()
+        workbench::workbench_root(cx)
             .bg(bg_color)
             .child({
                 let tooltip = self.addon_manager.tooltip();
@@ -4817,11 +4815,9 @@ impl Render for TerminalView {
                         |this| this.child(self.render_connection_overlay(can_reconnect, cx)),
                     );
 
-                div()
+                workbench::main_panel(cx)
                     .relative()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
+                    .bg(bg_color)
                     .child(terminal_core)
                     .when(show_scrollbar, |this| {
                         this.child(
@@ -4841,11 +4837,9 @@ impl Render for TerminalView {
             // 渲染侧边栏
             .when(sidebar_visible, |this| {
                 this.child(
-                    div()
+                    workbench::context_panel(cx)
                         .relative()
-                        .h_full()
                         .w(sidebar_panel_size)
-                        .flex_shrink_0()
                         .child(self.render_sidebar_resize_handle(window, cx))
                         .child(self.sidebar.clone()),
                 )

@@ -6,13 +6,14 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Axis, Bounds, Context, Element, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Style, Styled, Subscription, Task, Window, div, px,
+    Render, SharedString, Style, Styled, Subscription, Task, Window, px,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex};
+use gpui_component::{Icon, IconName, Sizable, Size};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::{ActiveConnections, StoredConnection, Workspace};
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent, TabItem};
 use one_ui::resize_handle::{HandlePlacement, ResizePanel, resize_handle};
+use one_ui::workbench;
 use tracing::warn;
 
 use crate::GlobalMongoState;
@@ -312,43 +313,28 @@ impl TabContent for MongoTabView {
 impl Render for MongoTabView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().clone();
-        let border_color = cx.theme().border;
         let tree_panel_size = self.tree_panel_size;
         let sidebar_visible = self.sidebar.read(cx).is_panel_visible();
         let sidebar_panel_size = self.sidebar_panel_size;
 
-        div()
+        workbench::workbench_root(cx)
             .id("mongodb-tab-view")
             .track_focus(&self.focus_handle)
-            .size_full()
             .child(
-                h_flex()
-                    .size_full()
+                workbench::workbench_root(cx)
                     .child(
-                        div()
+                        workbench::resource_panel(cx)
                             .relative()
-                            .h_full()
                             .w(tree_panel_size)
-                            .flex_shrink_0()
-                            .border_r_1()
-                            .border_color(border_color)
                             .child(self.tree_view.clone())
                             .child(self.render_tree_resize_handle(window, cx)),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .child(self.tab_container.clone()),
-                    )
+                    .child(workbench::main_panel(cx).child(self.tab_container.clone()))
                     .when(sidebar_visible, |this| {
                         this.child(
-                            div()
+                            workbench::context_panel(cx)
                                 .relative()
-                                .h_full()
                                 .w(sidebar_panel_size)
-                                .flex_shrink_0()
                                 .child(self.render_sidebar_resize_handle(window, cx))
                                 .child(self.sidebar.clone()),
                         )

@@ -24,6 +24,7 @@ use one_core::{
     tab_container::{TabContainer, TabContent, TabContentEvent, TabItem},
 };
 use one_ui::resize_handle::{HandlePlacement, ResizePanel, resize_handle};
+use one_ui::workbench;
 use rust_i18n::t;
 use uuid::Uuid;
 
@@ -98,12 +99,7 @@ impl DatabaseTabView {
             active_connection_id: active_conn_id,
         };
         let sidebar = cx.new(|cx| {
-            DatabaseSidebar::new(
-                window,
-                cx,
-                selector_context.clone(),
-                objects_panel.clone(),
-            )
+            DatabaseSidebar::new(window, cx, selector_context.clone(), objects_panel.clone())
         });
 
         // 注册 SQL 代码块操作
@@ -565,44 +561,29 @@ impl Render for DatabaseTabView {
         let sidebar_visible = self.sidebar.read(cx).is_panel_visible();
         let sidebar_panel_size = self.sidebar_panel_size;
 
-        div()
+        workbench::workbench_root(cx)
             .track_focus(&self.focus_handle)
-            .size_full()
             .when(!is_connected_flag, |el: gpui::Div| {
                 el.child(self.render_connection_status(cx))
             })
             .when(is_connected_flag, |el: gpui::Div| {
-                let border_color = cx.theme().border;
                 let tree_panel_size = self.tree_panel_size;
 
                 el.child(
-                    h_flex()
-                        .size_full()
+                    workbench::workbench_root(cx)
                         .child(
-                            div()
+                            workbench::resource_panel(cx)
                                 .relative()
-                                .h_full()
                                 .w(tree_panel_size)
-                                .flex_shrink_0()
-                                .border_r_1()
-                                .border_color(border_color)
                                 .child(self.db_tree_view.clone())
                                 .child(self.render_tree_resize_handle(window, cx)),
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .h_full()
-                                .min_w_0()
-                                .child(self.tab_container.clone()),
-                        )
+                        .child(workbench::main_panel(cx).child(self.tab_container.clone()))
                         .when(sidebar_visible, |this| {
                             this.child(
-                                div()
+                                workbench::context_panel(cx)
                                     .relative()
-                                    .h_full()
                                     .w(sidebar_panel_size)
-                                    .flex_shrink_0()
                                     .overflow_hidden()
                                     .child(self.render_sidebar_resize_handle(window, cx))
                                     .child(self.sidebar.clone()),
