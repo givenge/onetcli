@@ -30,6 +30,7 @@ pub mod breadcrumb;
 pub mod button;
 pub mod chart;
 pub mod checkbox;
+pub mod chrome;
 pub mod clipboard;
 pub mod collapsible;
 pub mod color_picker;

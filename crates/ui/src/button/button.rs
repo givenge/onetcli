@@ -963,7 +963,7 @@ impl ButtonVariant {
             Self::Warning => cx.theme().warning.opacity(0.15),
             Self::Success => cx.theme().success.opacity(0.15),
             Self::Info => cx.theme().info.opacity(0.15),
-            Self::Secondary => cx.theme().secondary.opacity(1.5),
+            Self::Secondary => cx.theme().secondary.opacity(0.55),
             Self::Custom(style) => style.color.opacity(0.15),
         };
         let fg = cx.theme().muted_foreground.opacity(0.5);
@@ -1049,5 +1049,34 @@ mod tests {
         assert!(ButtonVariant::Link.no_padding());
         assert!(ButtonVariant::Text.no_padding());
         assert!(!ButtonVariant::Ghost.no_padding());
+    }
+
+    #[gpui::test]
+    fn test_button_disabled_styles_keep_alpha_bounded(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            let secondary = ButtonVariant::Secondary.disabled(false, cx);
+            let secondary_normal = ButtonVariant::Secondary.normal(false, cx);
+            let primary = ButtonVariant::Primary.disabled(false, cx);
+
+            assert!(secondary.bg.a < secondary_normal.bg.a);
+            assert!(secondary.border.a < secondary_normal.border.a);
+            assert!(secondary.bg.a <= 0.55);
+            assert!(secondary.border.a <= 0.55);
+            assert!(primary.bg.a <= 1.0);
+            assert!(primary.border.a <= 1.0);
+        });
+    }
+
+    #[gpui::test]
+    fn test_text_and_ghost_buttons_use_theme_transparent_background(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            let text = ButtonVariant::Text.normal(false, cx);
+            let ghost = ButtonVariant::Ghost.normal(false, cx);
+
+            assert_eq!(text.bg, cx.theme().transparent);
+            assert_eq!(ghost.bg, cx.theme().transparent);
+        });
     }
 }
