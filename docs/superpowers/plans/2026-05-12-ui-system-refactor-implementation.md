@@ -21,7 +21,8 @@
 - 2026-05-13: Task 6 base workbench pass committed as `fb7ccfe0 refactor(ui): align workbench chrome`.
 - 2026-05-13: Task 6 side chrome and new connection picker follow-up committed as `ba470ad6 refactor(ui): align side chrome and connection picker`.
 - 2026-05-13: Formatting cleanup committed as `5994e2d7 style: apply rustfmt cleanup`.
-- Remaining: reliable native visual smoke still needs a launch path that cannot be confused with the installed `com.onetcli.app` bundle.
+- 2026-05-13: Native visual smoke verified from PID-launched `target/debug/onetcli`, avoiding the installed `com.onetcli.app` bundle.
+- Remaining: continue any future surface-specific polish from screenshots launched through the debug binary PID, not by app bundle name.
 
 ---
 
