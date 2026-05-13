@@ -1,5 +1,6 @@
 pub mod edit_table;
 pub mod resize_handle;
+pub mod workbench;
 mod time;
 
 pub use edit_table::{
