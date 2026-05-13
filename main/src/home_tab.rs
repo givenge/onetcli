@@ -34,7 +34,7 @@ use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
     ActiveConnections, ConnectionRepository, ConnectionType, DatabaseType, GlobalStorageState,
-    PendingCloudDeletionRepository, RedisMode, StoredConnection, Workspace, WorkspaceRepository,
+    PendingCloudDeletionRepository, StoredConnection, Workspace, WorkspaceRepository,
 };
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent};
 use redis_view::{RedisFormWindow, RedisFormWindowConfig};
@@ -43,6 +43,9 @@ use terminal_view::{SerialFormWindow, SerialFormWindowConfig};
 use terminal_view::{SshFormWindow, SshFormWindowConfig};
 
 use crate::auth::{AuthService, show_auth_dialog};
+use crate::home::connection_display::{
+    connection_icon, connection_subtitle, generate_duplicate_name, has_team_badge,
+};
 use crate::home::home_connection_quick_open::ConnectionQuickOpenDelegate;
 use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home::home_workspace_filter::{WorkspaceFilterDelegate, show_workspace_dialog};
@@ -2544,7 +2547,7 @@ impl HomePage {
             .map_or(false, |id| cx.global::<ActiveConnections>().is_active(id));
 
         let can_edit = can_edit_connection(&conn, cx);
-        let has_team = conn.team_id.is_some();
+        let has_team = has_team_badge(&conn);
 
         let card = v_flex()
             .justify_center()
@@ -2779,35 +2782,7 @@ impl HomePage {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(match conn.connection_type {
-                                ConnectionType::Database => {
-                                    let icon = conn
-                                        .to_db_connection()
-                                        .map(|c| c.database_type.as_icon())
-                                        .unwrap_or_else(|_| IconName::Database.color());
-                                    icon.with_size(px(40.0)).text_color(gpui::white())
-                                }
-                                ConnectionType::SshSftp => IconName::TerminalColor
-                                    .color()
-                                    .with_size(px(40.0))
-                                    .text_color(gpui::rgb(0x8b5cf6)),
-                                ConnectionType::Redis => IconName::Redis
-                                    .color()
-                                    .with_size(px(40.0))
-                                    .text_color(gpui::white()),
-                                ConnectionType::MongoDB => IconName::MongoDB
-                                    .color()
-                                    .with_size(px(40.0))
-                                    .text_color(gpui::white()),
-                                ConnectionType::Serial => IconName::SerialPort
-                                    .color()
-                                    .with_size(px(40.0))
-                                    .text_color(gpui::white()),
-                                _ => IconName::Server
-                                    .color()
-                                    .with_size(px(40.0))
-                                    .text_color(gpui::white()),
-                            }),
+                            .child(connection_icon(&conn).with_size(px(40.0))),
                     )
                     .child(
                         v_flex()
@@ -2852,223 +2827,31 @@ impl HomePage {
                                         )
                                     })
                             })
-                            .when(conn.connection_type == ConnectionType::Database, |this| {
-                                if let Ok(params) = conn.to_db_connection() {
-                                    let conn_info = if matches!(
-                                        params.database_type,
-                                        DatabaseType::SQLite | DatabaseType::DuckDB
-                                    ) {
-                                        params.host.clone()
-                                    } else {
-                                        let database = match params.database {
-                                            Some(database) => format!("/{}", database),
-                                            None => "".to_string(),
-                                        };
-                                        format!(
-                                            "{}@{}:{}{}",
-                                            params.username, params.host, params.port, database
-                                        )
-                                    };
-                                    let tooltip_text: SharedString = conn_info.clone().into();
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "conn-info-{}",
-                                                conn.id.unwrap_or(0)
-                                            )))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .max_w_full()
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
-                                            })
-                                            .child(conn_info),
-                                    )
-                                } else {
-                                    this
-                                }
-                            })
-                            .when(conn.connection_type == ConnectionType::SshSftp, |this| {
-                                if let Ok(params) = conn.to_ssh_params() {
-                                    let conn_info = format!(
-                                        "{}@{}:{}",
-                                        params.username, params.host, params.port
-                                    );
-                                    let tooltip_text: SharedString = conn_info.clone().into();
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "conn-info-{}",
-                                                conn.id.unwrap_or(0)
-                                            )))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .max_w_full()
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
-                                            })
-                                            .child(conn_info),
-                                    )
-                                } else {
-                                    this
-                                }
-                            })
-                            .when(conn.connection_type == ConnectionType::Redis, |this| {
-                                if let Ok(params) = conn.to_redis_params() {
-                                    let conn_info = match params.mode {
-                                        RedisMode::Standalone => {
-                                            format!(
-                                                "{}:{}/{}",
-                                                params.host, params.port, params.db_index
-                                            )
-                                        }
-                                        RedisMode::Sentinel => {
-                                            let (master_name, sentinel_count) = params
-                                                .sentinel
-                                                .as_ref()
-                                                .map(|sentinel| {
-                                                    (
-                                                        sentinel.master_name.as_str(),
-                                                        sentinel.sentinels.len(),
-                                                    )
-                                                })
-                                                .unwrap_or(("sentinel", 0));
-                                            format!("{} (sentinel:{})", master_name, sentinel_count)
-                                        }
-                                        RedisMode::Cluster => {
-                                            let node_count = params
-                                                .cluster
-                                                .as_ref()
-                                                .map(|cluster| cluster.nodes.len())
-                                                .unwrap_or(0);
-                                            format!("cluster ({} nodes)", node_count)
-                                        }
-                                    };
-                                    let tooltip_text: SharedString = conn_info.clone().into();
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "conn-info-{}",
-                                                conn.id.unwrap_or(0)
-                                            )))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .max_w_full()
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
-                                            })
-                                            .child(conn_info),
-                                    )
-                                } else {
-                                    this
-                                }
-                            })
-                            .when(conn.connection_type == ConnectionType::MongoDB, |this| {
-                                if let Ok(params) = conn.to_mongodb_params() {
-                                    let conn_info = if !params.host.is_empty() {
-                                        if let Some(port) = params.port {
-                                            format!("{}:{}", params.host, port)
-                                        } else {
-                                            params.host
-                                        }
-                                    } else if !params.connection_string.is_empty() {
-                                        params.connection_string
-                                    } else {
-                                        "MongoDB".to_string()
-                                    };
-                                    let tooltip_text: SharedString = conn_info.clone().into();
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "conn-info-{}",
-                                                conn.id.unwrap_or(0)
-                                            )))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .max_w_full()
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
-                                            })
-                                            .child(conn_info),
-                                    )
-                                } else {
-                                    this
-                                }
-                            })
-                            .when(conn.connection_type == ConnectionType::Serial, |this| {
-                                if let Ok(params) = conn.to_serial_params() {
-                                    // 格式：/dev/ttyUSB0 (115200, 8N1)
-                                    let parity_char = match params.parity {
-                                        one_core::storage::models::SerialParity::None => 'N',
-                                        one_core::storage::models::SerialParity::Odd => 'O',
-                                        one_core::storage::models::SerialParity::Even => 'E',
-                                    };
-                                    let conn_info = format!(
-                                        "{} ({}, {}{}{})",
-                                        params.port_name,
-                                        params.baud_rate,
-                                        params.data_bits,
-                                        parity_char,
-                                        params.stop_bits,
-                                    );
-                                    let tooltip_text: SharedString = conn_info.clone().into();
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "conn-info-{}",
-                                                conn.id.unwrap_or(0)
-                                            )))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .max_w_full()
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
-                                            })
-                                            .child(conn_info),
-                                    )
-                                } else {
-                                    this
-                                }
+                            .when_some(connection_subtitle(&conn), |this, conn_info| {
+                                let tooltip_text: SharedString = conn_info.clone().into();
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "conn-info-{}",
+                                            conn.id.unwrap_or(0)
+                                        )))
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .max_w_full()
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                        })
+                                        .child(conn_info),
+                                )
                             }),
                     ),
             );
 
         card.into_any_element()
     }
-}
-
-/// 生成复制连接的唯一名称
-fn generate_duplicate_name(original_name: &str, existing_names: &HashSet<String>) -> String {
-    let base_name = format!("{} (副本)", original_name);
-
-    if !existing_names.contains(&base_name) {
-        return base_name;
-    }
-
-    // 如果基础名称已存在，添加数字序号
-    for i in 2..100 {
-        let name = format!("{} (副本 {})", original_name, i);
-        if !existing_names.contains(&name) {
-            return name;
-        }
-    }
-
-    base_name
 }
 
 impl Focusable for HomePage {

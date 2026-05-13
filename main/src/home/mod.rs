@@ -1,3 +1,4 @@
+pub(crate) mod connection_display;
 pub(crate) mod home_connection_quick_open;
 pub(crate) mod home_strategy;
 pub(crate) mod home_tabs;
