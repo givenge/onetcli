@@ -23,6 +23,7 @@ use gpui_component::{
 };
 
 const SCROLLBAR_WIDTH: Pixels = px(16.);
+const COLUMN_SEPARATOR_WIDTH: Pixels = px(1.);
 
 gpui::actions!(
     edit_table_internal,
@@ -1938,14 +1939,27 @@ where
 
         let is_single_select_active =
             (is_active_cell || is_select_cell) && !is_editing && !is_multi_selection;
+        let show_column_separator = !is_editing && !border_right && !is_single_select_active;
 
         let mut cell = div()
             .id(cell_id)
             .w(col_width)
             .h_full()
+            .relative()
             .flex_shrink_0()
             .overflow_hidden()
             .whitespace_nowrap()
+            .when(show_column_separator, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(COLUMN_SEPARATOR_WIDTH)
+                        .bg(cx.theme().border),
+                )
+            })
             // 选区内的所有单元格使用背景色
             .when(is_in_selection && !is_editing, |this| {
                 this.bg(cx.theme().table_active)
@@ -1980,46 +1994,54 @@ where
                 this.bg(cx.theme().warning.opacity(0.15))
             });
 
+        // 统一布局：编辑和显示模式使用相同的容器 padding
+        cell = cell.table_cell_size(self.options.size);
+
+        let size_pad = self.options.size.table_cell_padding();
+        let (target_pt, target_pb, target_pl, target_pr) = match col_padding {
+            Some(p) => (p.top, p.bottom, p.left, p.right),
+            None => (size_pad.top, size_pad.bottom, size_pad.left, size_pad.right),
+        };
+
+        // 边框补偿：编辑态始终有 border_2；显示态仅选中时有
+        let (has_t, has_b, has_l, has_r) = if is_editing {
+            (true, true, true, true)
+        } else {
+            (
+                border_top || is_single_select_active,
+                border_bottom || is_single_select_active,
+                border_left || is_single_select_active,
+                border_right || is_single_select_active,
+            )
+        };
+        let b = px(2.);
+        cell = cell
+            .pt(if has_t {
+                (target_pt - b).max(px(0.))
+            } else {
+                target_pt
+            })
+            .pb(if has_b {
+                (target_pb - b).max(px(0.))
+            } else {
+                target_pb
+            })
+            .pl(if has_l {
+                (target_pl - b).max(px(0.))
+            } else {
+                target_pl
+            })
+            .pr(if has_r {
+                (target_pr - b).max(px(0.))
+            } else {
+                target_pr
+            });
+
+        // 编辑模式：嵌入轻量编辑器（无自带样式，由容器控制布局）
         if is_editing {
             if let Some(editor) = &self.editing_input {
                 cell = cell.child(editor.render(window, cx));
             }
-        } else {
-            cell = cell.table_cell_size(self.options.size);
-
-            let size_pad = self.options.size.table_cell_padding();
-            let (target_pt, target_pb, target_pl, target_pr) = match col_padding {
-                Some(p) => (p.top, p.bottom, p.left, p.right),
-                None => (size_pad.top, size_pad.bottom, size_pad.left, size_pad.right),
-            };
-
-            // 选中时 border 占用内部空间会挤压内容区，减少等量 padding 补偿
-            let has_t = border_top || is_single_select_active;
-            let has_b = border_bottom || is_single_select_active;
-            let has_l = border_left || is_single_select_active;
-            let has_r = border_right || is_single_select_active;
-            let b = px(2.);
-            cell = cell
-                .pt(if has_t {
-                    (target_pt - b).max(px(0.))
-                } else {
-                    target_pt
-                })
-                .pb(if has_b {
-                    (target_pb - b).max(px(0.))
-                } else {
-                    target_pb
-                })
-                .pl(if has_l {
-                    (target_pl - b).max(px(0.))
-                } else {
-                    target_pl
-                })
-                .pr(if has_r {
-                    (target_pr - b).max(px(0.))
-                } else {
-                    target_pr
-                });
         }
 
         cell

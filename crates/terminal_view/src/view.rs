@@ -888,6 +888,8 @@ pub struct TerminalView {
     autocomplete_enabled: bool,
     /// 中键粘贴
     middle_click_paste: bool,
+    /// 在 vim/less/man 等 alt-screen TUI 中,把鼠标滚轮转为方向键发送到 PTY
+    vim_scroll_to_arrow_keys: bool,
 
     /// 侧边栏面板大小
     sidebar_panel_size: Pixels,
@@ -1224,6 +1226,7 @@ impl TerminalView {
             auto_copy_on_select: true,
             autocomplete_enabled: true,
             middle_click_paste: true,
+            vim_scroll_to_arrow_keys: true,
             sidebar_panel_size: SIDEBAR_DEFAULT_WIDTH,
             resizing: None,
             view_bounds: Bounds::default(),
@@ -1326,6 +1329,9 @@ impl TerminalView {
             }
             TerminalSidebarEvent::MiddleClickPasteChanged(enabled) => {
                 self.set_middle_click_paste(*enabled, cx);
+            }
+            TerminalSidebarEvent::VimScrollToArrowKeysChanged(enabled) => {
+                self.set_vim_scroll_to_arrow_keys(*enabled, cx);
             }
             TerminalSidebarEvent::SyncPathChanged(enabled) => {
                 let enabled = *enabled;
@@ -2183,6 +2189,7 @@ impl TerminalView {
         autocomplete_enabled: bool,
         middle_click_paste: bool,
         sync_path: bool,
+        vim_scroll_to_arrow_keys: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2205,6 +2212,7 @@ impl TerminalView {
             self.dismiss_history_prompt_matches();
         }
         self.middle_click_paste = middle_click_paste;
+        self.vim_scroll_to_arrow_keys = vim_scroll_to_arrow_keys;
 
         self.terminal.update(cx, |terminal, _cx| {
             terminal.set_sync_path_with_terminal(sync_path);
@@ -2216,6 +2224,7 @@ impl TerminalView {
             sidebar.set_font_size(clamped, window, cx);
             sidebar.set_auto_copy(auto_copy, cx);
             sidebar.set_middle_click_paste(middle_click_paste, cx);
+            sidebar.set_vim_scroll_to_arrow_keys(vim_scroll_to_arrow_keys, cx);
             sidebar.set_sync_path_enabled(sync_path, cx);
         });
 
@@ -2238,6 +2247,7 @@ impl TerminalView {
             settings.enable_autocomplete,
             settings.middle_click_paste,
             settings.sync_path_with_terminal,
+            settings.vim_scroll_to_arrow_keys,
             window,
             cx,
         );
@@ -2366,6 +2376,15 @@ impl TerminalView {
         }
         let _ = update_settings(cx, move |settings| {
             settings.middle_click_paste = enabled;
+        });
+    }
+
+    pub fn set_vim_scroll_to_arrow_keys(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.vim_scroll_to_arrow_keys == enabled {
+            return;
+        }
+        let _ = update_settings(cx, move |settings| {
+            settings.vim_scroll_to_arrow_keys = enabled;
         });
     }
 
@@ -4173,6 +4192,19 @@ impl TerminalView {
                         self.write_to_pty(report.as_bytes().to_vec(), cx);
                     }
                 }
+            } else if self.vim_scroll_to_arrow_keys && lines != 0 {
+                // alt-screen TUI(vim/less/man 等)未启用鼠标报告:
+                // 把滚轮转为方向键发给 PTY,既能滚动又不会触发 vim 的 VISUAL 选区
+                let seq: &[u8] = if mode.contains(TermMode::APP_CURSOR) {
+                    if lines > 0 { b"\x1bOA" } else { b"\x1bOB" }
+                } else if lines > 0 {
+                    b"\x1b[A"
+                } else {
+                    b"\x1b[B"
+                };
+                for _ in 0..lines.unsigned_abs() {
+                    self.write_to_pty(seq.to_vec(), cx);
+                }
             }
             return;
         }
@@ -4240,6 +4272,11 @@ impl TerminalView {
 
     /// 当终端启用 SGR 鼠标 + 任意鼠标报告模式时，把按钮按下/释放事件以 SGR 形式
     /// 回报给 PTY。返回 true 表示已经处理，调用方应跳过 selection/dismiss/paste 等本地行为。
+    ///
+    /// 特殊穿透:Shift+Left 永远走终端自身的文本选区,不向 TUI 转发 —— 这是 xterm/iTerm/
+    /// kitty/wezterm 等的通用约定,让用户在 vim/tmux 等捕获鼠标的应用里仍能复制文本。
+    /// 同理 mouse_up 时,如果当前正在终端选区(由 shift+drag 启动),也跳过 release 回报,
+    /// 避免在 release 阶段 shift 已松开就把 release 事件错发给 TUI、丢掉 selection 收尾。
     fn try_report_sgr_mouse_button(
         &mut self,
         button: MouseButton,
@@ -4248,6 +4285,11 @@ impl TerminalView {
         pressed: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        if button == MouseButton::Left
+            && (modifiers.shift || (!pressed && self.mouse_state.selecting))
+        {
+            return false;
+        }
         let mode = self.terminal.read(cx).mode();
         if !(mode.contains(TermMode::SGR_MOUSE) && mode.intersects(TermMode::MOUSE_MODE)) {
             return false;
