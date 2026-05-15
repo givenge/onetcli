@@ -527,6 +527,23 @@ fn encode_mouse_modifiers(modifiers: Modifiers) -> u8 {
     bits
 }
 
+fn sgr_mouse_mode_enabled(mode: TermMode) -> bool {
+    mode.contains(TermMode::SGR_MOUSE) && mode.intersects(TermMode::MOUSE_MODE)
+}
+
+fn should_defer_sgr_left_press(button: MouseButton, modifiers: Modifiers, mode: TermMode) -> bool {
+    button == MouseButton::Left
+        && !modifiers.shift
+        && !modifiers.alt
+        && !modifiers.control
+        && !modifiers.platform
+        && sgr_mouse_mode_enabled(mode)
+}
+
+fn should_start_selection_from_pending_sgr_press(start: AlacPoint, current: AlacPoint) -> bool {
+    start != current
+}
+
 fn should_scroll_to_bottom_on_user_input(
     display_offset: usize,
     pending_display_offset: &StdCell<Option<usize>>,
@@ -910,9 +927,16 @@ pub struct TerminalView {
 #[derive(Default)]
 struct MouseState {
     selecting: bool,
+    pending_sgr_left_press: Option<PendingSgrMousePress>,
     last_click_point: Option<AlacPoint>,
     click_count: u32,
     last_click_time: Option<std::time::Instant>,
+}
+
+struct PendingSgrMousePress {
+    point: AlacPoint,
+    position: Point<Pixels>,
+    modifiers: Modifiers,
 }
 
 #[derive(Debug, Clone)]
@@ -4183,7 +4207,7 @@ impl TerminalView {
         }
 
         if mode.contains(TermMode::ALT_SCREEN) {
-            if mode.contains(TermMode::SGR_MOUSE) && mode.intersects(TermMode::MOUSE_MODE) {
+            if sgr_mouse_mode_enabled(mode) {
                 let point = self.pixel_to_point(event.position, self.terminal_bounds, cx);
                 if let Some(report) =
                     sgr_mouse_wheel_report(lines, point.column.0, point.line.0 as usize)
@@ -4291,9 +4315,20 @@ impl TerminalView {
             return false;
         }
         let mode = self.terminal.read(cx).mode();
-        if !(mode.contains(TermMode::SGR_MOUSE) && mode.intersects(TermMode::MOUSE_MODE)) {
+        if !sgr_mouse_mode_enabled(mode) {
             return false;
         }
+        self.write_sgr_mouse_button_report(button, position, modifiers, pressed, cx)
+    }
+
+    fn write_sgr_mouse_button_report(
+        &mut self,
+        button: MouseButton,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        pressed: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(base) = mouse_button_code(button) else {
             return false;
         };
@@ -4313,6 +4348,15 @@ impl TerminalView {
     ) {
         if self.terminal.read(cx).ssh_mfa_request().is_none() {
             window.focus(&self.focus_handle, cx);
+        }
+        let mode = self.terminal.read(cx).mode();
+        if should_defer_sgr_left_press(event.button, event.modifiers, mode) {
+            self.mouse_state.pending_sgr_left_press = Some(PendingSgrMousePress {
+                point: self.pixel_to_point(event.position, self.terminal_bounds, cx),
+                position: event.position,
+                modifiers: event.modifiers,
+            });
+            return;
         }
         // SGR 鼠标模式下把按钮按下事件交给 TUI，跳过 selection/URL/dismiss
         if self.try_report_sgr_mouse_button(event.button, event.position, event.modifiers, true, cx)
@@ -4433,6 +4477,39 @@ impl TerminalView {
         let point = self.pixel_to_point(event.position, bounds, cx);
         let screen_line = point.line.0 as usize;
         let column = point.column.0;
+        if let Some(pending) = &self.mouse_state.pending_sgr_left_press {
+            if should_start_selection_from_pending_sgr_press(pending.point, point) {
+                let pending = self.mouse_state.pending_sgr_left_press.take().unwrap();
+                let now = std::time::Instant::now();
+                let is_double_click = self.mouse_state.last_click_point == Some(pending.point)
+                    && self
+                        .mouse_state
+                        .last_click_time
+                        .map_or(false, |t| now.duration_since(t).as_millis() < 500);
+
+                self.mouse_state.click_count = if is_double_click {
+                    self.mouse_state.click_count + 1
+                } else {
+                    1
+                };
+                self.mouse_state.last_click_point = Some(pending.point);
+                self.mouse_state.last_click_time = Some(now);
+                let selection_type = match self.mouse_state.click_count {
+                    1 => SelectionType::Simple,
+                    2 => SelectionType::Semantic,
+                    _ => SelectionType::Lines,
+                };
+
+                self.terminal.update(cx, |terminal, _| {
+                    terminal.start_selection(
+                        selection_type,
+                        pending.point,
+                        self.pixel_to_side(pending.position, bounds),
+                    );
+                });
+                self.mouse_state.selecting = true;
+            }
+        }
         let line_text = self.get_line_text(screen_line, cx);
         let is_local = self.terminal.read(cx).connection_kind() == TerminalConnectionKind::Local;
         let hover_changed = {
@@ -4472,6 +4549,28 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(pending) = self.mouse_state.pending_sgr_left_press.take() {
+            self.terminal.update(cx, |terminal, _| {
+                terminal.clear_selection();
+            });
+            if sgr_mouse_mode_enabled(self.terminal.read(cx).mode()) {
+                self.write_sgr_mouse_button_report(
+                    MouseButton::Left,
+                    pending.position,
+                    pending.modifiers,
+                    true,
+                    cx,
+                );
+                self.write_sgr_mouse_button_report(
+                    MouseButton::Left,
+                    event.position,
+                    event.modifiers,
+                    false,
+                    cx,
+                );
+            }
+            return;
+        }
         // SGR 鼠标模式下：先回报释放，然后跳过 selection 收尾
         if self.try_report_sgr_mouse_button(
             event.button,
@@ -5079,15 +5178,16 @@ mod tests {
         history_prompt_available, history_prompt_dropdown_origin, history_prompt_overlay_bounds,
         json_object_candidates, mouse_button_code, multiline_non_empty_line_count,
         parse_terminal_agent_decision, prepend_terminal_agent_system_prompt,
-        sgr_mouse_button_report, sgr_mouse_wheel_report,
-        should_defer_inline_history_prompt_input_to_text_system,
+        sgr_mouse_button_report, sgr_mouse_mode_enabled, sgr_mouse_wheel_report,
+        should_defer_inline_history_prompt_input_to_text_system, should_defer_sgr_left_press,
         should_dismiss_history_prompt_for_keystroke, should_dismiss_history_prompt_for_mouse,
         should_dismiss_history_prompt_for_scroll, should_reset_history_prompt_for_terminal_event,
-        should_scroll_to_bottom_on_user_input, take_whole_scroll_lines,
-        terminal_agent_protocol_error_message,
+        should_scroll_to_bottom_on_user_input, should_start_selection_from_pending_sgr_press,
+        take_whole_scroll_lines, terminal_agent_protocol_error_message,
     };
     use crate::history_prompt::{HistoryPromptAccept, HistoryPromptState};
     use crate::llm::{Message, MessageBlock, Role};
+    use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
     use alacritty_terminal::term::TermMode;
     use gpui::{Bounds, Keystroke, Modifiers, MouseButton, Point, px, size};
     use std::cell::Cell as StdCell;
@@ -5221,6 +5321,71 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(encode_mouse_modifiers(all), 28);
+    }
+
+    #[test]
+    fn sgr_mouse_mode_enabled_requires_sgr_and_mouse_reporting() {
+        assert!(!sgr_mouse_mode_enabled(TermMode::SGR_MOUSE));
+        assert!(!sgr_mouse_mode_enabled(TermMode::MOUSE_REPORT_CLICK));
+        assert!(sgr_mouse_mode_enabled(
+            TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK
+        ));
+    }
+
+    #[test]
+    fn should_defer_sgr_left_press_only_for_plain_left_mouse_in_sgr_mode() {
+        let mode = TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK;
+        let none = Modifiers::default();
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let control = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let platform = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+
+        assert!(should_defer_sgr_left_press(MouseButton::Left, none, mode));
+        assert!(!should_defer_sgr_left_press(MouseButton::Right, none, mode));
+        assert!(!should_defer_sgr_left_press(MouseButton::Left, shift, mode));
+        assert!(!should_defer_sgr_left_press(
+            MouseButton::Left,
+            control,
+            mode
+        ));
+        assert!(!should_defer_sgr_left_press(MouseButton::Left, alt, mode));
+        assert!(!should_defer_sgr_left_press(
+            MouseButton::Left,
+            platform,
+            mode
+        ));
+        assert!(!should_defer_sgr_left_press(
+            MouseButton::Left,
+            none,
+            TermMode::default()
+        ));
+    }
+
+    #[test]
+    fn pending_sgr_press_starts_selection_after_mouse_reaches_another_cell() {
+        let start = AlacPoint::new(Line(1), Column(1));
+        assert!(!should_start_selection_from_pending_sgr_press(start, start));
+        assert!(should_start_selection_from_pending_sgr_press(
+            start,
+            AlacPoint::new(Line(1), Column(2))
+        ));
+        assert!(should_start_selection_from_pending_sgr_press(
+            start,
+            AlacPoint::new(Line(2), Column(1))
+        ));
     }
 
     #[test]

@@ -1525,12 +1525,16 @@ impl HomePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if crypto::has_repo_password_set() {
+        if self.is_master_key_ready_for_new_connection() {
             return true;
         }
 
         self.show_encryption_key_dialog(window, cx);
         false
+    }
+
+    pub(crate) fn is_master_key_ready_for_new_connection(&self) -> bool {
+        crypto::has_master_key()
     }
 
     pub(crate) fn show_encryption_key_dialog(
