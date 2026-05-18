@@ -168,7 +168,7 @@ impl RedisEventHandler {
             let mut config = match RedisManager::config_from_stored(&stored_connection) {
                 Ok(config) => config,
                 Err(e) => {
-                    let error_message = e.to_string();
+                    let error_message = format!("{e:#}");
                     let _ = cx.update(|cx| {
                         if let Some(window) = cx.active_window() {
                             _ = window.update(cx, |_, window, cx| {
@@ -198,7 +198,7 @@ impl RedisEventHandler {
                     global_state
                         .create_connection(config)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -242,7 +242,7 @@ impl RedisEventHandler {
                     let _ = cx.update(|cx| {
                         if let Some(window) = cx.active_window() {
                             _ = window.update(cx, |_, window, cx| {
-                                Self::show_error(window, e.to_string(), cx);
+                                Self::show_error(window, format!("{e:#}"), cx);
                             });
                         }
                     });
@@ -370,6 +370,7 @@ impl RedisEventHandler {
         let key_name = full_key.clone();
         let tree = tree_view.clone();
         let node_id = node.id.clone();
+        let db_index = node.db_index;
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let conn_id = connection_id.clone();
@@ -394,6 +395,7 @@ impl RedisEventHandler {
                     let state = state.clone();
                     let tree = tree.clone();
                     let node_id = node_id.clone();
+                    let db_index = db_index;
 
                     // 使用 Tokio::spawn_result 在 Tokio 运行时中执行删除操作
                     let task = Tokio::spawn_result(cx, {
@@ -405,9 +407,9 @@ impl RedisEventHandler {
                             })?;
                             let guard = conn.read().await;
                             guard
-                                .del(&[key.as_str()])
+                                .del_in_db(db_index, &[key.as_str()])
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))
+                                .map_err(anyhow::Error::new)
                         }
                     });
 
@@ -420,12 +422,13 @@ impl RedisEventHandler {
                             });
                         }
                         Err(e) => {
+                            let error = format!("{e:#}");
                             let _ = cx.update(|cx| {
                                 if let Some(window) = cx.active_window() {
                                     _ = window.update(cx, |_, window, cx| {
                                         Self::show_error(
                                             window,
-                                            t!("RedisTree.delete_key_failed", error = e)
+                                            t!("RedisTree.delete_key_failed", error = error)
                                                 .to_string(),
                                             cx,
                                         );
@@ -472,7 +475,8 @@ impl RedisEventHandler {
 
             dialog
                 .title(t!("RedisTree.create_key_title").to_string())
-                .w(px(500.))
+                .w(px(800.))
+                .h(px(720.))
                 .child(create_key_dialog.clone())
                 .confirm()
                 .button_props(
@@ -481,7 +485,13 @@ impl RedisEventHandler {
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
                 .on_ok(move |_, window, cx: &mut App| {
-                    let form_data = create_key_dialog_for_ok.read(cx).form_data(cx);
+                    let form_data = match create_key_dialog_for_ok.read(cx).form_data(cx) {
+                        Ok(form_data) => form_data,
+                        Err(error) => {
+                            window.push_notification(Notification::error(error).autohide(true), cx);
+                            return false;
+                        }
+                    };
                     let key = form_data.key;
                     if key.is_empty() {
                         window.push_notification(
@@ -541,48 +551,42 @@ impl RedisEventHandler {
                         .ok_or_else(|| anyhow::anyhow!(t!("RedisTree.connection_missing")))?;
                     let guard = conn.read().await;
 
-                    // 切换到目标数据库
-                    guard
-                        .select(db_index)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
                     // 根据类型创建键
                     match key_type {
                         RedisKeyType::String => {
                             guard
-                                .set(&key, &value, ttl)
+                                .set_in_db(db_index, &key, &value, ttl)
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                         }
                         RedisKeyType::List => {
                             let push_value = if value.is_empty() { "" } else { value.as_str() };
                             guard
-                                .rpush(&key, &[push_value])
+                                .rpush_in_db(db_index, &key, &[push_value])
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                             if let Some(seconds) = ttl {
                                 if seconds > 0 {
                                     guard
-                                        .expire(&key, seconds)
+                                        .expire_in_db(db_index, &key, seconds)
                                         .await
-                                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                        .map_err(anyhow::Error::new)?;
                                 }
                             }
                         }
                         RedisKeyType::Set => {
                             if !value.is_empty() {
                                 guard
-                                    .sadd(&key, &[value.as_str()])
+                                    .sadd_in_db(db_index, &key, &[value.as_str()])
                                     .await
-                                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                    .map_err(anyhow::Error::new)?;
                             }
                             if let Some(seconds) = ttl {
                                 if seconds > 0 {
                                     guard
-                                        .expire(&key, seconds)
+                                        .expire_in_db(db_index, &key, seconds)
                                         .await
-                                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                        .map_err(anyhow::Error::new)?;
                                 }
                             }
                         }
@@ -590,16 +594,16 @@ impl RedisEventHandler {
                             // 使用用户输入的分数
                             if !value.is_empty() {
                                 guard
-                                    .zadd(&key, &[(zset_score, value.as_str())])
+                                    .zadd_in_db(db_index, &key, &[(zset_score, value.as_str())])
                                     .await
-                                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                    .map_err(anyhow::Error::new)?;
                             }
                             if let Some(seconds) = ttl {
                                 if seconds > 0 {
                                     guard
-                                        .expire(&key, seconds)
+                                        .expire_in_db(db_index, &key, seconds)
                                         .await
-                                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                        .map_err(anyhow::Error::new)?;
                                 }
                             }
                         }
@@ -611,15 +615,15 @@ impl RedisEventHandler {
                                 hash_field
                             };
                             guard
-                                .hset(&key, &field, &value)
+                                .hset_in_db(db_index, &key, &field, &value)
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                             if let Some(seconds) = ttl {
                                 if seconds > 0 {
                                     guard
-                                        .expire(&key, seconds)
+                                        .expire_in_db(db_index, &key, seconds)
                                         .await
-                                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                        .map_err(anyhow::Error::new)?;
                                 }
                             }
                         }
@@ -655,12 +659,14 @@ impl RedisEventHandler {
                     });
                 }
                 Err(e) => {
+                    let error = format!("{e:#}");
                     let _ = cx.update(|cx| {
                         if let Some(window) = cx.active_window() {
                             _ = window.update(cx, |_, window, cx| {
                                 window.push_notification(
                                     Notification::error(
-                                        t!("RedisTree.create_key_failed", error = e).to_string(),
+                                        t!("RedisTree.create_key_failed", error = error)
+                                            .to_string(),
                                     )
                                     .autohide(true),
                                     cx,
@@ -716,7 +722,7 @@ impl RedisEventHandler {
                             state
                                 .remove_connection(&conn_id)
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))
+                                .map_err(anyhow::Error::new)
                         }
                     });
 
@@ -729,12 +735,13 @@ impl RedisEventHandler {
                             });
                         }
                         Err(e) => {
+                            let error = format!("{e:#}");
                             let _ = cx.update(|cx| {
                                 if let Some(window) = cx.active_window() {
                                     _ = window.update(cx, |_, window, cx| {
                                         Self::show_error(
                                             window,
-                                            t!("RedisTree.disconnect_failed", error = e)
+                                            t!("RedisTree.disconnect_failed", error = error)
                                                 .to_string(),
                                             cx,
                                         );

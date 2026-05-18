@@ -23,6 +23,7 @@ use gpui_component::{
 };
 use one_core::gpui_tokio::Tokio;
 use one_core::tab_container::{TabContent, TabContentEvent};
+use one_ui::{LargeTextEditor, create_large_text_editor_with_content};
 use rust_i18n::t;
 
 /// 键值视图事件
@@ -83,6 +84,17 @@ impl SelectItem for ViewFormat {
     fn value(&self) -> &Self::Value {
         self
     }
+}
+
+fn large_text_preview_title(label: &str, context: Option<&str>) -> String {
+    match context.map(str::trim).filter(|context| !context.is_empty()) {
+        Some(context) => format!("{label} {context}"),
+        None => label.to_string(),
+    }
+}
+
+fn should_replace_set_member(old_member: &str, new_member: &str) -> bool {
+    old_member != new_member
 }
 
 /// List 插入位置
@@ -376,6 +388,41 @@ impl KeyValueView {
         cx.notify();
     }
 
+    fn large_text_editor_value(
+        editor: &Entity<LargeTextEditor>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        match editor.read(cx).get_writeback_text(cx) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                window.push_notification(err.to_string(), cx);
+                None
+            }
+        }
+    }
+
+    fn show_large_text_preview_dialog(
+        &self,
+        title: String,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = create_large_text_editor_with_content(Some(value), window, cx);
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .title(SharedString::from(title.clone()))
+                .w(px(900.))
+                .h(px(680.))
+                .child(v_flex().size_full().child(editor.clone()))
+                .close_button(true)
+                .overlay(false)
+                .content_center()
+        });
+    }
+
     /// 更新编辑器内容（根据格式转换）
     fn update_editor_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(KeyValueContent::String(ref value)) = self.value_content else {
@@ -462,7 +509,7 @@ impl KeyValueView {
                         view.load_state = LoadState::Loaded;
                     }
                     Err(e) => {
-                        view.load_state = LoadState::Error(e.to_string());
+                        view.load_state = LoadState::Error(format!("{e:#}"));
                     }
                 }
                 cx.notify();
@@ -496,7 +543,7 @@ impl KeyValueView {
         guard
             .get_key_value_detail_in_db(db_index, key)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(anyhow::Error::new)
     }
 
     /// 获取编辑器内容
@@ -819,29 +866,21 @@ impl KeyValueView {
 
     /// 显示 List 添加对话框
     fn show_list_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.input_value_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8)
-        });
+        let value_editor = create_large_text_editor_with_content(None, window, cx);
         let view = cx.entity().downgrade();
         let position = self.list_insert_position;
 
-        // 在打开对话框前设置焦点，避免闪烁
-        value_input.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
-
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let input_for_ok = value_input.clone();
+            let editor_for_ok = value_editor.clone();
             let view_for_ok = view.clone();
 
             dialog
                 .title(t!("KeyValueView.list_insert_title").to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(620.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_3()
                         .child(
                             h_flex()
@@ -865,7 +904,7 @@ impl KeyValueView {
                                         .text_sm()
                                         .child(t!("KeyValueView.value_label").to_string()),
                                 )
-                                .child(Input::new(&value_input).w_full()),
+                                .child(div().h(px(460.)).w_full().child(value_editor.clone())),
                         ),
                 )
                 .confirm()
@@ -875,7 +914,10 @@ impl KeyValueView {
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
                 .on_ok(move |_, window, cx| {
-                    let value = input_for_ok.read(cx).text().to_string();
+                    let Some(value) = Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     if value.is_empty() {
                         return false;
                     }
@@ -896,37 +938,33 @@ impl KeyValueView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let value_input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.input_value_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8);
-            state.set_value(current_value, window, cx);
-            state
-        });
+        let value_editor = create_large_text_editor_with_content(Some(current_value), window, cx);
         let view = cx.entity().downgrade();
 
-        // 在打开对话框前设置焦点，避免闪烁
-        value_input.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
-
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let input_for_ok = value_input.clone();
+            let editor_for_ok = value_editor.clone();
             let view_for_ok = view.clone();
 
             dialog
                 .title(t!("KeyValueView.edit_list_item", index = index + 1).to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(600.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_1()
                         .child(
                             div()
                                 .text_sm()
                                 .child(t!("KeyValueView.value_label").to_string()),
                         )
-                        .child(Input::new(&value_input).w_full()),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(value_editor.clone()),
+                        ),
                 )
                 .confirm()
                 .button_props(
@@ -935,7 +973,10 @@ impl KeyValueView {
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
                 .on_ok(move |_, window, cx| {
-                    let value = input_for_ok.read(cx).text().to_string();
+                    let Some(value) = Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     if value.is_empty() {
                         return false;
                     }
@@ -962,6 +1003,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -976,15 +1018,15 @@ impl KeyValueView {
                     match position {
                         ListInsertPosition::Head => {
                             guard
-                                .lpush(&key, &[value.as_str()])
+                                .lpush_in_db(db_index, &key, &[value.as_str()])
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                         }
                         ListInsertPosition::Tail => {
                             guard
-                                .rpush(&key, &[value.as_str()])
+                                .rpush_in_db(db_index, &key, &[value.as_str()])
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                         }
                     }
                     Ok::<(), anyhow::Error>(())
@@ -1011,6 +1053,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1023,9 +1066,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .lset(&key, index as i64, &new_value)
+                        .lset_in_db(db_index, &key, index as i64, &new_value)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -1044,35 +1087,33 @@ impl KeyValueView {
 
     /// 显示 Set 添加对话框
     fn show_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.set_member_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8)
-        });
+        let member_editor = create_large_text_editor_with_content(None, window, cx);
         let view = cx.entity().downgrade();
 
-        // 在打开对话框前设置焦点，避免闪烁
-        value_input.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
-
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let input_for_ok = value_input.clone();
+            let editor_for_ok = member_editor.clone();
             let view_for_ok = view.clone();
 
             dialog
                 .title(t!("KeyValueView.add_set_member").to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(600.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_1()
                         .child(
                             div()
                                 .text_sm()
                                 .child(t!("KeyValueView.member_label").to_string()),
                         )
-                        .child(Input::new(&value_input).w_full()),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(member_editor.clone()),
+                        ),
                 )
                 .confirm()
                 .button_props(
@@ -1081,12 +1122,76 @@ impl KeyValueView {
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
                 .on_ok(move |_, window, cx| {
-                    let member = input_for_ok.read(cx).text().to_string();
+                    let Some(member) = Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     if member.is_empty() {
                         return false;
                     }
                     let _ = view_for_ok.update(cx, |v, cx| {
                         v.add_set_member(member, cx);
+                        window.close_dialog(cx);
+                    });
+                    false
+                })
+        });
+    }
+
+    /// 显示 Set 编辑对话框
+    fn show_set_edit_dialog(
+        &mut self,
+        current_member: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let member_editor =
+            create_large_text_editor_with_content(Some(current_member.clone()), window, cx);
+        let view = cx.entity().downgrade();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let editor_for_ok = member_editor.clone();
+            let view_for_ok = view.clone();
+            let old_member = current_member.clone();
+
+            dialog
+                .title(t!("KeyValueView.edit_set_member").to_string())
+                .w(px(800.))
+                .h(px(600.))
+                .child(
+                    v_flex()
+                        .size_full()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(t!("KeyValueView.member_label").to_string()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(member_editor.clone()),
+                        ),
+                )
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t!("KeyValueView.save").to_string())
+                        .cancel_text(t!("Common.cancel").to_string()),
+                )
+                .on_ok(move |_, window, cx| {
+                    let Some(new_member) =
+                        Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
+                    if new_member.is_empty() {
+                        return false;
+                    }
+                    let _ = view_for_ok.update(cx, |v, cx| {
+                        v.update_set_member(old_member.clone(), new_member, cx);
                         window.close_dialog(cx);
                     });
                     false
@@ -1103,6 +1208,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1115,9 +1221,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .sadd(&key, &[member.as_str()])
+                        .sadd_in_db(db_index, &key, &[member.as_str()])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -1142,12 +1248,7 @@ impl KeyValueView {
             state.set_value("0", window, cx);
             state
         });
-        let member_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.set_member_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8)
-        });
+        let member_editor = create_large_text_editor_with_content(None, window, cx);
         let view = cx.entity().downgrade();
 
         // 在打开对话框前设置焦点，避免闪烁
@@ -1157,14 +1258,16 @@ impl KeyValueView {
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let score_for_ok = score_input.clone();
-            let member_for_ok = member_input.clone();
+            let editor_for_ok = member_editor.clone();
             let view_for_ok = view.clone();
 
             dialog
                 .title(t!("KeyValueView.add_zset_member").to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(660.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_3()
                         .child(
                             v_flex()
@@ -1178,13 +1281,21 @@ impl KeyValueView {
                         )
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_h_0()
                                 .gap_1()
                                 .child(
                                     div()
                                         .text_sm()
                                         .child(t!("KeyValueView.member_label").to_string()),
                                 )
-                                .child(Input::new(&member_input).w_full()),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .w_full()
+                                        .child(member_editor.clone()),
+                                ),
                         ),
                 )
                 .confirm()
@@ -1194,7 +1305,10 @@ impl KeyValueView {
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
                 .on_ok(move |_, window, cx| {
-                    let member = member_for_ok.read(cx).text().to_string();
+                    let Some(member) = Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     let score_str = score_for_ok.read(cx).text().to_string();
                     let score: f64 = score_str.parse().unwrap_or(0.0);
                     if member.is_empty() {
@@ -1223,14 +1337,7 @@ impl KeyValueView {
             state.set_value(format!("{}", current_score), window, cx);
             state
         });
-        let member_input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.zset_member_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8);
-            state.set_value(member.clone(), window, cx);
-            state
-        });
+        let member_editor = create_large_text_editor_with_content(Some(member.clone()), window, cx);
         let view = cx.entity().downgrade();
         let old_member = member;
 
@@ -1241,15 +1348,17 @@ impl KeyValueView {
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let score_for_ok = score_input.clone();
-            let member_for_ok = member_input.clone();
+            let editor_for_ok = member_editor.clone();
             let view_for_ok = view.clone();
             let old_member_for_ok = old_member.clone();
 
             dialog
                 .title(t!("KeyValueView.edit_zset_member").to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(660.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_3()
                         .child(
                             v_flex()
@@ -1263,13 +1372,21 @@ impl KeyValueView {
                         )
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_h_0()
                                 .gap_1()
                                 .child(
                                     div()
                                         .text_sm()
                                         .child(t!("KeyValueView.member_label").to_string()),
                                 )
-                                .child(Input::new(&member_input).w_full()),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .w_full()
+                                        .child(member_editor.clone()),
+                                ),
                         ),
                 )
                 .confirm()
@@ -1279,7 +1396,11 @@ impl KeyValueView {
                         .cancel_text(t!("Common.cancel").to_string()),
                 )
                 .on_ok(move |_, window, cx| {
-                    let new_member = member_for_ok.read(cx).text().to_string();
+                    let Some(new_member) =
+                        Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     let score_str = score_for_ok.read(cx).text().to_string();
                     let score: f64 = score_str.parse().unwrap_or(0.0);
                     if new_member.is_empty() {
@@ -1303,6 +1424,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1315,9 +1437,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .zadd(&key, &[(score, member.as_str())])
+                        .zadd_in_db(db_index, &key, &[(score, member.as_str())])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -1347,6 +1469,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1362,14 +1485,14 @@ impl KeyValueView {
                     // 如果成员名变了，先删除旧的
                     if old_member != new_member {
                         guard
-                            .zrem(&key, &[old_member.as_str()])
+                            .zrem_in_db(db_index, &key, &[old_member.as_str()])
                             .await
-                            .map_err(|e| anyhow::anyhow!("{}", e))?;
+                            .map_err(anyhow::Error::new)?;
                     }
                     guard
-                        .zadd(&key, &[(score, new_member.as_str())])
+                        .zadd_in_db(db_index, &key, &[(score, new_member.as_str())])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                        .map_err(anyhow::Error::new)?;
                     Ok::<(), anyhow::Error>(())
                 }
             })
@@ -1393,12 +1516,7 @@ impl KeyValueView {
             InputState::new(window, cx)
                 .placeholder(t!("KeyValueView.hash_field_placeholder").to_string())
         });
-        let value_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.input_value_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8)
-        });
+        let value_editor = create_large_text_editor_with_content(None, window, cx);
         let view = cx.entity().downgrade();
 
         // 在打开对话框前设置焦点，避免闪烁
@@ -1408,14 +1526,16 @@ impl KeyValueView {
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let field_for_ok = field_input.clone();
-            let value_for_ok = value_input.clone();
+            let editor_for_ok = value_editor.clone();
             let view_for_ok = view.clone();
 
             dialog
                 .title(t!("KeyValueView.add_hash_field").to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(660.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_3()
                         .child(
                             v_flex()
@@ -1429,13 +1549,21 @@ impl KeyValueView {
                         )
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_h_0()
                                 .gap_1()
                                 .child(
                                     div()
                                         .text_sm()
                                         .child(t!("KeyValueView.value_label").to_string()),
                                 )
-                                .child(Input::new(&value_input).w_full()),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .w_full()
+                                        .child(value_editor.clone()),
+                                ),
                         ),
                 )
                 .confirm()
@@ -1446,7 +1574,10 @@ impl KeyValueView {
                 )
                 .on_ok(move |_, window, cx| {
                     let field = field_for_ok.read(cx).text().to_string();
-                    let value = value_for_ok.read(cx).text().to_string();
+                    let Some(value) = Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     if field.is_empty() {
                         return false;
                     }
@@ -1473,33 +1604,23 @@ impl KeyValueView {
             state.set_value(field.clone(), window, cx);
             state
         });
-        let value_input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("KeyValueView.input_value_placeholder").to_string())
-                .multi_line(true)
-                .auto_grow(3, 8);
-            state.set_value(current_value, window, cx);
-            state
-        });
+        let value_editor = create_large_text_editor_with_content(Some(current_value), window, cx);
         let view = cx.entity().downgrade();
         let old_field = field;
 
-        // 在打开对话框前设置焦点，避免闪烁
-        value_input.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
-
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let field_for_ok = field_input.clone();
-            let value_for_ok = value_input.clone();
+            let editor_for_ok = value_editor.clone();
             let view_for_ok = view.clone();
             let old_field_for_ok = old_field.clone();
 
             dialog
                 .title(t!("KeyValueView.edit_hash_field").to_string())
-                .w(px(400.))
+                .w(px(800.))
+                .h(px(660.))
                 .child(
                     v_flex()
+                        .size_full()
                         .gap_3()
                         .child(
                             v_flex()
@@ -1513,13 +1634,21 @@ impl KeyValueView {
                         )
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_h_0()
                                 .gap_1()
                                 .child(
                                     div()
                                         .text_sm()
                                         .child(t!("KeyValueView.value_label").to_string()),
                                 )
-                                .child(Input::new(&value_input).w_full()),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .w_full()
+                                        .child(value_editor.clone()),
+                                ),
                         ),
                 )
                 .confirm()
@@ -1530,7 +1659,10 @@ impl KeyValueView {
                 )
                 .on_ok(move |_, window, cx| {
                     let new_field = field_for_ok.read(cx).text().to_string();
-                    let value = value_for_ok.read(cx).text().to_string();
+                    let Some(value) = Self::large_text_editor_value(&editor_for_ok, window, cx)
+                    else {
+                        return false;
+                    };
                     if new_field.is_empty() {
                         return false;
                     }
@@ -1562,6 +1694,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1575,9 +1708,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .hset(&key, &field, &value)
+                        .hset_in_db(db_index, &key, &field, &value)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -1607,6 +1740,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1618,13 +1752,13 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .hdel(&key, &[old_field.as_str()])
+                        .hdel_in_db(db_index, &key, &[old_field.as_str()])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                        .map_err(anyhow::Error::new)?;
                     guard
-                        .hset(&key, &new_field, &value)
+                        .hset_in_db(db_index, &key, &new_field, &value)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                        .map_err(anyhow::Error::new)?;
                     Ok::<(), anyhow::Error>(())
                 }
             })
@@ -1725,6 +1859,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1738,15 +1873,15 @@ impl KeyValueView {
                     match ttl {
                         Some(seconds) if seconds > 0 => {
                             guard
-                                .expire(&key, seconds)
+                                .expire_in_db(db_index, &key, seconds)
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                         }
                         _ => {
                             guard
-                                .persist(&key)
+                                .persist_in_db(db_index, &key)
                                 .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                .map_err(anyhow::Error::new)?;
                         }
                     }
                     Ok::<(), anyhow::Error>(())
@@ -1844,9 +1979,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .rename(&old_name, &new_name)
+                        .rename_in_db(db_index, &old_name, &new_name)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -1872,6 +2007,7 @@ impl KeyValueView {
         };
         let value = self.get_editor_content(cx);
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1884,9 +2020,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .set(&key, &value, None)
+                        .set_in_db(db_index, &key, &value, None)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -1919,6 +2055,7 @@ impl KeyValueView {
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
         let delete_marker = "__DELETED_ELEMENT_MARKER__";
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1930,13 +2067,16 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .lset(&key, index as i64, delete_marker)
+                        .lset_in_db(db_index, &key, index as i64, delete_marker)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                        .map_err(anyhow::Error::new)?;
                     guard
-                        .execute_command(&format!("LREM {} 1 {}", key, delete_marker))
+                        .execute_command_in_db(
+                            db_index,
+                            &format!("LREM {} 1 {}", key, delete_marker),
+                        )
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                        .map_err(anyhow::Error::new)?;
                     Ok::<(), anyhow::Error>(())
                 }
             })
@@ -1961,6 +2101,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -1973,9 +2114,62 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .srem(&key, &[member.as_str()])
+                        .srem_in_db(db_index, &key, &[member.as_str()])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
+                }
+            })
+            .await;
+
+            _ = this.update(cx, |view, cx| {
+                if result.is_ok() {
+                    view.reload_after_operation(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 更新 Set 成员
+    fn update_set_member(
+        &mut self,
+        old_member: String,
+        new_member: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !should_replace_set_member(&old_member, &new_member) {
+            return;
+        }
+        let Some(connection_id) = self.connection_id.clone() else {
+            return;
+        };
+        let Some(key) = self.current_key.clone() else {
+            return;
+        };
+        let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = Tokio::spawn_result(cx, {
+                let connection_id = connection_id.clone();
+                let key = key.clone();
+                let old_member = old_member.clone();
+                let new_member = new_member.clone();
+                async move {
+                    let conn = global_state.get_connection(&connection_id).ok_or_else(|| {
+                        anyhow::anyhow!("{}", t!("KeyValueView.connection_missing"))
+                    })?;
+                    let guard = conn.read().await;
+                    guard
+                        .srem_in_db(db_index, &key, &[old_member.as_str()])
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    guard
+                        .sadd_in_db(db_index, &key, &[new_member.as_str()])
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    Ok::<(), anyhow::Error>(())
                 }
             })
             .await;
@@ -1999,6 +2193,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -2011,9 +2206,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .zrem(&key, &[member.as_str()])
+                        .zrem_in_db(db_index, &key, &[member.as_str()])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -2037,6 +2232,7 @@ impl KeyValueView {
             return;
         };
         let global_state = cx.global::<GlobalRedisState>().clone();
+        let db_index = self.db_index;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, {
@@ -2049,9 +2245,9 @@ impl KeyValueView {
                     })?;
                     let guard = conn.read().await;
                     guard
-                        .hdel(&key, &[field.as_str()])
+                        .hdel_in_db(db_index, &key, &[field.as_str()])
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                        .map_err(anyhow::Error::new)
                 }
             })
             .await;
@@ -2200,6 +2396,9 @@ impl KeyValueView {
                     let view = view.clone();
                     let value_for_copy = item.clone();
                     let value_for_edit = item.clone();
+                    let value_for_preview = item.clone();
+                    let preview_title =
+                        large_text_preview_title("List item", Some(&format!("#{}", idx + 1)));
 
                     h_flex()
                         .id(("list-row", idx))
@@ -2218,7 +2417,36 @@ impl KeyValueView {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!("{}", idx + 1)),
                         )
-                        .child(div().flex_1().text_base().truncate().child(item.clone()))
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .items_center()
+                                .child(div().flex_1().text_base().truncate().child(item.clone()))
+                                .child(
+                                    Button::new(("preview-list", idx))
+                                        .icon(IconName::Maximize)
+                                        .ghost()
+                                        .with_size(Size::Medium)
+                                        .tooltip("查看完整值")
+                                        .on_click({
+                                            let view = view.clone();
+                                            let title = preview_title.clone();
+                                            let value = value_for_preview.clone();
+                                            move |_, window, cx| {
+                                                view.update(cx, |v, cx| {
+                                                    v.show_large_text_preview_dialog(
+                                                        title.clone(),
+                                                        value.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
                         .child(
                             h_flex()
                                 .w(px(120.0))
@@ -2302,6 +2530,9 @@ impl KeyValueView {
                     let view = view.clone();
                     let value_for_copy = item.clone();
                     let value_for_delete = item.clone();
+                    let value_for_edit = item.clone();
+                    let value_for_preview = item.clone();
+                    let preview_title = large_text_preview_title("Set member", None);
 
                     h_flex()
                         .id(("set-row", idx))
@@ -2316,6 +2547,7 @@ impl KeyValueView {
                         .child(
                             h_flex()
                                 .flex_1()
+                                .min_w_0()
                                 .gap_2()
                                 .items_center()
                                 .child(
@@ -2323,7 +2555,29 @@ impl KeyValueView {
                                         .with_size(Size::Small)
                                         .text_color(cx.theme().muted_foreground),
                                 )
-                                .child(div().flex_1().text_base().truncate().child(item.clone())),
+                                .child(div().flex_1().text_base().truncate().child(item.clone()))
+                                .child(
+                                    Button::new(("preview-set", idx))
+                                        .icon(IconName::Maximize)
+                                        .ghost()
+                                        .with_size(Size::Medium)
+                                        .tooltip("查看完整值")
+                                        .on_click({
+                                            let view = view.clone();
+                                            let title = preview_title.clone();
+                                            let value = value_for_preview.clone();
+                                            move |_, window, cx| {
+                                                view.update(cx, |v, cx| {
+                                                    v.show_large_text_preview_dialog(
+                                                        title.clone(),
+                                                        value.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -2343,6 +2597,25 @@ impl KeyValueView {
                                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                                     value.clone(),
                                                 ));
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new(("edit-set", idx))
+                                        .icon(IconName::Edit)
+                                        .ghost()
+                                        .with_size(Size::Medium)
+                                        .on_click({
+                                            let view = view.clone();
+                                            let member = value_for_edit.clone();
+                                            move |_, window, cx| {
+                                                view.update(cx, |v, cx| {
+                                                    v.show_set_edit_dialog(
+                                                        member.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
                                             }
                                         }),
                                 )
@@ -2412,6 +2685,11 @@ impl KeyValueView {
                     let member_for_edit = item.member.clone();
                     let score_for_edit = item.score;
                     let member_for_delete = item.member.clone();
+                    let member_for_preview = item.member.clone();
+                    let preview_title = large_text_preview_title(
+                        "ZSet member",
+                        Some(&format!("score {:.2}", item.score)),
+                    );
 
                     // 计算分数百分比用于可视化柱状图 (0.0-1.0)
                     let score_ratio = if (max_score - min_score).abs() < f64::EPSILON {
@@ -2483,11 +2761,40 @@ impl KeyValueView {
                                 ),
                         )
                         .child(
-                            div()
+                            h_flex()
                                 .flex_1()
-                                .text_base()
-                                .truncate()
-                                .child(item.member.clone()),
+                                .min_w_0()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_base()
+                                        .truncate()
+                                        .child(item.member.clone()),
+                                )
+                                .child(
+                                    Button::new(("preview-zset", original_idx))
+                                        .icon(IconName::Maximize)
+                                        .ghost()
+                                        .with_size(Size::Medium)
+                                        .tooltip("查看完整值")
+                                        .on_click({
+                                            let view = view.clone();
+                                            let title = preview_title.clone();
+                                            let value = member_for_preview.clone();
+                                            move |_, window, cx| {
+                                                view.update(cx, |v, cx| {
+                                                    v.show_large_text_preview_dialog(
+                                                        title.clone(),
+                                                        value.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -2577,6 +2884,8 @@ impl KeyValueView {
                     let field_for_edit = item.field.clone();
                     let value_for_edit = item.value.clone();
                     let field_for_delete = item.field.clone();
+                    let value_for_preview = item.value.clone();
+                    let preview_title = large_text_preview_title("Hash value", Some(&item.field));
 
                     h_flex()
                         .id(("hash-row", idx))
@@ -2597,11 +2906,40 @@ impl KeyValueView {
                                 .child(item.field.clone()),
                         )
                         .child(
-                            div()
+                            h_flex()
                                 .flex_1()
-                                .text_base()
-                                .truncate()
-                                .child(item.value.clone()),
+                                .min_w_0()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_base()
+                                        .truncate()
+                                        .child(item.value.clone()),
+                                )
+                                .child(
+                                    Button::new(("preview-hash", idx))
+                                        .icon(IconName::Maximize)
+                                        .ghost()
+                                        .with_size(Size::Medium)
+                                        .tooltip("查看完整值")
+                                        .on_click({
+                                            let view = view.clone();
+                                            let title = preview_title.clone();
+                                            let value = value_for_preview.clone();
+                                            move |_, window, cx| {
+                                                view.update(cx, |v, cx| {
+                                                    v.show_large_text_preview_dialog(
+                                                        title.clone(),
+                                                        value.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -2700,39 +3038,94 @@ impl KeyValueView {
     }
 
     /// 渲染 Stream 视图
-    fn render_stream_view(&self, entries: &[crate::StreamEntry], cx: &App) -> impl IntoElement {
+    fn render_stream_view(
+        &self,
+        entries: &[crate::StreamEntry],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let view = cx.entity().clone();
+        let muted = cx.theme().muted;
+        let accent = cx.theme().accent;
+        let muted_foreground = cx.theme().muted_foreground;
+
         v_flex()
             .id("stream-value-scroll")
             .size_full()
             .p_2()
             .gap_2()
             .overflow_scroll()
-            .children(entries.iter().map(|entry| {
-                v_flex()
-                    .w_full()
-                    .p_2()
-                    .rounded(px(4.0))
-                    .bg(cx.theme().muted)
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().accent)
-                            .child(format!("ID: {}", entry.id)),
-                    )
-                    .children(entry.fields.iter().map(|(k, v)| {
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .w(px(100.0))
-                                    .child(k.clone()),
-                            )
-                            .child(div().text_sm().child(v.clone()))
-                    }))
+            .children(entries.iter().enumerate().map({
+                let view = view.clone();
+                move |(entry_idx, entry)| {
+                    let view = view.clone();
+
+                    v_flex()
+                        .w_full()
+                        .p_2()
+                        .rounded(px(4.0))
+                        .bg(muted)
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(accent)
+                                .child(format!("ID: {}", entry.id)),
+                        )
+                        .children(entry.fields.iter().enumerate().map({
+                            let view = view.clone();
+                            let entry_id = entry.id.clone();
+                            move |(field_idx, (k, v))| {
+                                let title = large_text_preview_title(
+                                    "Stream value",
+                                    Some(&format!("{} @ {}", k, entry_id)),
+                                );
+                                let value = v.clone();
+                                let view = view.clone();
+
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_foreground)
+                                            .w(px(100.0))
+                                            .child(k.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .truncate()
+                                            .child(v.clone()),
+                                    )
+                                    .child(
+                                        Button::new((
+                                            "preview-stream",
+                                            ((entry_idx as u64) << 32) | field_idx as u64,
+                                        ))
+                                        .icon(IconName::Maximize)
+                                        .ghost()
+                                        .with_size(Size::Medium)
+                                        .tooltip("查看完整值")
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                view.update(cx, |v, cx| {
+                                                    v.show_large_text_preview_dialog(
+                                                        title.clone(),
+                                                        value.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            },
+                                        ),
+                                    )
+                            }
+                        }))
+                }
             }))
     }
 
@@ -2834,6 +3227,30 @@ impl Render for KeyValueView {
 }
 
 impl EventEmitter<TabContentEvent> for KeyValueView {}
+
+#[cfg(test)]
+mod tests {
+    use super::{large_text_preview_title, should_replace_set_member};
+
+    #[test]
+    fn large_text_preview_title_formats_context() {
+        assert_eq!(
+            "List item #1",
+            large_text_preview_title("List item", Some("#1"))
+        );
+    }
+
+    #[test]
+    fn large_text_preview_title_omits_blank_context() {
+        assert_eq!("Set member", large_text_preview_title("Set member", None));
+    }
+
+    #[test]
+    fn should_replace_set_member_detects_changes() {
+        assert!(should_replace_set_member("old", "new"));
+        assert!(!should_replace_set_member("same", "same"));
+    }
+}
 
 impl TabContent for KeyValueView {
     fn content_key(&self) -> &'static str {
