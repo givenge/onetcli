@@ -6041,7 +6041,7 @@ checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 
 [[package]]
 name = "main"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6058,6 +6058,7 @@ dependencies = [
  "one-core",
  "one-ui",
  "redis_view",
+ "remote_file_editor",
  "reqwest_client",
  "rust-i18n",
  "semver",
@@ -7112,6 +7113,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "json5",
+ "one-core",
  "serde_json",
  "tracing",
 ]

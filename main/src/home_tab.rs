@@ -26,6 +26,7 @@ use one_core::cloud_sync::{
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event, get_notifier};
 use one_core::crypto;
 use one_core::key_storage;
+use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
 use one_core::license::Feature;
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::storage::traits::Repository;
@@ -51,16 +52,67 @@ use crate::setting_tab::GlobalCurrentUser;
 actions!(home_tab, [OpenConnectionQuickOpen, NewConnectionShortcut]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-o", OpenConnectionQuickOpen, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("alt-o", OpenConnectionQuickOpen, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-n", NewConnectionShortcut, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("alt-n", NewConnectionShortcut, None),
-    ]);
+    cx.bind_keys(init_keybindings(cx));
+}
+
+pub fn refresh_keybindings(cx: &mut App) {
+    cx.bind_keys(refreshable_keybindings(cx));
+}
+
+fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
+    let quick_open_default = if cfg!(target_os = "macos") {
+        "cmd-o"
+    } else {
+        "alt-o"
+    };
+    let new_connection_default = if cfg!(target_os = "macos") {
+        "cmd-n"
+    } else {
+        "alt-n"
+    };
+    let mut keybindings = Vec::new();
+    keybindings.extend(
+        shortcuts_for(cx, action_id::HOME_QUICK_OPEN, &[quick_open_default])
+            .into_iter()
+            .map(|key| KeyBinding::new(&key, OpenConnectionQuickOpen, None)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
+            action_id::HOME_NEW_CONNECTION,
+            &[new_connection_default],
+        )
+        .into_iter()
+        .map(|key| KeyBinding::new(&key, NewConnectionShortcut, None)),
+    );
+    keybindings
+}
+
+fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
+    let mut keybindings = Vec::new();
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::HOME_QUICK_OPEN,
+        &[home_default_shortcut("cmd-o", "alt-o")],
+        None,
+        OpenConnectionQuickOpen,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::HOME_NEW_CONNECTION,
+        &[home_default_shortcut("cmd-n", "alt-n")],
+        None,
+        NewConnectionShortcut,
+    ));
+    keybindings
+}
+
+fn home_default_shortcut(macos: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        other
+    }
 }
 
 // HomePage Entity - 管理 home 页面的所有状态
@@ -97,6 +149,10 @@ pub struct HomePage {
     pub(crate) logging_in: bool,
     /// 认证错误消息（登录/注册失败时设置）
     pub(crate) auth_error: Option<String>,
+    /// 启动恢复主密钥失败后，在首帧延迟弹出解锁对话框。
+    master_key_unlock_prompt_pending: bool,
+    /// 防止主密钥对话框被启动提示和用户点击重复打开。
+    master_key_dialog_open: bool,
 }
 
 impl HomePage {
@@ -152,6 +208,8 @@ impl HomePage {
             current_user: None,
             logging_in: false,
             auth_error: None,
+            master_key_unlock_prompt_pending: false,
+            master_key_dialog_open: false,
         };
 
         // 异步加载工作区
@@ -164,6 +222,7 @@ impl HomePage {
         } else if crypto::has_repo_password_set() {
             // 有验证文件但恢复失败，提示用户需要重新输入密钥
             tracing::warn!("密钥恢复失败，需要用户重新输入主密钥");
+            page.master_key_unlock_prompt_pending = true;
         } else {
             tracing::info!("首次使用，需要设置主密钥");
         }
@@ -269,6 +328,13 @@ impl HomePage {
     }
 
     fn load_connections(&mut self, cx: &mut Context<Self>) {
+        if self.saved_connections_locked() {
+            tracing::warn!("主密钥未解锁，暂缓加载本地连接，避免将加密密码解密为空");
+            self.connections.clear();
+            cx.notify();
+            return;
+        }
+
         let storage = cx.global::<GlobalStorageState>().storage.clone();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = (|| {
@@ -751,10 +817,15 @@ impl HomePage {
                 this.syncing = false;
                 let sync_requested = this.sync_requested;
                 match result {
-                    Ok(_stats) => {
-                        tracing::info!("冲突解决完成");
-                        this.pending_conflicts.clear();
-                        this.refresh_local_home_data(cx);
+                    Ok(stats) => {
+                        if stats.errors.is_empty() {
+                            tracing::info!("冲突解决完成");
+                            this.pending_conflicts.clear();
+                            this.refresh_local_home_data(cx);
+                        } else {
+                            tracing::error!("冲突解决存在错误: {}", stats.errors.join("; "));
+                            this.cloud_error = Some(stats.errors.join("; "));
+                        }
                     }
                     Err(e) => {
                         tracing::error!("冲突解决失败: {}", e);
@@ -1088,6 +1159,10 @@ impl HomePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_master_key_ready_for_saved_connections(window, cx) {
+            return;
+        }
+
         let parent = cx.entity();
         let connections = self.connections.clone();
         let list = cx.new(|cx| {
@@ -1147,6 +1222,10 @@ impl HomePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_master_key_ready_for_saved_connections(window, cx) {
+            return;
+        }
+
         let workspace = connection
             .workspace_id
             .and_then(|id| self.workspaces.iter().find(|w| w.id == Some(id)).cloned());
@@ -1537,11 +1616,33 @@ impl HomePage {
         crypto::has_master_key()
     }
 
+    pub(crate) fn ensure_master_key_ready_for_saved_connections(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.saved_connections_locked() {
+            return true;
+        }
+
+        self.show_encryption_key_dialog(window, cx);
+        false
+    }
+
+    fn saved_connections_locked(&self) -> bool {
+        crypto::has_repo_password_set() && !crypto::has_master_key()
+    }
+
     pub(crate) fn show_encryption_key_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.master_key_dialog_open {
+            return;
+        }
+        self.master_key_dialog_open = true;
+
         let view = cx.entity();
         let has_password_set = crypto::has_repo_password_set();
         let has_key_in_memory = crypto::has_master_key();
@@ -1664,16 +1765,17 @@ impl HomePage {
                 .on_close({
                     let view_for_sync = view.clone();
                     move |_window, _result, cx| {
-                        if crypto::has_master_key() {
-                            view_for_sync.update(cx, |this, cx| {
+                        view_for_sync.update(cx, |this, cx| {
+                            this.master_key_dialog_open = false;
+                            if crypto::has_master_key() {
                                 // 密钥已就绪后刷新连接列表，修复启动时序导致的空密码回显
                                 this.load_connections(cx);
                                 if this.current_user.is_some() {
                                     tracing::info!("密钥设置/解锁成功，自动触发云同步");
                                     this.trigger_sync(cx);
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                 })
                 .child(
@@ -1898,6 +2000,16 @@ impl Render for HomePage {
             window.defer(cx, move |window, cx| {
                 view.update(cx, |this, cx| {
                     this.show_login_dialog(window, cx);
+                });
+            });
+        }
+
+        if self.master_key_unlock_prompt_pending && self.saved_connections_locked() {
+            self.master_key_unlock_prompt_pending = false;
+            let view = cx.entity();
+            window.defer(cx, move |window, cx| {
+                view.update(cx, |this, cx| {
+                    this.show_encryption_key_dialog(window, cx);
                 });
             });
         }

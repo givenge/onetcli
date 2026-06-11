@@ -88,6 +88,37 @@ impl TableVisibleRange {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DeletedRowSelectionCleanup {
+    clear_selection: bool,
+    clear_drag_end: bool,
+    clear_drag_start: bool,
+}
+
+fn deleted_row_selection_cleanup(
+    selected_row: Option<usize>,
+    selected_cell: Option<CellCoord>,
+    selection: &TableSelection,
+    drag_end_cell: Option<CellCoord>,
+    drag_start: Option<(usize, usize, bool)>,
+    row_ix: usize,
+) -> DeletedRowSelectionCleanup {
+    let selected_deleted_row = selected_row == Some(row_ix);
+    let selected_deleted_cell = selected_cell.is_some_and(|(row, _)| row == row_ix);
+    let selection_contains_deleted_row = selection
+        .ranges
+        .iter()
+        .any(|range| range.row_range().contains(&row_ix));
+
+    DeletedRowSelectionCleanup {
+        clear_selection: selected_deleted_row
+            || selected_deleted_cell
+            || selection_contains_deleted_row,
+        clear_drag_end: drag_end_cell.is_some_and(|(row, _)| row == row_ix),
+        clear_drag_start: drag_start.is_some_and(|(row, _, _)| row == row_ix),
+    }
+}
+
 pub struct EditTableState<D: EditTableDelegate> {
     focus_handle: FocusHandle,
     delegate: D,
@@ -985,8 +1016,8 @@ where
             .count()
     }
 
-    fn page_item_count(&self) -> usize {
-        let row_height = self.options.size.table_row_height();
+    fn page_item_count(&self, cx: &gpui::App) -> usize {
+        let row_height = crate::table_row_height_or(cx, self.options.size.table_row_height());
         let height = self.bounds.size.height;
         let count = (height / row_height).floor() as usize;
         count.saturating_sub(1).max(1)
@@ -1178,10 +1209,41 @@ where
     pub fn delete_row(&mut self, row_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.delegate.on_row_deleted(row_ix, window, cx);
         cx.emit(EditTableEvent::RowDeleted(row_ix));
-        if self.selected_row == Some(row_ix) {
-            self.selected_row = None;
-        }
+        self.clear_deleted_row_selection(row_ix);
         self.refresh(cx);
+        cx.notify();
+    }
+
+    fn clear_deleted_row_selection(&mut self, row_ix: usize) {
+        let cleanup = deleted_row_selection_cleanup(
+            self.selected_row,
+            self.selected_cell,
+            &self.selection,
+            self.drag_end_cell,
+            self.drag_start,
+            row_ix,
+        );
+
+        if cleanup.clear_selection {
+            self.clear_selection_fields();
+        }
+
+        if cleanup.clear_drag_end {
+            self.drag_end_cell = None;
+        }
+
+        if cleanup.clear_drag_start {
+            self.drag_start = None;
+            self.is_selecting = false;
+        }
+    }
+
+    fn clear_selection_fields(&mut self) {
+        self.selection_state = SelectionState::Row;
+        self.selected_row = None;
+        self.selected_col = None;
+        self.selected_cell = None;
+        self.selection.clear();
     }
 
     fn on_col_head_click(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<Self>) {
@@ -1377,7 +1439,7 @@ where
             return;
         }
 
-        let step = self.page_item_count();
+        let step = self.page_item_count(cx);
         if self.has_cell_selection() {
             let first_col_ix = self.first_data_col_ix(cx);
             if let Some((row_ix, col_ix)) = self.current_cell_for_navigation() {
@@ -1405,7 +1467,7 @@ where
             return;
         }
 
-        let step = self.page_item_count();
+        let step = self.page_item_count(cx);
         if self.has_cell_selection() {
             let first_col_ix = self.first_data_col_ix(cx);
             if let Some((row_ix, col_ix)) = self.current_cell_for_navigation() {
@@ -2545,7 +2607,10 @@ where
         header
             .h_flex()
             .w_full()
-            .h(self.options.size.table_row_height())
+            .h(crate::table_row_height_or(
+                cx,
+                self.options.size.table_row_height(),
+            ))
             .flex_shrink_0()
             .border_b_1()
             .border_color(cx.theme().border)
@@ -2633,7 +2698,7 @@ where
         let is_row_deleted = self.delegate.is_row_deleted(row_ix, cx);
         let is_row_added = self.delegate.is_row_added(row_ix, cx);
         let _view = cx.entity().clone();
-        let row_height = self.options.size.table_row_height();
+        let row_height = crate::table_row_height_or(cx, self.options.size.table_row_height());
 
         if row_ix < rows_count {
             let is_last_row = row_ix + 1 == rows_count;
@@ -2822,21 +2887,31 @@ where
             col_ix
         };
 
-        self.delegate
-            .render_td(row_ix, delegate_col_ix, window, cx)
+        h_flex()
+            .size_full()
+            .items_center()
+            .overflow_hidden()
+            .child(
+                self.delegate
+                    .render_td(row_ix, delegate_col_ix, window, cx)
+                    .into_any_element(),
+            )
             .into_any_element()
     }
 
     fn render_vertical_scrollbar(
         &mut self,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         Some(
             div()
                 .occlude()
                 .absolute()
-                .top(self.options.size.table_row_height())
+                .top(crate::table_row_height_or(
+                    cx,
+                    self.options.size.table_row_height(),
+                ))
                 .right_0()
                 .bottom_0()
                 .w(SCROLLBAR_WIDTH)
@@ -2870,6 +2945,52 @@ where
 }
 impl<D> EventEmitter<EditTableEvent> for EditTableState<D> where D: EditTableDelegate {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_row_cleanup_clears_cell_selection_and_drag_state() {
+        let mut selection = TableSelection::new();
+        selection.select_single((1, 1));
+
+        let cleanup = deleted_row_selection_cleanup(
+            None,
+            Some((1, 1)),
+            &selection,
+            Some((1, 1)),
+            Some((1, 1, false)),
+            1,
+        );
+
+        assert_eq!(
+            DeletedRowSelectionCleanup {
+                clear_selection: true,
+                clear_drag_end: true,
+                clear_drag_start: true,
+            },
+            cleanup
+        );
+    }
+
+    #[test]
+    fn deleted_row_cleanup_preserves_unrelated_selection() {
+        let mut selection = TableSelection::new();
+        selection.select_single((2, 1));
+
+        let cleanup = deleted_row_selection_cleanup(
+            Some(2),
+            Some((2, 1)),
+            &selection,
+            Some((2, 1)),
+            Some((2, 1, false)),
+            1,
+        );
+
+        assert_eq!(DeletedRowSelectionCleanup::default(), cleanup);
+    }
+}
+
 impl<D> Render for EditTableState<D>
 where
     D: EditTableDelegate,
@@ -2884,7 +3005,7 @@ where
         let rows_count = self.delegate.rows_count(cx);
         let loading = self.delegate.loading(cx);
 
-        let row_height = self.options.size.table_row_height();
+        let row_height = crate::table_row_height_or(cx, self.options.size.table_row_height());
         let total_height = self
             .vertical_scroll_handle
             .0

@@ -24,9 +24,20 @@ use one_core::{
     tab_container::{TabContainer, TabItem},
 };
 use rust_i18n::t;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::log::{error, warn};
 use uuid::Uuid;
+
+const TAB_META_NODE_ID: &str = "node_id";
+const TAB_META_KIND: &str = "kind";
+const TAB_META_CONNECTION_ID: &str = "connection_id";
+const TAB_META_DATABASE: &str = "database";
+const TAB_META_SCHEMA: &str = "schema";
+const TAB_META_TABLE: &str = "table";
+const TAB_META_DATABASE_TYPE: &str = "database_type";
+const TAB_KIND_TABLE_DATA: &str = "table_data";
+const TAB_KIND_VIEW_DATA: &str = "view_data";
+const TAB_KIND_TABLE_DESIGNER: &str = "table_designer";
 
 // Event handler for database tree view events
 pub struct DatabaseEventHandler {
@@ -56,6 +67,39 @@ impl DatabaseEventHandler {
                 window.push_notification(Notification::success(message.into()).autohide(true), cx);
             });
         }
+    }
+
+    fn tab_metadata_for_node(node: &DbNode, kind: &str) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        metadata.insert(TAB_META_NODE_ID.to_string(), node.id.clone());
+        metadata.insert(TAB_META_KIND.to_string(), kind.to_string());
+        metadata.insert(
+            TAB_META_CONNECTION_ID.to_string(),
+            node.connection_id.clone(),
+        );
+        metadata.insert(
+            TAB_META_DATABASE_TYPE.to_string(),
+            format!("{:?}", node.database_type),
+        );
+
+        if let Some(database) = node.get_database_name() {
+            metadata.insert(TAB_META_DATABASE.to_string(), database);
+        }
+        if let Some(schema) = node.get_schema_name() {
+            metadata.insert(TAB_META_SCHEMA.to_string(), schema);
+        }
+        if let Some(table) = node.get_table_name() {
+            metadata.insert(TAB_META_TABLE.to_string(), table);
+        }
+
+        metadata
+    }
+
+    fn tab_node_id_from_metadata(metadata: &HashMap<String, String>, fallback: &str) -> String {
+        metadata
+            .get(TAB_META_NODE_ID)
+            .cloned()
+            .unwrap_or_else(|| fallback.to_string())
     }
 }
 
@@ -107,7 +151,13 @@ impl DatabaseEventHandler {
                     }
                     DbTreeViewEvent::OpenTableData { node_id } => {
                         if let Some(node) = get_node(&node_id, cx) {
-                            Self::handle_open_table_data(node, tab_container, window, cx);
+                            Self::handle_open_table_data(
+                                node,
+                                tab_container,
+                                tree_view.clone(),
+                                window,
+                                cx,
+                            );
                         }
                     }
                     DbTreeViewEvent::OpenViewData { node_id } => {
@@ -318,6 +368,13 @@ impl DatabaseEventHandler {
                             Self::handle_dump_sql_file(node, *mode, global_state, window, cx);
                         }
                     }
+                    DbTreeViewEvent::LocateActiveTab => {
+                        Self::handle_locate_active_tab(
+                            tab_container.clone(),
+                            tree_view.clone(),
+                            cx,
+                        );
+                    }
                 }
             },
         );
@@ -415,7 +472,13 @@ impl DatabaseEventHandler {
                         );
                     }
                     DatabaseObjectsEvent::OpenTableData { node } => {
-                        Self::handle_open_table_data(node.clone(), tab_container, window, cx);
+                        Self::handle_open_table_data(
+                            node.clone(),
+                            tab_container,
+                            tree_view.clone(),
+                            window,
+                            cx,
+                        );
                     }
                     DatabaseObjectsEvent::DesignTable { node } => {
                         Self::handle_design_table(
@@ -695,14 +758,16 @@ impl DatabaseEventHandler {
     fn handle_open_table_data(
         node: DbNode,
         tab_container: Entity<TabContainer>,
+        tree_view: Entity<DbTreeView>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        use crate::table_data_tab::TableDataTabContent;
+        use crate::table_data_tab::{TableDataTabContent, TableDataTabEvent};
         use tracing::info;
 
         let connection_id = node.connection_id.clone();
         let table = node.name.clone();
+        let node_id = node.id.clone();
 
         info!(
             "handle_open_table_data: connection_id={}, table={}",
@@ -723,12 +788,16 @@ impl DatabaseEventHandler {
         );
 
         let database_type = node.database_type;
+        let tab_metadata = Self::tab_metadata_for_node(&node, TAB_KIND_TABLE_DATA);
         tab_container.update(cx, |container, cx| {
             let tab_id_clone = tab_id.clone();
             let database_clone = database.clone();
             let schema_clone = schema.clone();
             let table_clone = table.clone();
             let config_id_clone = connection_id.clone();
+            let tree_view_for_events = tree_view.clone();
+            let node_id_for_events = node_id.clone();
+            let tab_metadata_clone = tab_metadata.clone();
             container.activate_or_add_tab_lazy(
                 tab_id_clone.clone(),
                 move |window, cx| {
@@ -744,7 +813,24 @@ impl DatabaseEventHandler {
                             cx,
                         )
                     });
+                    let tree_view_for_sub = tree_view_for_events.clone();
+                    let node_id_for_sub = node_id_for_events.clone();
+                    cx.subscribe_in(
+                        &table_data,
+                        window,
+                        move |_, _, event: &TableDataTabEvent, _, cx| match event {
+                            TableDataTabEvent::OpenTableDesignerRequested => {
+                                let node_id = node_id_for_sub.clone();
+                                tree_view_for_sub.update(cx, |_, cx| {
+                                    cx.emit(DbTreeViewEvent::DesignTable { node_id });
+                                });
+                            }
+                        },
+                    )
+                    .detach();
+
                     TabItem::new(tab_id_clone.clone(), connection_id.clone(), table_data)
+                        .with_metadata(tab_metadata_clone)
                 },
                 window,
                 cx,
@@ -778,12 +864,14 @@ impl DatabaseEventHandler {
         );
 
         let database_type = node.database_type;
+        let tab_metadata = Self::tab_metadata_for_node(&node, TAB_KIND_VIEW_DATA);
         tab_container.update(cx, |container, cx| {
             let tab_id_clone = tab_id.clone();
             let database_clone = database.clone();
             let schema_clone = schema.clone();
             let view_clone = view.clone();
             let config_id_clone = connection_id.clone();
+            let tab_metadata_clone = tab_metadata.clone();
             container.activate_or_add_tab_lazy(
                 tab_id_clone.clone(),
                 move |window, cx| {
@@ -799,7 +887,9 @@ impl DatabaseEventHandler {
                             cx,
                         )
                     });
+
                     TabItem::new(tab_id_clone.clone(), connection_id.clone(), view_data)
+                        .with_metadata(tab_metadata_clone)
                 },
                 window,
                 cx,
@@ -843,6 +933,7 @@ impl DatabaseEventHandler {
             }
             _ => return,
         };
+        let tab_metadata = Self::tab_metadata_for_node(&node, TAB_KIND_TABLE_DESIGNER);
 
         let tab_id = if let Some(ref table) = table_name {
             format!("table-designer-{}-{}", database_name, table)
@@ -852,6 +943,7 @@ impl DatabaseEventHandler {
 
         let tab_id_for_config = tab_id.clone();
         tab_container.update(cx, |container, cx| {
+            let tab_metadata_clone = tab_metadata.clone();
             container.activate_or_add_tab_lazy(
                 tab_id.clone(),
                 |window, cx| {
@@ -914,6 +1006,7 @@ impl DatabaseEventHandler {
                     .detach();
 
                     TabItem::new(tab_id, clone_conn_id.clone(), designer)
+                        .with_metadata(tab_metadata_clone)
                 },
                 window,
                 cx,
@@ -3655,5 +3748,21 @@ impl DatabaseEventHandler {
             }
         })
         .detach();
+    }
+
+    fn handle_locate_active_tab(
+        tab_container: Entity<TabContainer>,
+        tree_view: Entity<DbTreeView>,
+        cx: &mut App,
+    ) {
+        let Some(tab) = tab_container.read(cx).active_tab() else {
+            return;
+        };
+
+        let fallback = tab.from().to_string();
+        let node_id = Self::tab_node_id_from_metadata(tab.metadata(), &fallback);
+        tree_view.update(cx, |tree, cx| {
+            tree.locate_and_select_node(&node_id, cx);
+        });
     }
 }
