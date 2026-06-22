@@ -3,12 +3,15 @@ use crate::database_view_plugin::{
     build_toolbar_buttons_for,
 };
 use crate::db_tree_view::{DbTreeViewEvent, SqlDumpMode, get_icon_for_node_type};
+use crate::search_shortcut::{
+    DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, focus_search_input,
+};
 use db::{DbNode, DbNodeType, GlobalDbState, ObjectView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Context, DragMoveEvent, Empty, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ListSizingBehavior,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
+    AnyElement, App, AppContext, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, px, uniform_list,
 };
 use gpui_component::button::Button;
@@ -37,18 +40,6 @@ use std::time::Duration;
 const DB_OBJECTS_ROW_NUMBER_WIDTH: Pixels = px(48.0);
 const DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH: Pixels = px(6.0);
 const DB_OBJECTS_MIN_COLUMN_WIDTH: Pixels = px(64.0);
-
-#[derive(Clone)]
-struct DbObjectsResizeColumn {
-    entity_id: EntityId,
-    col_ix: usize,
-}
-
-impl Render for DbObjectsResizeColumn {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Empty
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 struct ColumnResizeState {
@@ -191,7 +182,46 @@ pub struct DatabaseObjects {
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone)]
+struct ResizeObjectColumn {
+    entity_id: EntityId,
+    col_ix: usize,
+}
+
+impl Render for ResizeObjectColumn {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.0))
+    }
+}
+
 impl DatabaseObjects {
+    fn on_action_focus_search(
+        &mut self,
+        _: &FocusSearchInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        focus_search_input(&self.search_input, window, cx);
+    }
+
+    fn on_action_open_selected_table_query(
+        &mut self,
+        _: &OpenSelectedTableQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let nodes = self.build_nodes_for_selected_rows();
+        if nodes.len() != 1 {
+            window.push_notification(Notification::warning(t!("Common.select_row")), cx);
+            return;
+        }
+
+        let node = nodes[0].clone();
+        if matches!(node.node_type, DbNodeType::Table | DbNodeType::View) {
+            cx.emit(DatabaseObjectsEvent::CreateNewQuery { node });
+        }
+    }
+
     fn stop_vertical_scroll_bubble(
         &mut self,
         event: &ScrollWheelEvent,
@@ -524,6 +554,18 @@ impl DatabaseObjects {
         }
     }
 
+    fn resize_column(columns: &mut [Column], col_ix: usize, width: Pixels) {
+        let Some(column) = columns.get_mut(col_ix) else {
+            return;
+        };
+
+        if !column.resizable {
+            return;
+        }
+
+        column.width = width.max(column.min_width).min(column.max_width);
+    }
+
     fn load_connection_list_view(
         storage_manager: StorageManager,
         workspace: Option<Workspace>,
@@ -552,7 +594,7 @@ impl DatabaseObjects {
                 vec![
                     stored_conn.name.clone(),
                     connection_id,
-                    db_type.as_str().into(),
+                    db_type.storage_key(),
                     created,
                     updated,
                     remark,
@@ -579,7 +621,7 @@ impl DatabaseObjects {
         use std::time::UNIX_EPOCH;
 
         let database_name = node.get_database_name().unwrap_or_default();
-        let database_type = node.database_type.as_str();
+        let database_type = node.database_type.path_key();
         let connection_id = node.connection_id.clone();
 
         let queries_dir = get_queries_dir().ok()?;
@@ -651,7 +693,6 @@ impl DatabaseObjects {
 
     fn build_node_for_row(&self, row_ix: usize) -> Option<DbNode> {
         let db_node_type = self.db_node_type;
-
         let original_row = self.filtered_rows.get(row_ix).copied()?;
         let row_data = self.rows.get(original_row)?;
 
@@ -669,7 +710,8 @@ impl DatabaseObjects {
         if current_node.is_none() && db_node_type == DbNodeType::Connection {
             let connection_id = row_data.get(1).cloned().unwrap_or_default();
             let db_type_str = row_data.get(2).cloned().unwrap_or_default();
-            let database_type = DatabaseType::from_str(&db_type_str).unwrap_or(DatabaseType::MySQL);
+            let database_type =
+                DatabaseType::from_storage_key(&db_type_str).unwrap_or(DatabaseType::MySQL);
 
             return Some(DbNode::new(
                 connection_id.clone(),
@@ -682,7 +724,7 @@ impl DatabaseObjects {
 
         let current_node = current_node?;
         let connection_id = current_node.connection_id.clone();
-        let database_type = current_node.database_type;
+        let database_type = current_node.database_type.clone();
 
         let mut metadata: HashMap<String, String> = current_node.metadata.clone();
         let database = metadata.get("database").cloned().unwrap_or_default();
@@ -697,7 +739,7 @@ impl DatabaseObjects {
                     let row_connection_id = row_data.get(1).cloned().unwrap_or_default();
                     let db_type_str = row_data.get(2).cloned().unwrap_or_default();
                     let row_database_type =
-                        DatabaseType::from_str(&db_type_str).unwrap_or(DatabaseType::MySQL);
+                        DatabaseType::from_storage_key(&db_type_str).unwrap_or(DatabaseType::MySQL);
                     return Some(DbNode::new(
                         row_connection_id.clone(),
                         name,
@@ -1038,7 +1080,8 @@ impl DatabaseObjects {
             cx.notify();
         });
 
-        let menu_items = build_context_menu_for(node.database_type, &node.id, node.node_type, cx);
+        let menu_items =
+            build_context_menu_for(node.database_type.clone(), &node.id, node.node_type, cx);
         menu = Self::render_context_menu_items(menu, menu_items, is_active, node, view, window, cx);
 
         let view_ref = view.clone();
@@ -1102,7 +1145,7 @@ impl DatabaseObjects {
         });
     }
 
-    fn resize_column(&mut self, col_ix: usize, pointer_x: Pixels, cx: &mut Context<Self>) {
+    fn resize_active_column(&mut self, col_ix: usize, pointer_x: Pixels, cx: &mut Context<Self>) {
         let Some(resizing) = self.resizing_column else {
             return;
         };
@@ -1138,14 +1181,14 @@ impl DatabaseObjects {
     fn drag_resize_column(
         &mut self,
         col_ix: usize,
-        event: &DragMoveEvent<DbObjectsResizeColumn>,
+        event: &DragMoveEvent<ResizeObjectColumn>,
         cx: &mut Context<Self>,
     ) {
         let drag = event.drag(cx);
         if drag.entity_id != cx.entity_id() || drag.col_ix != col_ix {
             return;
         }
-        self.resize_column(col_ix, event.event.position.x, cx);
+        self.resize_active_column(col_ix, event.event.position.x, cx);
     }
 
     fn render_column_resize_indicator(
@@ -1192,12 +1235,12 @@ impl DatabaseObjects {
                 }),
             )
             .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<DbObjectsResizeColumn>, _window, cx| {
+                move |this, event: &DragMoveEvent<ResizeObjectColumn>, _window, cx| {
                     this.drag_resize_column(col_ix, event, cx);
                 },
             ))
             .on_drag(
-                DbObjectsResizeColumn {
+                ResizeObjectColumn {
                     entity_id: cx.entity_id(),
                     col_ix,
                 },
@@ -1229,6 +1272,7 @@ impl DatabaseObjects {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut header = h_flex()
+            .w_full()
             .h(px(32.))
             .px_2()
             .items_center()
@@ -1258,6 +1302,7 @@ impl DatabaseObjects {
         for (col_ix, column) in columns.iter().enumerate() {
             header = header.child(
                 div()
+                    .relative()
                     .w(column.width)
                     .h_full()
                     .flex()
@@ -1284,43 +1329,34 @@ impl DatabaseObjects {
         header.into_any_element()
     }
 
-    fn render_row(
-        &self,
-        row_ix: usize,
-        row_values: &[String],
-        columns: &[Column],
-        show_row_number: bool,
-        is_selected: bool,
-        search_query: &str,
-        db_node_type: DbNodeType,
-        cx: &App,
-    ) -> impl IntoElement {
+    fn render_row(&self, args: ObjectRowRenderArgs<'_>, cx: &App) -> impl IntoElement {
         let mut row = h_flex()
+            .w_full()
             .h(one_ui::table_row_height(cx))
             .px_2()
             .items_center()
-            .when(is_selected, |el| el.bg(cx.theme().selection));
+            .when(args.is_selected, |el| el.bg(cx.theme().selection));
 
-        if show_row_number {
+        if args.show_row_number {
             row = row.child(
                 div()
                     .w(DB_OBJECTS_ROW_NUMBER_WIDTH)
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child((row_ix + 1).to_string()),
+                    .child((args.row_ix + 1).to_string()),
             );
         }
 
-        for (col_ix, column) in columns.iter().enumerate() {
-            let cell_value = row_values.get(col_ix).cloned().unwrap_or_default();
+        for (col_ix, column) in args.columns.iter().enumerate() {
+            let cell_value = args.row_values.get(col_ix).cloned().unwrap_or_default();
             let tooltip_text = cell_value.clone();
             let cell = if col_ix == 0 {
-                let icon = get_icon_for_node_type(&db_node_type, cx.theme()).color();
-                let label = if search_query.is_empty() {
+                let icon = get_icon_for_node_type(&args.db_node_type, cx.theme()).color();
+                let label = if args.search_query.is_empty() {
                     Label::new(cell_value)
                 } else {
-                    Label::new(cell_value).highlights(search_query.to_string())
+                    Label::new(cell_value).highlights(args.search_query.to_string())
                 };
                 h_flex()
                     .gap_2()
@@ -1332,7 +1368,7 @@ impl DatabaseObjects {
                 div().child(cell_value).into_any_element()
             };
 
-            let cell_id = SharedString::from(format!("cell-{}-{}", row_ix, col_ix));
+            let cell_id = SharedString::from(format!("cell-{}-{}", args.row_ix, col_ix));
             row = row.child(
                 div()
                     .id(cell_id)
@@ -1367,7 +1403,7 @@ impl DatabaseObjects {
             .unwrap_or(DbNodeType::Connection);
         let database_type = current_node
             .as_ref()
-            .map(|n| n.database_type)
+            .map(|n| n.database_type.clone())
             .unwrap_or(DatabaseType::MySQL);
 
         buttons.push({
@@ -1470,6 +1506,16 @@ impl DatabaseObjects {
     }
 }
 
+struct ObjectRowRenderArgs<'a> {
+    row_ix: usize,
+    row_values: &'a [String],
+    columns: &'a [Column],
+    show_row_number: bool,
+    is_selected: bool,
+    search_query: &'a str,
+    db_node_type: DbNodeType,
+}
+
 impl Render for DatabaseObjects {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let loaded_data = self.loaded_data.read(cx);
@@ -1487,6 +1533,10 @@ impl Render for DatabaseObjects {
 
         v_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context(DB_SEARCH_CONTEXT)
+            .on_action(cx.listener(Self::on_action_focus_search))
+            .on_action(cx.listener(Self::on_action_open_selected_table_query))
             .child(
                 h_flex()
                     .gap_1()
@@ -1531,30 +1581,20 @@ impl Render for DatabaseObjects {
                                     .child(
                                         uniform_list("database-objects-list", row_count, {
                                             cx.processor(
-                                                move |state: &mut Self,
-                                                      range: Range<usize>,
-                                                      _window,
-                                                      cx| {
+                                                move |state: &mut Self, range: Range<usize>, _window, cx| {
                                                     let db_node_type = state.db_node_type;
                                                     let show_row_number = true;
                                                     range
-                                                        .map(|list_ix| {
-                                                            let Some(original_row) = state
-                                                                .filtered_rows
-                                                                .get(list_ix)
-                                                                .copied()
-                                                            else {
-                                                                return div()
-                                                                    .id(list_ix)
-                                                                    .into_any_element();
-                                                            };
-                                                            let Some(row_values) =
-                                                                state.rows.get(original_row)
-                                                            else {
-                                                                return div()
-                                                                    .id(list_ix)
-                                                                    .into_any_element();
-                                                            };
+                                        .map(|list_ix| {
+                                            let Some(original_row) =
+                                                state.filtered_rows.get(list_ix).copied()
+                                            else {
+                                                return div().id(list_ix).into_any_element();
+                                            };
+                                            let Some(row_values) = state.rows.get(original_row)
+                                            else {
+                                                return div().id(list_ix).into_any_element();
+                                            };
 
                                                             let is_selected = state
                                                                 .selected_indices
@@ -1599,13 +1639,15 @@ impl Render for DatabaseObjects {
                                                                     },
                                                                 )
                                                                 .child(state.render_row(
-                                                                    row_ix,
-                                                                    row_values,
-                                                                    &list_columns,
-                                                                    show_row_number,
-                                                                    is_selected,
-                                                                    &list_search_query,
-                                                                    db_node_type,
+                                                                    ObjectRowRenderArgs {
+                                                                        row_ix,
+                                                                        row_values,
+                                                                        columns: &list_columns,
+                                                                        show_row_number,
+                                                                        is_selected,
+                                                                        search_query: &list_search_query,
+                                                                        db_node_type,
+                                                                    },
                                                                     cx,
                                                                 ))
                                                                 .into_any_element()
@@ -1834,6 +1876,34 @@ mod tests {
             DatabaseObjectsEvent::AddDatabaseToTree { node }
                 if node.node_type == DbNodeType::Schema && node.name == "public"
         ));
+    }
+
+    #[test]
+    fn resize_column_updates_width_with_minimum_bound() {
+        let mut columns = vec![
+            Column::new("name", "Name").width(px(200.0)),
+            Column::new("type", "Type").width(px(120.0)),
+        ];
+
+        DatabaseObjects::resize_column(&mut columns, 0, px(260.0));
+        assert_eq!(px(260.0), columns[0].width);
+
+        DatabaseObjects::resize_column(&mut columns, 0, px(8.0));
+        assert_eq!(px(20.0), columns[0].width);
+    }
+
+    #[test]
+    fn resize_column_ignores_invalid_and_non_resizable_columns() {
+        let mut columns = vec![
+            Column::new("name", "Name")
+                .width(px(200.0))
+                .resizable(false),
+        ];
+
+        DatabaseObjects::resize_column(&mut columns, 0, px(260.0));
+        DatabaseObjects::resize_column(&mut columns, 99, px(320.0));
+
+        assert_eq!(px(200.0), columns[0].width);
     }
 }
 

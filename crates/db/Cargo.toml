@@ -3,15 +3,21 @@ name = "db"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+builtin-duckdb = ["dep:duckdb"]
+compare = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 rusqlite.workspace = true
-duckdb.workspace = true
+duckdb = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["process", "io-util"] }
-interprocess.workspace = true
 tracing.workspace = true
 hex.workspace = true
 gpui.workspace = true
@@ -37,7 +43,8 @@ moka.workspace = true
 smol.workspace = true
 regex.workspace = true
 thiserror.workspace = true
-ipc.workspace = true
+extension-host.workspace = true
+extension-protocol.workspace = true
 rust-i18n.workspace = true
 [dev-dependencies]
 proptest = { workspace = true }

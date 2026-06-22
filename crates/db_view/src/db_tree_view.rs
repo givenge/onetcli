@@ -32,10 +32,20 @@ use tracing::log::{error, info, trace, warn};
 
 // 3. 当前 crate 导入（按模块分组）
 use crate::database_view_plugin::build_context_menu_for;
-use db::{DbNode, DbNodeType, GlobalDbState};
+use crate::extension_menu::{
+    DbTreeExtensionActionContext, DbTreeExtensionMenuContext, DbTreeExtensionMenuItem,
+    DbTreeExtensionMenuRegistry, GlobalDbTreeExtensionActionHandler,
+};
+use crate::search_shortcut::{
+    DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, focus_search_input,
+};
+use db::{
+    DbNode, DbNodeType, GlobalDbState,
+    ipc::{driver_icon_from_asset_path, driver_icon_from_file_path},
+};
 use gpui_component::label::Label;
 use gpui_component::menu::PopupMenu;
-use one_core::storage::DatabaseType;
+use one_core::storage::{DatabaseType, DbConnectionConfig};
 use one_core::utils::debouncer::Debouncer;
 use one_core::{
     connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifier, get_notifier},
@@ -86,6 +96,73 @@ fn sync_selected_databases_for_connection(
     selected_databases.insert(connection_id, selected);
 }
 
+const EXTERNAL_DRIVER_ICON_METADATA: &str = "external_driver_icon";
+const EXTERNAL_DRIVER_ID_METADATA: &str = "external_driver_id";
+const EXTERNAL_DRIVER_NAME_METADATA: &str = "external_driver_name";
+
+fn connection_node(id: String, name: String, config: &DbConnectionConfig) -> DbNode {
+    let mut node = DbNode::new(
+        id.clone(),
+        name,
+        DbNodeType::Connection,
+        id,
+        config.database_type.clone(),
+    );
+    let metadata = external_driver_metadata(config);
+    apply_connection_node_config(&mut node, config, metadata);
+    node
+}
+
+fn external_driver_metadata(config: &DbConnectionConfig) -> HashMap<String, String> {
+    let registry = db::ipc::IpcDriverRegistry::load_default();
+    external_driver_metadata_from_registry(config, &registry)
+}
+
+fn external_driver_metadata_from_registry(
+    config: &DbConnectionConfig,
+    registry: &db::ipc::IpcDriverRegistry,
+) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+    if let Some(display) = registry.display_for_config(config) {
+        metadata.insert(EXTERNAL_DRIVER_ID_METADATA.to_string(), display.driver_id);
+        metadata.insert(EXTERNAL_DRIVER_NAME_METADATA.to_string(), display.name);
+        let icon_asset_path = display.icon_asset_path;
+        let icon_file_path = display.icon_file_path;
+        if let Some(icon_path) = icon_file_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or(icon_asset_path.clone())
+        {
+            metadata.insert(EXTERNAL_DRIVER_ICON_METADATA.to_string(), icon_path);
+        }
+    }
+    metadata
+}
+
+fn connection_node_icon(node: &DbNode) -> Icon {
+    if let Some(path) = node.metadata.get(EXTERNAL_DRIVER_ICON_METADATA) {
+        let file_path = std::path::Path::new(path);
+        if file_path.is_absolute() {
+            return driver_icon_from_file_path(file_path.to_path_buf(), ComponentSize::Large);
+        }
+        return driver_icon_from_asset_path(path.clone(), ComponentSize::Large);
+    }
+    node.database_type.as_node_icon()
+}
+
+fn apply_connection_node_config(
+    node: &mut DbNode,
+    config: &DbConnectionConfig,
+    metadata: HashMap<String, String>,
+) {
+    node.name = config.name.to_string();
+    node.database_type = config.database_type.clone();
+    node.metadata.remove(EXTERNAL_DRIVER_ID_METADATA);
+    node.metadata.remove(EXTERNAL_DRIVER_NAME_METADATA);
+    node.metadata.remove(EXTERNAL_DRIVER_ICON_METADATA);
+    node.metadata.extend(metadata);
+}
+
 fn apply_db_selection_state(
     selected_node_id: &mut Option<String>,
     selected_ix: &mut Option<usize>,
@@ -110,6 +187,33 @@ fn apply_db_context_menu_target(
     *context_menu_node_id = Some(node_id.to_string());
 }
 
+fn extension_menu_items_for_node(
+    node: &DbNode,
+    registry: &DbTreeExtensionMenuRegistry,
+) -> Vec<DbTreeExtensionMenuItem> {
+    registry.items_for_context(&DbTreeExtensionMenuContext {
+        node_type: node.node_type,
+        node_name: node.name.clone(),
+        connection_id: node.connection_id.clone(),
+        database_type: node.database_type.clone(),
+    })
+}
+
+fn extension_action_context_for_item(
+    node: &DbNode,
+    item: &DbTreeExtensionMenuItem,
+) -> DbTreeExtensionActionContext {
+    DbTreeExtensionActionContext {
+        extension_id: item.extension_id.clone(),
+        command_id: item.command_id.clone(),
+        node_id: node.id.clone(),
+        node_name: node.name.clone(),
+        node_type: node.node_type,
+        database_type: node.database_type.clone(),
+        connection_id: node.connection_id.clone(),
+    }
+}
+
 // ============================================================================
 // FlatDbEntry - 扁平化的树条目（用于 uniform_list 渲染）
 // ============================================================================
@@ -128,7 +232,7 @@ struct FlatDbEntry {
 pub struct DatabaseListItem {
     db_id: String,
     db_name: String,
-    is_selected: bool,
+    db_selected: bool,
     selected: bool,
     view: Entity<DbTreeView>,
     connection_id: String,
@@ -146,7 +250,7 @@ impl DatabaseListItem {
         Self {
             db_id,
             db_name,
-            is_selected,
+            db_selected: is_selected,
             selected,
             view,
             connection_id,
@@ -171,7 +275,7 @@ impl RenderOnce for DatabaseListItem {
         let conn_item = self.connection_id.clone();
         let db_name_item = self.db_name.clone();
         let db_name_display = self.db_name.clone();
-        let is_selected = self.is_selected;
+        let is_selected = self.db_selected;
 
         h_flex()
             .id(SharedString::from(format!("db-item-{}", self.db_id)))
@@ -358,6 +462,12 @@ pub enum DbTreeViewEvent {
     RunSqlFile { node_id: String },
     /// 转储SQL文件（导出结构和/或数据）
     DumpSqlFile { node_id: String, mode: SqlDumpMode },
+    #[cfg(feature = "compare")]
+    /// 数据比较
+    CompareData { node_id: String },
+    #[cfg(feature = "compare")]
+    /// 结构比较
+    CompareSchema { node_id: String },
 }
 
 /// 根据节点类型获取图标（公共函数，可被其他模块复用）
@@ -429,6 +539,32 @@ pub struct DbTreeView {
 }
 
 impl DbTreeView {
+    fn on_action_focus_search(
+        &mut self,
+        _: &FocusSearchInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        focus_search_input(&self.search_input, window, cx);
+    }
+
+    fn on_action_open_selected_table_query(
+        &mut self,
+        _: &OpenSelectedTableQuery,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.selected_node_id.clone() else {
+            return;
+        };
+        let Some(node) = self.db_nodes.get(&node_id) else {
+            return;
+        };
+        if matches!(node.node_type, DbNodeType::Table | DbNodeType::View) {
+            cx.emit(DbTreeViewEvent::CreateNewQuery { node_id });
+        }
+    }
+
     /// 将 ContextMenuItem 渲染到 PopupMenu
     fn render_context_menu_items(
         menu: PopupMenu,
@@ -495,6 +631,35 @@ impl DbTreeView {
         result_menu
     }
 
+    fn render_extension_menu_items(
+        menu: PopupMenu,
+        items: Vec<DbTreeExtensionMenuItem>,
+        is_active: bool,
+        node: &DbNode,
+    ) -> PopupMenu {
+        let mut result_menu = menu;
+        for item in items {
+            let disabled = item.requires_active && !is_active;
+            let context = extension_action_context_for_item(node, &item);
+            let label = item.label.clone();
+            result_menu = result_menu.item(PopupMenuItem::new(label).disabled(disabled).on_click(
+                move |_, window, cx| {
+                    match cx
+                        .try_global::<GlobalDbTreeExtensionActionHandler>()
+                        .cloned()
+                    {
+                        Some(handler) => handler.run(context.clone(), window, cx),
+                        None => warn!(
+                            "db tree extension action handler is not registered for {}",
+                            context.command_id
+                        ),
+                    }
+                },
+            ));
+        }
+        result_menu
+    }
+
     pub fn new(
         connections: &Vec<StoredConnection>,
         window: &mut Window,
@@ -542,13 +707,7 @@ impl DbTreeView {
 
                 sync_selected_databases_for_connection(&mut unselected_databases_map, conn);
 
-                let node = DbNode::new(
-                    id.clone(),
-                    conn_config.name.to_string(),
-                    DbNodeType::Connection,
-                    id.clone(),
-                    conn_config.database_type,
-                );
+                let node = connection_node(id.clone(), conn_config.name.to_string(), &conn_config);
                 db_nodes.insert(id, node.clone());
             }
         }
@@ -761,7 +920,7 @@ impl DbTreeView {
             sync_selected_databases_for_connection(&mut self.selected_databases, connection);
 
             if let Some(node) = self.db_nodes.get_mut(&id) {
-                node.name = config.name.to_string();
+                apply_connection_node_config(node, &config, external_driver_metadata(&config));
                 let mut global_db_state = cx.global_mut::<GlobalDbState>().clone();
                 let conn_id = id.clone();
                 if let Some(exist_config) = global_db_state.get_config(&id) {
@@ -804,13 +963,7 @@ impl DbTreeView {
 
             sync_selected_databases_for_connection(&mut self.selected_databases, connection);
 
-            let node = DbNode::new(
-                id.clone(),
-                config.name.to_string(),
-                DbNodeType::Connection,
-                id.clone(),
-                config.database_type,
-            );
+            let node = connection_node(id.clone(), config.name.to_string(), &config);
             let global_db_state = cx.global_mut::<GlobalDbState>();
             global_db_state.register_connection(config);
             self.db_nodes.insert(id, node);
@@ -1415,7 +1568,7 @@ impl DbTreeView {
         let global_state = global_state.clone();
         let clone_node_id = node_id.clone();
         let connection_id = node.connection_id.clone();
-        let node_type = node.node_type.clone();
+        let node_type = node.node_type;
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             // 使用 DatabasePlugin 的方法加载子节点，添加超时机制
@@ -1791,7 +1944,7 @@ impl DbTreeView {
         match node.map(|n| &n.node_type) {
             Some(DbNodeType::Connection) => {
                 if let Some(n) = node {
-                    n.database_type.as_node_icon()
+                    connection_node_icon(n)
                 } else {
                     IconName::Database.color().with_size(ComponentSize::Large)
                 }
@@ -1851,8 +2004,7 @@ impl DbTreeView {
                 .with_size(ComponentSize::Size(px(20.))),
             Some(DbNodeType::Column) => {
                 let is_primary_key = node
-                    .map(|n| n.metadata.get("is_primary_key"))
-                    .flatten()
+                    .and_then(|n| n.metadata.get("is_primary_key"))
                     .map(|v| v == "true")
                     .unwrap_or(false);
                 if is_primary_key {
@@ -2082,7 +2234,10 @@ impl DbTreeView {
 
         // 获取连接节点信息
         let (database_type, connection_id_str) = match self.db_nodes.get(connection_id) {
-            Some(conn_node) => (conn_node.database_type, conn_node.connection_id.clone()),
+            Some(conn_node) => (
+                conn_node.database_type.clone(),
+                conn_node.connection_id.clone(),
+            ),
             None => {
                 error!("Connection node not found: {}", connection_id);
                 return;
@@ -2155,7 +2310,7 @@ impl DbTreeView {
 
         // 获取数据库节点信息
         let database_type = match self.db_nodes.get(&db_node_id) {
-            Some(db_node) => db_node.database_type,
+            Some(db_node) => db_node.database_type.clone(),
             None => {
                 error!("Database node not found: {}", db_node_id);
                 return;
@@ -2247,6 +2402,10 @@ impl Render for DbTreeView {
         v_flex()
             .id("db-tree-view")
             .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context(DB_SEARCH_CONTEXT)
+            .on_action(cx.listener(Self::on_action_focus_search))
+            .on_action(cx.listener(Self::on_action_open_selected_table_query))
             .bg(cx.theme().sidebar)
             .child({
                 let view_for_collapse = cx.entity();
@@ -2438,7 +2597,7 @@ impl DbTreeView {
         };
 
         // 获取节点类型相关信息
-        let node_type = node.as_ref().map(|n| n.node_type.clone());
+        let node_type = node.as_ref().map(|n| n.node_type);
         let database_type = node.as_ref().map(|n| n.database_type.clone());
         // 判断是否是分组类型（Folder 类型）
         let is_folder_type = matches!(
@@ -2780,10 +2939,20 @@ impl DbTreeView {
         let is_active =
             conn_active && (node.node_type != DbNodeType::Database || node.children_loaded);
 
-        let menu_items = build_context_menu_for(node.database_type, node_id, node.node_type, cx);
+        let menu_items =
+            build_context_menu_for(node.database_type.clone(), node_id, node.node_type, cx);
         if !menu_items.is_empty() {
             // 渲染 plugin 提供的菜单，传入连接激活状态
             menu = Self::render_context_menu_items(menu, menu_items, is_active, view, window, cx);
+        }
+
+        let extension_items = cx
+            .try_global::<DbTreeExtensionMenuRegistry>()
+            .map(|registry| extension_menu_items_for_node(node, registry))
+            .unwrap_or_default();
+        if !extension_items.is_empty() {
+            menu = menu.separator();
+            menu = Self::render_extension_menu_items(menu, extension_items, is_active, node);
         }
 
         // 添加通用的刷新菜单项
@@ -2811,7 +2980,8 @@ impl Focusable for DbTreeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use one_core::storage::ConnectionType;
+    use db::ipc::{IpcDriverManifest, IpcDriverRegistry};
+    use one_core::storage::{ConnectionType, DbConnectionConfig};
 
     fn build_node(node_type: DbNodeType, name: &str, metadata: &[(&str, &str)]) -> DbNode {
         let metadata = metadata
@@ -2849,11 +3019,113 @@ mod tests {
             sync_enabled: true,
             cloud_id: None,
             last_synced_at: None,
+            last_used_at: None,
             created_at: None,
             updated_at: None,
             team_id: None,
             owner_id: None,
         }
+    }
+
+    fn external_config(driver_id: &str) -> DbConnectionConfig {
+        DbConnectionConfig {
+            id: "1".to_string(),
+            database_type: DatabaseType::external(driver_id),
+            name: "saved".to_string(),
+            host: "localhost".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            service_name: None,
+            sid: None,
+            workspace_id: None,
+            extra_params: HashMap::new(),
+        }
+    }
+
+    fn driver_manifest() -> IpcDriverManifest {
+        let mut manifest: IpcDriverManifest = serde_json::from_str(
+            r#"{
+                "id": "demo",
+                "name": "DemoDB",
+                "entry": { "command": "driver" },
+                "transport": { "name": "demo.sock" },
+                "ui": { "icon": "DuckDB" }
+            }"#,
+        )
+        .unwrap();
+        manifest.manifest_dir = std::path::PathBuf::from("/drivers/demo");
+        manifest
+    }
+
+    #[test]
+    fn external_connection_metadata_uses_driver_display() {
+        let registry = IpcDriverRegistry::from_drivers(vec![driver_manifest()]);
+        let metadata = external_driver_metadata_from_registry(&external_config("demo"), &registry);
+
+        assert_eq!(
+            Some(&"demo".to_string()),
+            metadata.get(EXTERNAL_DRIVER_ID_METADATA)
+        );
+        assert_eq!(
+            Some(&"DemoDB".to_string()),
+            metadata.get(EXTERNAL_DRIVER_NAME_METADATA)
+        );
+        assert_eq!(
+            Some(&"icons/duckdb.svg".to_string()),
+            metadata.get(EXTERNAL_DRIVER_ICON_METADATA)
+        );
+    }
+
+    #[test]
+    fn apply_connection_node_config_refreshes_external_driver_metadata() {
+        let mut node = build_node(
+            DbNodeType::Connection,
+            "old",
+            &[(EXTERNAL_DRIVER_ICON_METADATA, "driver://old/icon")],
+        );
+        let config = external_config("demo");
+        let metadata = HashMap::from([
+            (EXTERNAL_DRIVER_ID_METADATA.to_string(), "demo".to_string()),
+            (
+                EXTERNAL_DRIVER_ICON_METADATA.to_string(),
+                "driver://demo/icon".to_string(),
+            ),
+        ]);
+
+        apply_connection_node_config(&mut node, &config, metadata);
+
+        assert_eq!("saved", node.name);
+        assert_eq!(DatabaseType::external("demo"), node.database_type);
+        assert_eq!(
+            Some(&"driver://demo/icon".to_string()),
+            node.metadata.get(EXTERNAL_DRIVER_ICON_METADATA)
+        );
+    }
+
+    #[test]
+    fn apply_connection_node_config_clears_stale_external_driver_metadata() {
+        let mut node = build_node(
+            DbNodeType::Connection,
+            "old",
+            &[
+                (EXTERNAL_DRIVER_ID_METADATA, "demo"),
+                (EXTERNAL_DRIVER_NAME_METADATA, "DemoDB"),
+                (EXTERNAL_DRIVER_ICON_METADATA, "driver://demo/icon"),
+                ("custom", "kept"),
+            ],
+        );
+        let mut config = external_config("demo");
+        config.database_type = DatabaseType::MySQL;
+
+        apply_connection_node_config(&mut node, &config, HashMap::new());
+
+        assert_eq!(DatabaseType::MySQL, node.database_type);
+        assert!(!node.metadata.contains_key(EXTERNAL_DRIVER_ID_METADATA));
+        assert!(!node.metadata.contains_key(EXTERNAL_DRIVER_NAME_METADATA));
+        assert!(!node.metadata.contains_key(EXTERNAL_DRIVER_ICON_METADATA));
+        assert_eq!(Some(&"kept".to_string()), node.metadata.get("custom"));
     }
 
     #[test]
@@ -2960,5 +3232,51 @@ mod tests {
         assert_eq!(selected_node_id.as_deref(), Some("node-2"));
         assert_eq!(selected_ix, Some(4));
         assert_eq!(context_menu_node_id, None);
+    }
+
+    #[test]
+    fn extension_menu_items_for_node_filters_and_builds_action_context() {
+        let node = build_node(
+            DbNodeType::Table,
+            "users",
+            &[("database", "analytics"), ("schema", "public")],
+        );
+        let mut registry = crate::extension_menu::DbTreeExtensionMenuRegistry::default();
+        registry.add(
+            "db.tree.table",
+            crate::extension_menu::DbTreeExtensionMenuItem {
+                extension_id: "com.example.tools".to_string(),
+                command_id: "example.sync_table".to_string(),
+                label: "同步表".to_string(),
+                group: Some("extension@10".to_string()),
+                when_clause: Some("node.type == 'table' && connection.kind == 'mysql'".to_string()),
+                requires_active: true,
+            },
+        );
+        registry.add(
+            "db.tree.table",
+            crate::extension_menu::DbTreeExtensionMenuItem {
+                extension_id: "com.example.tools".to_string(),
+                command_id: "example.hidden".to_string(),
+                label: "Hidden".to_string(),
+                group: Some("extension@20".to_string()),
+                when_clause: Some("connection.kind == 'duckdb'".to_string()),
+                requires_active: true,
+            },
+        );
+
+        let items = extension_menu_items_for_node(&node, &registry);
+
+        assert_eq!(1, items.len());
+        assert_eq!("example.sync_table", items[0].command_id);
+
+        let context = extension_action_context_for_item(&node, &items[0]);
+        assert_eq!("com.example.tools", context.extension_id);
+        assert_eq!("example.sync_table", context.command_id);
+        assert_eq!("node-users", context.node_id);
+        assert_eq!("users", context.node_name);
+        assert_eq!(DbNodeType::Table, context.node_type);
+        assert_eq!(DatabaseType::MySQL, context.database_type);
+        assert_eq!("conn-1", context.connection_id);
     }
 }

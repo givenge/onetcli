@@ -8,24 +8,22 @@ use super::UpdateDialogInfo;
 
 const GITHUB_OWNER: &str = "feigeCode";
 const GITHUB_REPO: &str = "onetcli";
-const GITHUB_API_URL: &str = "https://api.github.com/repos/feigeCode/onetcli/releases/latest";
+pub const GITHUB_API_URL: &str = "https://api.github.com/repos/feigeCode/onetcli/releases/latest";
 const GITHUB_USER_AGENT: &str = "onetcli-updater";
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const EXPECTED_ARCHIVE_NAME: &str = "onetcli-aarch64-apple-darwin.tar.gz";
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const EXPECTED_ARCHIVE_NAME: &str = "onetcli-x86_64-apple-darwin.tar.gz";
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const EXPECTED_ARCHIVE_NAME: &str = "onetcli-x86_64-unknown-linux-gnu.tar.gz";
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-const EXPECTED_ARCHIVE_NAME: &str = "onetcli-x86_64-pc-windows-msvc.zip";
-#[cfg(not(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "windows", target_arch = "x86_64")
-)))]
-const EXPECTED_ARCHIVE_NAME: &str = "";
+const EXPECTED_ARCHIVE_NAME: &str =
+    expected_archive_name_for(std::env::consts::OS, std::env::consts::ARCH);
+
+pub(crate) const fn expected_archive_name_for(os: &str, arch: &str) -> &'static str {
+    match (os.as_bytes(), arch.as_bytes()) {
+        (b"macos", b"aarch64") => "onetcli-aarch64-apple-darwin.tar.gz",
+        (b"macos", b"x86_64") => "onetcli-x86_64-apple-darwin.tar.gz",
+        (b"linux", b"x86_64") => "onetcli-x86_64-unknown-linux-gnu.tar.gz",
+        (b"linux", b"aarch64") => "onetcli-aarch64-unknown-linux-gnu.tar.gz",
+        (b"windows", b"x86_64") => "onetcli-x86_64-pc-windows-msvc.zip",
+        _ => "",
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GithubReleaseAsset {
@@ -91,17 +89,12 @@ pub(crate) fn github_release_to_dialog_info(
     let asset = select_github_asset(release)
         .ok_or_else(|| format!("未找到当前平台的发布资产: {}", EXPECTED_ARCHIVE_NAME))?;
 
-    let release_page_url = format!(
-        "https://github.com/{}/{}/releases/latest",
-        GITHUB_OWNER, GITHUB_REPO
-    );
-
     Ok(UpdateDialogInfo {
         current_version: current_version.to_string(),
         latest_version: release.tag_name.clone(),
         download_url: Some(asset.browser_download_url.clone()),
+        fallback_download_url: None,
         expected_sha256: None,
-        release_page_url: Some(release_page_url),
     })
 }
 
@@ -135,7 +128,7 @@ mod tests {
 
         let requests = client.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, http::Method::GET);
+        assert_eq!(requests[0].method, Method::GET);
         assert_eq!(requests[0].uri, GITHUB_API_URL);
         assert_eq!(requests[0].user_agent.as_deref(), Some(GITHUB_USER_AGENT));
     }
@@ -163,6 +156,14 @@ mod tests {
         assert_eq!(
             info.download_url.as_deref(),
             Some("https://example.com/update")
+        );
+    }
+
+    #[test]
+    fn expected_archive_name_includes_linux_arm64() {
+        assert_eq!(
+            "onetcli-aarch64-unknown-linux-gnu.tar.gz",
+            expected_archive_name_for("linux", "aarch64")
         );
     }
 

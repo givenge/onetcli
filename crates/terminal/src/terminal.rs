@@ -71,6 +71,8 @@ pub enum TerminalModelEvent {
     PromptStart,
     /// shell prompt 已渲染完成，用户可以输入（OSC 133;B）
     InputStart,
+    /// shell 命令开始执行（OSC 133;C）
+    CommandStart,
     /// 终端标题已更改
     TitleChanged(String),
     /// 终端响铃
@@ -99,6 +101,15 @@ pub enum TerminalConnectionKind {
     Local,
     Ssh,
     Serial,
+}
+
+const SSH_CLEAR_SCREEN_REDRAW_BYTES: &[u8] = b"\x0c";
+
+fn clear_screen_remote_redraw_bytes(kind: TerminalConnectionKind) -> Option<&'static [u8]> {
+    match kind {
+        TerminalConnectionKind::Ssh => Some(SSH_CLEAR_SCREEN_REDRAW_BYTES),
+        TerminalConnectionKind::Local | TerminalConnectionKind::Serial => None,
+    }
 }
 
 /// SSH 终端配置
@@ -870,6 +881,9 @@ impl Terminal {
         term.grid_mut().reset::<Color>();
         term.selection = None;
         drop(term);
+        if let Some(bytes) = clear_screen_remote_redraw_bytes(self.connection_kind) {
+            self.write(bytes);
+        }
         cx.emit(TerminalModelEvent::Wakeup);
     }
 
@@ -980,7 +994,7 @@ impl Terminal {
         let rows = config.pty_config.height as usize;
 
         let (term, event_proxy, _colors) = Self::create_term(cols, rows, event_tx.clone());
-        let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+        let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
         let connection_generation = 1;
 
         Self::spawn_disconnect_handler(disconnect_rx, connection_generation, cx);
@@ -1453,6 +1467,9 @@ impl Terminal {
             TerminalEvent::InputStart => {
                 cx.emit(TerminalModelEvent::InputStart);
             }
+            TerminalEvent::CommandStart => {
+                cx.emit(TerminalModelEvent::CommandStart);
+            }
             TerminalEvent::TitleChanged(title) => {
                 self.title = title.clone();
                 cx.emit(TerminalModelEvent::TitleChanged(title));
@@ -1889,9 +1906,9 @@ mod tests {
     use super::{
         ConnectionState, Terminal, TerminalConnectionKind, TerminalMfaPrompt, TerminalMfaRequest,
         TerminalMfaResponder, build_cd_command, build_ssh_base_init_commands,
-        build_ssh_init_commands, compose_ssh_init_commands, format_connection_error,
-        keyboard_interactive_answers_for_terminal, resolve_default_windows_shell_from_env,
-        resolve_local_working_dir, shell_escape_arg,
+        build_ssh_init_commands, clear_screen_remote_redraw_bytes, compose_ssh_init_commands,
+        format_connection_error, keyboard_interactive_answers_for_terminal,
+        resolve_default_windows_shell_from_env, resolve_local_working_dir, shell_escape_arg,
     };
     use crate::TerminalEvent;
     use crate::history::{
@@ -1923,6 +1940,22 @@ mod tests {
     fn build_cd_command_escapes_newline() {
         let cmd = build_cd_command("a\nb");
         assert_eq!(cmd, "cd -- 'a\nb'");
+    }
+
+    #[test]
+    fn clear_screen_requests_remote_prompt_redraw_for_ssh_only() {
+        assert_eq!(
+            Some(b"\x0c".as_slice()),
+            clear_screen_remote_redraw_bytes(TerminalConnectionKind::Ssh)
+        );
+        assert_eq!(
+            None,
+            clear_screen_remote_redraw_bytes(TerminalConnectionKind::Local)
+        );
+        assert_eq!(
+            None,
+            clear_screen_remote_redraw_bytes(TerminalConnectionKind::Serial)
+        );
     }
 
     #[test]

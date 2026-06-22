@@ -17,7 +17,9 @@ mod install;
 mod network;
 mod util;
 
-use custom_api::{fetch_update_info, select_download_url};
+use custom_api::{
+    fetch_update_info, select_download_url, select_fallback_download_url, select_sha256,
+};
 use dialog::show_update_dialog;
 use github_release::{fetch_github_release, github_release_to_dialog_info};
 use install::{apply_update_helper, cleanup_stale_update_backups};
@@ -27,15 +29,27 @@ use util::parse_version;
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APPLY_UPDATE_FLAG: &str = "--apply-update";
 
-/// 当前使用的更新源。修改此常量即可切换更新渠道。
+/// 当前使用的更新源。默认走 R2 JSON；启用 `github-updates` feature 时切回 GitHub Releases。
+#[cfg(test)]
+#[cfg(feature = "github-updates")]
 const ACTIVE_UPDATE_SOURCE: UpdateSource = UpdateSource::GitHub;
+#[cfg(test)]
+#[cfg(not(feature = "github-updates"))]
+const ACTIVE_UPDATE_SOURCE: UpdateSource = UpdateSource::CustomApi;
+#[cfg(feature = "github-updates")]
+const GITHUB_UPDATE_SOURCES: &[UpdateSource] = &[UpdateSource::GitHub];
+#[cfg(not(feature = "github-updates"))]
+const GITHUB_UPDATE_SOURCES: &[UpdateSource] = &[UpdateSource::GitHub];
+#[cfg(not(feature = "github-updates"))]
+const CUSTOM_API_UPDATE_SOURCES: &[UpdateSource] = &[UpdateSource::CustomApi, UpdateSource::GitHub];
 
 /// 更新源类型
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpdateSource {
     /// 通过 GitHub Releases 检查更新
+    #[cfg_attr(not(feature = "github-updates"), allow(dead_code))]
     GitHub,
-    /// 通过自建 API 检查更新（需配置 ONETCLI_UPDATE_URL）
+    /// 通过 R2 或自定义 JSON API 检查更新
     #[allow(dead_code)]
     CustomApi,
 }
@@ -58,9 +72,26 @@ pub(crate) struct UpdateDialogInfo {
     current_version: String,
     latest_version: String,
     download_url: Option<String>,
+    fallback_download_url: Option<String>,
     expected_sha256: Option<String>,
-    /// 发布页面 URL，方便用户手动下载
-    release_page_url: Option<String>,
+}
+
+impl UpdateDialogInfo {
+    fn download_urls(&self) -> Vec<String> {
+        let mut urls = Vec::new();
+        push_unique_url(&mut urls, self.download_url.clone());
+        push_unique_url(&mut urls, self.fallback_download_url.clone());
+        urls
+    }
+}
+
+fn push_unique_url(urls: &mut Vec<String>, url: Option<String>) {
+    let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+        return;
+    };
+    if !urls.contains(&url) {
+        urls.push(url);
+    }
 }
 
 pub fn handle_update_command() -> bool {
@@ -148,8 +179,50 @@ async fn perform_update_check(
     current_version: String,
     trigger: UpdateCheckTrigger,
 ) -> UpdateCheckOutcome {
-    let source = ACTIVE_UPDATE_SOURCE;
+    let mut last_error = None;
+    let mut saw_no_update = false;
 
+    for source in active_update_sources(&config) {
+        match fetch_dialog_info_from_source(*source, &config, http_client.clone(), &current_version)
+            .await
+        {
+            Ok(Some(info)) => return UpdateCheckOutcome::ShowDialog(info),
+            Ok(None) => saw_no_update = true,
+            Err(err) => {
+                tracing::warn!("更新源 {:?} 检查失败: {}", source, err);
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if saw_no_update {
+        return no_update_outcome(trigger);
+    }
+
+    let err = last_error.unwrap_or_else(|| "没有可用的更新源".to_string());
+    failure_outcome(trigger, err)
+}
+
+#[cfg(feature = "github-updates")]
+fn active_update_sources(_config: &UpdateConfig) -> &'static [UpdateSource] {
+    GITHUB_UPDATE_SOURCES
+}
+
+#[cfg(not(feature = "github-updates"))]
+fn active_update_sources(config: &UpdateConfig) -> &'static [UpdateSource] {
+    if config.is_valid() {
+        CUSTOM_API_UPDATE_SOURCES
+    } else {
+        GITHUB_UPDATE_SOURCES
+    }
+}
+
+async fn fetch_dialog_info_from_source(
+    source: UpdateSource,
+    config: &UpdateConfig,
+    http_client: std::sync::Arc<dyn gpui::http_client::HttpClient>,
+    current_version: &str,
+) -> Result<Option<UpdateDialogInfo>, String> {
     // 网络连通性检查：直接探测对应更新源，而非第三方地址
     let connectivity_url = match source {
         UpdateSource::GitHub => network::GITHUB_API_HOST,
@@ -157,29 +230,13 @@ async fn perform_update_check(
     };
     if let Err(err) = check_network_connectivity(http_client.clone(), connectivity_url).await {
         tracing::warn!("{}: {}", t!("Update.network_check_failed"), err);
-        return failure_outcome(trigger, err);
+        return Err(err);
     }
 
     match source {
-        UpdateSource::GitHub => {
-            match fetch_github_dialog_info(http_client, &current_version).await {
-                Ok(Some(info)) => UpdateCheckOutcome::ShowDialog(info),
-                Ok(None) => no_update_outcome(trigger),
-                Err(err) => {
-                    tracing::warn!("GitHub Release 检查失败: {}", err);
-                    failure_outcome(trigger, err)
-                }
-            }
-        }
+        UpdateSource::GitHub => fetch_github_dialog_info(http_client, current_version).await,
         UpdateSource::CustomApi => {
-            match fetch_custom_dialog_info(&config, http_client, &current_version).await {
-                Ok(Some(info)) => UpdateCheckOutcome::ShowDialog(info),
-                Ok(None) => no_update_outcome(trigger),
-                Err(err) => {
-                    tracing::warn!("自定义更新检查失败: {}", err);
-                    failure_outcome(trigger, err)
-                }
-            }
+            fetch_custom_dialog_info(config, http_client, current_version).await
         }
     }
 }
@@ -241,7 +298,7 @@ async fn fetch_custom_dialog_info(
     current_version: &str,
 ) -> Result<Option<UpdateDialogInfo>, String> {
     if !config.is_valid() {
-        return Err("缺少 ONETCLI_UPDATE_URL，无法使用自定义更新接口兜底".to_string());
+        return Err("缺少更新接口地址，无法检查更新".to_string());
     }
 
     let response = fetch_update_info(http_client, &config.update_url).await?;
@@ -258,8 +315,8 @@ async fn fetch_custom_dialog_info(
         current_version: current_version.to_string(),
         latest_version: response.version.clone(),
         download_url: select_download_url(&response, config.download_url.clone()),
-        expected_sha256: response.sha256.clone(),
-        release_page_url: None,
+        fallback_download_url: select_fallback_download_url(&response),
+        expected_sha256: select_sha256(&response),
     }))
 }
 
@@ -324,11 +381,11 @@ pub(crate) mod test_support {
     }
 
     impl HttpClient for FakeHttpClient {
-        fn proxy(&self) -> Option<&Url> {
+        fn user_agent(&self) -> Option<&http::HeaderValue> {
             None
         }
 
-        fn user_agent(&self) -> Option<&http::HeaderValue> {
+        fn proxy(&self) -> Option<&Url> {
             None
         }
 
@@ -364,7 +421,24 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{UpdateCheckTrigger, should_run_update_check};
+    #[cfg(not(feature = "github-updates"))]
+    use std::sync::Arc;
+
+    #[cfg(not(feature = "github-updates"))]
+    use anyhow::anyhow;
+    #[cfg(not(feature = "github-updates"))]
+    use gpui::http_client::HttpClient;
+    #[cfg(not(feature = "github-updates"))]
+    use one_core::config::update_url_from_public_base;
+
+    use super::{
+        ACTIVE_UPDATE_SOURCE, UpdateCheckTrigger, UpdateDialogInfo, UpdateSource,
+        should_run_update_check,
+    };
+    #[cfg(not(feature = "github-updates"))]
+    use super::{UpdateCheckOutcome, perform_update_check};
+    #[cfg(not(feature = "github-updates"))]
+    use crate::update::test_support::FakeHttpClient;
 
     #[test]
     fn manual_check_bypasses_auto_update_switch() {
@@ -378,5 +452,264 @@ mod tests {
             false
         ));
         assert!(should_run_update_check(UpdateCheckTrigger::Automatic, true));
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    #[test]
+    fn default_update_source_uses_r2_custom_api() {
+        assert_eq!(UpdateSource::CustomApi, ACTIVE_UPDATE_SOURCE);
+    }
+
+    #[cfg(feature = "github-updates")]
+    #[test]
+    fn github_updates_feature_uses_github_source() {
+        assert_eq!(UpdateSource::GitHub, ACTIVE_UPDATE_SOURCE);
+    }
+
+    #[test]
+    fn update_dialog_info_download_urls_keep_primary_then_fallback() {
+        let info = UpdateDialogInfo {
+            current_version: "0.1.0".to_string(),
+            latest_version: "9.9.9".to_string(),
+            download_url: Some("https://onetcli.pdyyds.cn/update.tar.gz".to_string()),
+            fallback_download_url: Some("https://github.example.test/update.tar.gz".to_string()),
+            expected_sha256: None,
+        };
+
+        assert_eq!(
+            vec![
+                "https://onetcli.pdyyds.cn/update.tar.gz".to_string(),
+                "https://github.example.test/update.tar.gz".to_string(),
+            ],
+            info.download_urls()
+        );
+    }
+
+    #[test]
+    fn update_dialog_info_download_urls_deduplicate_repeated_fallback() {
+        let info = UpdateDialogInfo {
+            current_version: "0.1.0".to_string(),
+            latest_version: "9.9.9".to_string(),
+            download_url: Some("https://github.example.test/update.tar.gz".to_string()),
+            fallback_download_url: Some("https://github.example.test/update.tar.gz".to_string()),
+            expected_sha256: None,
+        };
+
+        assert_eq!(
+            vec!["https://github.example.test/update.tar.gz".to_string()],
+            info.download_urls()
+        );
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    #[tokio::test]
+    async fn cloudflare_connectivity_failure_falls_back_to_github_release() {
+        let update_url = update_url_from_public_base("https://onetcli.pdyyds.cn");
+        let client = Arc::new(FakeHttpClient::new(vec![
+            Err(anyhow!("r2 unavailable")),
+            FakeHttpClient::response(200, ""),
+            FakeHttpClient::response(200, &github_release_body("v9.9.9")),
+        ]));
+        let http_client: Arc<dyn HttpClient> = client.clone();
+        let config = one_core::config::UpdateConfig {
+            update_url: update_url.clone(),
+            download_url: None,
+        };
+
+        let outcome = perform_update_check(
+            config,
+            http_client,
+            "0.1.0".to_string(),
+            UpdateCheckTrigger::Manual,
+        )
+        .await;
+
+        let UpdateCheckOutcome::ShowDialog(info) = outcome else {
+            panic!("R2 失败后应回退到 GitHub Release");
+        };
+        assert_eq!(info.latest_version, "v9.9.9");
+        assert_eq!(
+            info.download_url.as_deref(),
+            Some("https://github.example.test/update")
+        );
+
+        let requests = client.take_requests();
+        assert_eq!(requests[0].uri, update_url);
+        assert_eq!(requests[1].uri, "https://api.github.com/");
+        assert_eq!(
+            requests[2].uri,
+            "https://api.github.com/repos/feigeCode/onetcli/releases/latest"
+        );
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    #[tokio::test]
+    async fn missing_cloudflare_update_url_uses_github_directly() {
+        let client = Arc::new(FakeHttpClient::new(vec![
+            FakeHttpClient::response(200, ""),
+            FakeHttpClient::response(200, &github_release_body("v9.9.9")),
+        ]));
+        let http_client: Arc<dyn HttpClient> = client.clone();
+        let config = one_core::config::UpdateConfig {
+            update_url: String::new(),
+            download_url: None,
+        };
+
+        let outcome = perform_update_check(
+            config,
+            http_client,
+            "0.1.0".to_string(),
+            UpdateCheckTrigger::Manual,
+        )
+        .await;
+
+        assert!(matches!(outcome, UpdateCheckOutcome::ShowDialog(_)));
+        let requests = client.take_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri, "https://api.github.com/");
+        assert_eq!(
+            requests[1].uri,
+            "https://api.github.com/repos/feigeCode/onetcli/releases/latest"
+        );
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    #[tokio::test]
+    async fn stale_cloudflare_manifest_falls_back_to_github_release() {
+        let update_url = update_url_from_public_base("https://onetcli.pdyyds.cn");
+        let client = Arc::new(FakeHttpClient::new(vec![
+            FakeHttpClient::response(200, ""),
+            FakeHttpClient::response(200, r#"{"version":"0.1.0"}"#),
+            FakeHttpClient::response(200, ""),
+            FakeHttpClient::response(200, &github_release_body("v9.9.9")),
+        ]));
+        let http_client: Arc<dyn HttpClient> = client.clone();
+        let config = one_core::config::UpdateConfig {
+            update_url: update_url.clone(),
+            download_url: None,
+        };
+
+        let outcome = perform_update_check(
+            config,
+            http_client,
+            "0.1.0".to_string(),
+            UpdateCheckTrigger::Manual,
+        )
+        .await;
+
+        let UpdateCheckOutcome::ShowDialog(info) = outcome else {
+            panic!("R2 manifest 未更新时应继续回退到 GitHub Release");
+        };
+        assert_eq!(info.latest_version, "v9.9.9");
+
+        let requests = client.take_requests();
+        assert_eq!(requests[0].uri, update_url);
+        assert_eq!(requests[1].uri, update_url);
+        assert_eq!(requests[2].uri, "https://api.github.com/");
+        assert_eq!(
+            requests[3].uri,
+            "https://api.github.com/repos/feigeCode/onetcli/releases/latest"
+        );
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    #[tokio::test]
+    async fn cloudflare_manifest_can_provide_github_download_fallback() {
+        let update_url = update_url_from_public_base("https://onetcli.pdyyds.cn");
+        let client = Arc::new(FakeHttpClient::new(vec![
+            FakeHttpClient::response(200, ""),
+            FakeHttpClient::response(200, &custom_update_body_with_fallback("9.9.9")),
+        ]));
+        let http_client: Arc<dyn HttpClient> = client.clone();
+        let config = one_core::config::UpdateConfig {
+            update_url,
+            download_url: None,
+        };
+
+        let outcome = perform_update_check(
+            config,
+            http_client,
+            "0.1.0".to_string(),
+            UpdateCheckTrigger::Manual,
+        )
+        .await;
+
+        let UpdateCheckOutcome::ShowDialog(info) = outcome else {
+            panic!("R2 manifest 有新版本时应展示更新对话框");
+        };
+        assert_eq!(
+            info.download_url.as_deref(),
+            Some(
+                format!(
+                    "https://onetcli.pdyyds.cn/releases/v9.9.9/{}",
+                    expected_archive_name()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            info.fallback_download_url.as_deref(),
+            Some(
+                format!(
+                    "https://github.com/feigeCode/onetcli/releases/download/v9.9.9/{}",
+                    expected_archive_name()
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    fn github_release_body(version: &str) -> String {
+        format!(
+            r#"{{
+                "tag_name": "{version}",
+                "assets": [{{
+                    "name": "{}",
+                    "browser_download_url": "https://github.example.test/update"
+                }}]
+            }}"#,
+            expected_archive_name()
+        )
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    fn custom_update_body_with_fallback(version: &str) -> String {
+        format!(
+            r#"{{
+                "version": "{version}",
+                "downloads": {{
+                    "{}": "https://onetcli.pdyyds.cn/releases/v{version}/{}"
+                }},
+                "fallback_downloads": {{
+                    "{}": "https://github.com/feigeCode/onetcli/releases/download/v{version}/{}"
+                }}
+            }}"#,
+            current_target_key(),
+            expected_archive_name(),
+            current_target_key(),
+            expected_archive_name()
+        )
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    fn current_target_key() -> &'static str {
+        super::custom_api::platform_download_keys_for(std::env::consts::OS, std::env::consts::ARCH)
+            .first()
+            .copied()
+            .unwrap_or("unsupported-target")
+    }
+
+    #[cfg(not(feature = "github-updates"))]
+    fn expected_archive_name() -> &'static str {
+        let archive = super::github_release::expected_archive_name_for(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        );
+        if archive.is_empty() {
+            "unsupported-target"
+        } else {
+            archive
+        }
     }
 }

@@ -28,6 +28,7 @@ pub struct ConnectionFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
+    pub ssh_connections: Vec<StoredConnection>,
 }
 
 /// 连接表单窗口
@@ -43,10 +44,42 @@ fn external_driver_id_from_connection(conn: Option<&StoredConnection>) -> Option
     conn.and_then(|conn| conn.to_db_connection().ok())
         .and_then(|config| {
             config
-                .extra_params
-                .get(db::ipc::EXTERNAL_DRIVER_ID_PARAM)
-                .cloned()
+                .database_type
+                .external_driver_id()
+                .map(str::to_string)
         })
+}
+
+fn external_driver_id_for_form(
+    db_type: &DatabaseType,
+    explicit_driver_id: Option<&str>,
+    conn: Option<&StoredConnection>,
+) -> Option<String> {
+    explicit_driver_id
+        .map(str::to_string)
+        .or_else(|| db_type.external_driver_id().map(str::to_string))
+        .or_else(|| external_driver_id_from_connection(conn))
+}
+
+fn external_driver_name_for_title(driver_id: Option<&str>) -> Option<String> {
+    driver_id.and_then(|driver_id| {
+        db::ipc::IpcDriverRegistry::load_default()
+            .find(driver_id)
+            .map(|driver| driver.name)
+    })
+}
+
+fn connection_title_for_locale(
+    locale: &str,
+    is_editing: bool,
+    db_type: &DatabaseType,
+    external_driver_name: Option<&str>,
+) -> String {
+    let db_type_label = external_driver_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| db_type.as_str());
+
+    db::translate_connection_title_for_locale(locale, is_editing, db_type_label)
 }
 
 impl ConnectionFormWindow {
@@ -58,14 +91,17 @@ impl ConnectionFormWindow {
         let is_editing = config.editing_connection.is_some();
         let db_type = config.db_type;
 
-        let external_driver_id = config
-            .external_driver_id
-            .clone()
-            .or_else(|| external_driver_id_from_connection(config.editing_connection.as_ref()));
-        let title: SharedString = db::translate_connection_title_for_locale(
+        let external_driver_id = external_driver_id_for_form(
+            &db_type,
+            config.external_driver_id.as_deref(),
+            config.editing_connection.as_ref(),
+        );
+        let external_driver_name = external_driver_name_for_title(external_driver_id.as_deref());
+        let title: SharedString = connection_title_for_locale(
             locale().as_ref(),
             is_editing,
-            db_type.as_str(),
+            &db_type,
+            external_driver_name.as_deref(),
         )
         .into();
 
@@ -77,6 +113,7 @@ impl ConnectionFormWindow {
         form.update(cx, |f, cx| {
             f.set_workspaces(config.workspaces.clone(), window, cx);
             f.set_teams(config.teams.clone(), window, cx);
+            f.set_ssh_connections(config.ssh_connections.clone(), window, cx);
         });
 
         if let Some(ref conn) = config.editing_connection {
@@ -94,14 +131,14 @@ impl ConnectionFormWindow {
                     if is_edit {
                         emit_connection_event(
                             ConnectionDataEvent::ConnectionUpdated {
-                                connection: conn.clone(),
+                                connection: conn.as_ref().clone(),
                             },
                             cx,
                         );
                     } else {
                         emit_connection_event(
                             ConnectionDataEvent::ConnectionCreated {
-                                connection: conn.clone(),
+                                connection: conn.as_ref().clone(),
                             },
                             cx,
                         );
@@ -234,5 +271,103 @@ impl Render for ConnectionFormWindow {
                             })),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use one_core::storage::{DbConnectionConfig, StoredConnection};
+    use std::collections::HashMap;
+
+    fn stored_external_connection(driver_id: &str) -> StoredConnection {
+        StoredConnection::new_database(
+            "demo".to_string(),
+            DbConnectionConfig {
+                id: String::new(),
+                database_type: DatabaseType::external(driver_id),
+                name: "demo".to_string(),
+                host: "localhost".to_string(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                database: None,
+                service_name: None,
+                sid: None,
+                workspace_id: None,
+                extra_params: HashMap::new(),
+            },
+            None,
+        )
+    }
+
+    fn stored_connection_with_extra_driver_param() -> StoredConnection {
+        let mut extra_params = HashMap::new();
+        extra_params.insert("external_driver_id".to_string(), "iotdb".to_string());
+
+        StoredConnection::new_database(
+            "demo".to_string(),
+            DbConnectionConfig {
+                id: String::new(),
+                database_type: DatabaseType::MySQL,
+                name: "demo".to_string(),
+                host: "localhost".to_string(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                database: None,
+                service_name: None,
+                sid: None,
+                workspace_id: None,
+                extra_params,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn external_driver_id_from_connection_uses_database_type_identity() {
+        let connection = stored_external_connection("iotdb");
+
+        assert_eq!(
+            Some("iotdb".to_string()),
+            external_driver_id_from_connection(Some(&connection))
+        );
+    }
+
+    #[test]
+    fn external_driver_id_for_form_uses_database_type_without_explicit_config() {
+        assert_eq!(
+            Some("iotdb".to_string()),
+            external_driver_id_for_form(&DatabaseType::external("iotdb"), None, None)
+        );
+    }
+
+    #[test]
+    fn external_driver_id_from_connection_ignores_extra_params_driver_id() {
+        let connection = stored_connection_with_extra_driver_param();
+
+        assert_eq!(None, external_driver_id_from_connection(Some(&connection)));
+    }
+
+    #[test]
+    fn connection_title_uses_external_driver_name() {
+        assert_eq!(
+            "新建 Dameng DM 连接",
+            connection_title_for_locale(
+                "zh-CN",
+                false,
+                &DatabaseType::external("dm"),
+                Some("Dameng DM")
+            )
+        );
+    }
+
+    #[test]
+    fn connection_title_falls_back_to_database_type_name() {
+        assert_eq!(
+            "新建 External 连接",
+            connection_title_for_locale("zh-CN", false, &DatabaseType::external("dm"), None)
+        );
     }
 }

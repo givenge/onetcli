@@ -7,8 +7,10 @@ pub const DATABASE_UI_MANIFEST_VERSION: u32 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseUiManifest {
     pub schema_version: u32,
+    #[serde(default)]
     pub capabilities: DatabaseUiCapabilities,
     pub forms: Vec<DatabaseFormManifest>,
+    #[serde(default)]
     pub actions: DatabaseActionManifest,
 }
 

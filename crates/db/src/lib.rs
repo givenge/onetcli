@@ -2,7 +2,9 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod cache;
 pub mod cache_manager;
+pub mod compare;
 pub mod connection;
+pub mod connection_config_resolver;
 pub mod ddl_invalidator;
 pub mod executor;
 pub mod import_export;
@@ -20,6 +22,7 @@ pub mod types;
 
 // Database implementations
 pub mod clickhouse;
+#[cfg(feature = "builtin-duckdb")]
 pub mod duckdb;
 pub mod mssql;
 pub mod mysql;
@@ -32,6 +35,7 @@ pub mod sqlite;
 pub use cache::*;
 pub use cache_manager::*;
 pub use connection::*;
+pub use connection_config_resolver::*;
 pub use ddl_invalidator::*;
 pub use executor::*;
 pub use import_export::*;

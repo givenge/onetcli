@@ -1,5 +1,4 @@
 use crate::home_tab::{HomePage, NewConnectionShortcut, OpenConnectionQuickOpen};
-use crate::setting_tab::{AppSettings, build_app_http_client};
 use gpui::{
     App, AppContext, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Styled,
     Window, actions, div,
@@ -46,14 +45,16 @@ use gpui::px;
 use gpui_component::dock::{ClosePanel, ToggleZoom};
 use gpui_component::{ActiveTheme, Root};
 use one_core::llm::manager::GlobalProviderState;
+use one_core::settings::AppSettings;
 use one_core::storage::manager::get_config_dir;
 use one_core::tab_container::{TabContainer, TabContentRegistry, TabItem};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+use crate::setting_tab;
+use db::GlobalDbState;
+use one_core::storage::{ConnectionRepository, GlobalStorageState};
 
 fn activate_tab_by_number(number: usize, cx: &mut App) {
     let Some(active_window) = cx.active_window() else {
@@ -127,40 +128,7 @@ fn default_shortcut(macos: &'static str, other: &'static str) -> &'static str {
     }
 }
 
-fn init_tracing(settings: &AppSettings) {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    match configured_log_file_path(&settings.log_file_path) {
-        Ok(log_file_path) => match log_file_appender(&log_file_path) {
-            Ok(file_appender) => {
-                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-                Box::leak(Box::new(guard));
-                tracing_subscriber::registry()
-                    .with(tracing_subscriber::fmt::layer())
-                    .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
-                    .with(env_filter)
-                    .init();
-            }
-            Err(err) => {
-                tracing_subscriber::registry()
-                    .with(tracing_subscriber::fmt::layer())
-                    .with(env_filter)
-                    .init();
-                tracing::error!(path = %log_file_path.display(), error = %err, "日志文件初始化失败");
-            }
-        },
-        Err(err) => {
-            tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer())
-                .with(env_filter)
-                .init();
-            tracing::error!(error = %err, "默认日志目录初始化失败");
-        }
-    }
-}
-
-fn configured_log_file_path(value: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn configured_log_file_path(value: &str) -> anyhow::Result<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         Ok(default_log_file_path()?)
@@ -173,7 +141,7 @@ fn default_log_file_path() -> anyhow::Result<PathBuf> {
     Ok(get_config_dir()?.join("logs").join("onetcli.log"))
 }
 
-fn log_file_appender(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn log_file_appender(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -189,14 +157,11 @@ fn log_file_appender(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 pub fn init(cx: &mut App) {
-    let settings = AppSettings::load();
-    init_tracing(&settings);
-    one_core::keybindings::set_overrides(settings.custom_keybindings.clone(), cx);
-    let http_client = build_app_http_client(&settings.global_proxy).expect("HTTP 客户端初始化失败");
-    cx.set_http_client(http_client);
     gpui_component::init(cx);
+    setting_tab::init_settings(cx);
     one_core::init(cx);
     one_ui::init(cx);
+    db_view::search_shortcut::init(cx);
     db_view::sql_editor_view::init(cx);
     db_view::chatdb::agents::init(cx);
     crate::auth::init(cx);
@@ -205,6 +170,9 @@ pub fn init(cx: &mut App) {
         let auth_service = crate::auth::get_auth_service(cx);
         let global_provider_state = cx.global::<GlobalProviderState>().clone();
         global_provider_state.set_cloud_client(auth_service.cloud_client());
+        global_provider_state
+            .set_proxy_settings(&AppSettings::global(cx).global_proxy)
+            .expect("LLM 代理初始化失败");
     }
     db::init_cache(cx);
     // 启动后台磁盘缓存清理任务
@@ -214,6 +182,7 @@ pub fn init(cx: &mut App) {
     terminal_view::init(cx);
     redis_view::init(cx);
     mongodb_view::init(cx);
+    remote_desktop_view::init(cx);
     crate::home_tab::init(cx);
     cx.bind_keys(init_keybindings(cx));
     init_action_handlers(cx);
@@ -221,15 +190,23 @@ pub fn init(cx: &mut App) {
     let registry = TabContentRegistry::new();
     cx.set_global(registry);
 
+    let storage_state = cx.global::<GlobalStorageState>();
+    let conn_repo = storage_state.storage.get::<ConnectionRepository>();
+    let db_state = GlobalDbState::with_connection_repository(conn_repo);
+    db_state.start_cleanup_task(cx);
+    cx.set_global(db_state);
+    db_view::init_ask_ai_notifier(cx);
     cx.activate(true);
 }
 
 pub fn refresh_keybindings(cx: &mut App) {
     cx.bind_keys(refreshable_keybindings(cx));
     crate::home_tab::refresh_keybindings(cx);
+    db_view::search_shortcut::refresh_keybindings(cx);
     db_view::sql_editor_view::refresh_keybindings(cx);
     terminal_view::refresh_keybindings(cx);
     redis_view::refresh_keybindings(cx);
+    remote_desktop_view::refresh_keybindings(cx);
     one_ui::refresh_keybindings(cx);
     remote_file_editor::refresh_keybindings(cx);
 }

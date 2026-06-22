@@ -971,11 +971,9 @@ impl SettingsPanel {
                                     .small()
                                     .on_click(cx.listener(|this, checked: &bool, _window, cx| {
                                         this.vim_scroll_to_arrow_keys = *checked;
-                                        cx.emit(
-                                            SettingsPanelEvent::VimScrollToArrowKeysChanged(
-                                                *checked,
-                                            ),
-                                        );
+                                        cx.emit(SettingsPanelEvent::VimScrollToArrowKeysChanged(
+                                            *checked,
+                                        ));
                                     })),
                             ),
                     ),

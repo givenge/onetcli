@@ -1,9 +1,10 @@
-use crate::highlighter::{HighlightTheme, LanguageRegistry};
+use crate::highlighter::{HighlightTheme, LanguageKind, LanguageRegistry, wasm_store};
 
 use anyhow::{Context, Result, anyhow};
 use gpui::{HighlightStyle, SharedString};
 
 use ropey::{ChunkCursor, Rope};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
@@ -200,16 +201,13 @@ impl<'a> sum_tree::Dimension<'a, HighlightSummary> for Range<usize> {
 impl SyntaxHighlighter {
     /// Create a new SyntaxHighlighter for HTML.
     pub fn new(lang: &str) -> Self {
-        match Self::build_combined_injections_query(&lang) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    "SyntaxHighlighter init failed, fallback to use `text`, {}",
-                    err
-                );
-                Self::build_combined_injections_query("text").unwrap()
-            }
-        }
+        Self::build_combined_injections_query(&lang).unwrap_or_else(|err| {
+            tracing::warn!(
+                "SyntaxHighlighter init failed, fallback to use `text`, {}",
+                err
+            );
+            Self::build_combined_injections_query("text").unwrap()
+        })
     }
 
     /// Build the combined injections query for the given language.
@@ -224,6 +222,7 @@ impl SyntaxHighlighter {
         };
 
         let mut parser = Parser::new();
+        configure_parser_for_language(&mut parser, &config)?;
         parser
             .set_language(&config.language)
             .context("parse set_language")?;
@@ -415,17 +414,17 @@ impl SyntaxHighlighter {
 
         let mut timed_out = false;
         let start = Instant::now();
-        let mut progress = |_: &tree_sitter::ParseState| -> bool {
+        let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
             let Some(budget) = timeout else {
-                return false;
+                return ControlFlow::Continue(());
             };
 
             if start.elapsed() > budget {
                 timed_out = true;
-                return true;
+                return ControlFlow::Break(());
             }
 
-            false
+            ControlFlow::Continue(())
         };
         let options = ParseOptions::new().progress_callback(&mut progress);
 
@@ -521,6 +520,9 @@ impl SyntaxHighlighter {
             };
 
             let mut parser = Parser::new();
+            if configure_parser_for_language(&mut parser, &config).is_err() {
+                continue;
+            }
             if parser.set_language(&config.language).is_err() {
                 continue;
             }
@@ -860,6 +862,23 @@ fn collect_query_nodes_inner<'a>(
     }
 
     out.push(node);
+}
+
+/// 当语言是 wasm 加载时,为 parser 配置一个独立的 `WasmStore`。
+fn configure_parser_for_language(
+    parser: &mut Parser,
+    config: &crate::highlighter::LanguageConfig,
+) -> Result<()> {
+    if let LanguageKind::Wasm { wasm_bytes } = &config.kind {
+        let mut store = wasm_store::new_parser_store().context("create parser wasm store")?;
+        store
+            .load_language(&config.name, wasm_bytes)
+            .map_err(|e| anyhow!("load wasm language {} into parser store: {e}", &config.name))?;
+        parser
+            .set_wasm_store(store)
+            .map_err(|e| anyhow!("attach wasm store to parser: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Merge other style (Other on top)

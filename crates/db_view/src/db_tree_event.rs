@@ -101,6 +101,43 @@ impl DatabaseEventHandler {
             .cloned()
             .unwrap_or_else(|| fallback.to_string())
     }
+
+    fn build_select_all_sql(table_reference: &str) -> String {
+        format!("select * from {};", table_reference)
+    }
+
+    fn format_query_table_reference(node: &DbNode, global_state: &GlobalDbState) -> Option<String> {
+        let table = match node.node_type {
+            DbNodeType::Table => node.get_table_name()?,
+            DbNodeType::View => node.name.clone(),
+            _ => return None,
+        };
+        let plugin = global_state
+            .db_manager
+            .get_plugin(&node.database_type)
+            .ok()?;
+        let database = node.get_database_name();
+        let schema = node.get_schema_name();
+
+        Some(match database.as_deref() {
+            Some(database) => plugin.format_table_reference(database, schema.as_deref(), &table),
+            None => match schema.as_deref() {
+                Some(schema) => format!(
+                    "{}.{}",
+                    plugin.quote_identifier(schema),
+                    plugin.quote_identifier(&table)
+                ),
+                None => plugin.quote_identifier(&table),
+            },
+        })
+    }
+
+    fn query_title_for_node(node: &DbNode, database: Option<&str>) -> String {
+        match node.node_type {
+            DbNodeType::Table | DbNodeType::View => format!("{} - Query", node.name),
+            _ => format!("{} - Query", database.unwrap_or("New Query")),
+        }
+    }
 }
 
 impl DatabaseEventHandler {
@@ -366,6 +403,18 @@ impl DatabaseEventHandler {
                     DbTreeViewEvent::DumpSqlFile { node_id, mode } => {
                         if let Some(node) = get_node(&node_id, cx) {
                             Self::handle_dump_sql_file(node, *mode, global_state, window, cx);
+                        }
+                    }
+                    #[cfg(feature = "compare")]
+                    DbTreeViewEvent::CompareData { node_id } => {
+                        if let Some(node) = get_node(&node_id, cx) {
+                            Self::handle_compare_data(node, window, cx);
+                        }
+                    }
+                    #[cfg(feature = "compare")]
+                    DbTreeViewEvent::CompareSchema { node_id } => {
+                        if let Some(node) = get_node(&node_id, cx) {
+                            Self::handle_compare_schema(node, window, cx);
                         }
                     }
                     DbTreeViewEvent::LocateActiveTab => {
@@ -696,8 +745,10 @@ impl DatabaseEventHandler {
         let connection_id = node.connection_id.clone();
         let database = node.get_database_name();
         let schema = node.get_schema_name();
-        let database_type = node.database_type;
-        let title = format!("{} - Query", database.as_deref().unwrap_or("New Query"));
+        let database_type = node.database_type.clone();
+        let title = Self::query_title_for_node(&node, database.as_deref());
+        let initial_sql = Self::format_query_table_reference(&node, cx.global::<GlobalDbState>())
+            .map(|table_reference| Self::build_select_all_sql(&table_reference));
 
         let tab_id = format!(
             "query-{}-{}",
@@ -712,16 +763,22 @@ impl DatabaseEventHandler {
                 tab_id.clone(),
                 move |window, cx| {
                     let sql_editor = cx.new(|cx| {
-                        SqlEditorTab::new_with_config(
-                            title.clone(),
-                            connection_id.clone(),
-                            database_type,
-                            None,
-                            database.clone(),
-                            schema.clone(),
+                        let editor = SqlEditorTab::new_with_config(
+                            crate::sql_editor_view::SqlEditorTabConfig {
+                                title: title.clone().into(),
+                                connection_id: connection_id.clone(),
+                                database_type,
+                                file_path: None,
+                                initial_database: database.clone(),
+                                initial_schema: schema.clone(),
+                            },
                             window,
                             cx,
-                        )
+                        );
+                        if let Some(sql) = initial_sql.clone() {
+                            editor.set_sql(sql, window, cx);
+                        }
+                        editor
                     });
                     TabItem::new(tab_id_clone.clone(), conn_id_clone.clone(), sql_editor)
                 },
@@ -787,7 +844,7 @@ impl DatabaseEventHandler {
             table
         );
 
-        let database_type = node.database_type;
+        let database_type = node.database_type.clone();
         let tab_metadata = Self::tab_metadata_for_node(&node, TAB_KIND_TABLE_DATA);
         tab_container.update(cx, |container, cx| {
             let tab_id_clone = tab_id.clone();
@@ -803,12 +860,14 @@ impl DatabaseEventHandler {
                 move |window, cx| {
                     let table_data = cx.new(|cx| {
                         TableDataTabContent::new(
-                            database_clone.clone(),
-                            schema_clone.clone(),
-                            table_clone.clone(),
-                            config_id_clone.clone(),
-                            database_type,
-                            true,
+                            crate::table_data_tab::TableDataTabParams {
+                                database_name: database_clone.clone(),
+                                schema_name: schema_clone.clone(),
+                                table_name: table_clone.clone(),
+                                connection_id: config_id_clone.clone(),
+                                database_type,
+                                editable: true,
+                            },
                             window,
                             cx,
                         )
@@ -863,7 +922,7 @@ impl DatabaseEventHandler {
             view
         );
 
-        let database_type = node.database_type;
+        let database_type = node.database_type.clone();
         let tab_metadata = Self::tab_metadata_for_node(&node, TAB_KIND_VIEW_DATA);
         tab_container.update(cx, |container, cx| {
             let tab_id_clone = tab_id.clone();
@@ -877,12 +936,14 @@ impl DatabaseEventHandler {
                 move |window, cx| {
                     let view_data = cx.new(|cx| {
                         TableDataTabContent::new(
-                            database_clone.clone(),
-                            schema_clone.clone(),
-                            view_clone.clone(),
-                            config_id_clone.clone(),
-                            database_type,
-                            false,
+                            crate::table_data_tab::TableDataTabParams {
+                                database_name: database_clone.clone(),
+                                schema_name: schema_clone.clone(),
+                                table_name: view_clone.clone(),
+                                connection_id: config_id_clone.clone(),
+                                database_type,
+                                editable: false,
+                            },
                             window,
                             cx,
                         )
@@ -908,7 +969,7 @@ impl DatabaseEventHandler {
         cx: &mut App,
     ) {
         let connection_id = node.connection_id.clone();
-        let database_type = node.database_type;
+        let database_type = node.database_type.clone();
         let clone_conn_id = connection_id.clone();
         let (database_name, schema_name, table_name) = match node.node_type {
             DbNodeType::Schema => {
@@ -1075,7 +1136,7 @@ impl DatabaseEventHandler {
                     cx,
                     clone_connection_id,
                     clone_database,
-                    schema.into(),
+                    schema,
                     clone_table_name,
                 )
                 .await;
@@ -1336,7 +1397,7 @@ impl DatabaseEventHandler {
         use gpui_component::WindowExt;
 
         let connection_id = node.connection_id.clone();
-        let database_type = node.database_type;
+        let database_type = node.database_type.clone();
 
         let editor_view =
             create_database_editor_view_for_new(database_type, connection_id.clone(), window, cx);
@@ -1465,7 +1526,7 @@ impl DatabaseEventHandler {
         let database_type = node.database_type;
 
         let editor_view = create_database_editor_view_for_edit_type(
-            database_type,
+            database_type.clone(),
             connection_id.clone(),
             database_name.clone(),
             window,
@@ -1597,9 +1658,9 @@ impl DatabaseEventHandler {
                         .gap_2()
                         .child(format!(
                             "{} \"{}\" {}?",
-                            t!("Common.confirm").to_string(),
+                            t!("Common.confirm"),
                             db_name,
-                            t!("Database.close_database").to_string()
+                            t!("Database.close_database")
                         ))
                         .child(t!("Database.close_hint").to_string()),
                 )
@@ -1726,10 +1787,10 @@ impl DatabaseEventHandler {
 
         let connection_id = node.connection_id.clone();
         let database_name = node.name.clone();
-        let database_type = node.database_type;
+        let database_type = node.database_type.clone();
 
         let editor_view = if let Some(view) = create_schema_editor_view_for(
-            database_type,
+            database_type.clone(),
             connection_id.clone(),
             database_name.clone(),
             window,
@@ -1895,89 +1956,98 @@ impl DatabaseEventHandler {
                         )
                         .child(t!("DbTreeEvent.delete_schema_desc").to_string()),
                 )
-                .on_ok(move |_, _, cx| {
-                    let conn_id = conn_id.clone();
-                    let schema = schema.clone();
-                    let meta = meta.clone();
-                    let state = state.clone();
-                    let schema_log = schema.clone();
-                    let schema_for_remove = schema.clone();
-                    let tree = tree.clone();
-                    let panel = panel.clone();
-                    let database = meta
-                        .get("database")
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    let database_for_remove = database.clone();
+                .on_ok({
+                    let database_type = database_type.clone();
+                    move |_, _, cx| {
+                        let conn_id = conn_id.clone();
+                        let schema = schema.clone();
+                        let meta = meta.clone();
+                        let state = state.clone();
+                        let schema_log = schema.clone();
+                        let schema_for_remove = schema.clone();
+                        let tree = tree.clone();
+                        let panel = panel.clone();
+                        let database = meta
+                            .get("database")
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        let database_for_remove = database.clone();
 
-                    let sql = state
-                        .get_plugin(&database_type)
-                        .map(|p| p.build_drop_schema_sql(&schema))
-                        .unwrap_or_else(|_| {
-                            let escaped_schema = schema.replace('"', "\"\"");
-                            format!("DROP SCHEMA \"{}\"", escaped_schema)
-                        });
+                        let sql = state
+                            .get_plugin(&database_type)
+                            .map(|p| p.build_drop_schema_sql(&schema))
+                            .unwrap_or_else(|_| {
+                                let escaped_schema = schema.replace('"', "\"\"");
+                                format!("DROP SCHEMA \"{}\"", escaped_schema)
+                            });
 
-                    cx.spawn(async move |cx: &mut AsyncApp| {
-                        let result = state
-                            .execute_single(cx, conn_id.clone(), sql, Some(database.clone()), None)
-                            .await;
+                        cx.spawn(async move |cx: &mut AsyncApp| {
+                            let result = state
+                                .execute_single(
+                                    cx,
+                                    conn_id.clone(),
+                                    sql,
+                                    Some(database.clone()),
+                                    None,
+                                )
+                                .await;
 
-                        match result {
-                            Ok(sql_result) => match sql_result {
-                                SqlResult::Query(_) => {}
-                                SqlResult::Exec(_) => {
-                                    let state_for_refresh = state.clone();
-                                    let _ = cx.update(|cx| {
-                                        tree.update(cx, |tree, cx| {
-                                            tree.remove_schema_node(
-                                                &conn_id,
-                                                &database_for_remove,
-                                                &schema_for_remove,
+                            match result {
+                                Ok(sql_result) => match sql_result {
+                                    SqlResult::Query(_) => {}
+                                    SqlResult::Exec(_) => {
+                                        let state_for_refresh = state.clone();
+                                        let _ = cx.update(|cx| {
+                                            tree.update(cx, |tree, cx| {
+                                                tree.remove_schema_node(
+                                                    &conn_id,
+                                                    &database_for_remove,
+                                                    &schema_for_remove,
+                                                    cx,
+                                                );
+                                            });
+                                            if let Some(panel) = panel {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.refresh(state_for_refresh, cx);
+                                                });
+                                            }
+                                            Self::show_success_async(
                                                 cx,
+                                                t!(
+                                                    "DbTreeEvent.delete_schema_success",
+                                                    name = schema_log
+                                                )
+                                                .to_string(),
                                             );
                                         });
-                                        if let Some(panel) = panel {
-                                            panel.update(cx, |panel, cx| {
-                                                panel.refresh(state_for_refresh, cx);
-                                            });
-                                        }
-                                        Self::show_success_async(
-                                            cx,
-                                            t!(
-                                                "DbTreeEvent.delete_schema_success",
-                                                name = schema_log
-                                            )
-                                            .to_string(),
-                                        );
-                                    });
-                                }
-                                SqlResult::Error(err) => {
+                                    }
+                                    SqlResult::Error(err) => {
+                                        let _ = cx.update(|cx| {
+                                            Self::show_error_async(
+                                                cx,
+                                                t!(
+                                                    "DbTreeEvent.delete_schema_failed",
+                                                    error = err.message
+                                                )
+                                                .to_string(),
+                                            );
+                                        });
+                                    }
+                                },
+                                Err(e) => {
                                     let _ = cx.update(|cx| {
                                         Self::show_error_async(
                                             cx,
-                                            t!(
-                                                "DbTreeEvent.delete_schema_failed",
-                                                error = err.message
-                                            )
-                                            .to_string(),
+                                            t!("DbTreeEvent.delete_schema_failed", error = e)
+                                                .to_string(),
                                         );
                                     });
                                 }
-                            },
-                            Err(e) => {
-                                let _ = cx.update(|cx| {
-                                    Self::show_error_async(
-                                        cx,
-                                        t!("DbTreeEvent.delete_schema_failed", error = e)
-                                            .to_string(),
-                                    );
-                                });
                             }
-                        }
-                    })
-                    .detach();
-                    true
+                        })
+                        .detach();
+                        true
+                    }
                 })
         });
     }
@@ -2753,7 +2823,7 @@ impl DatabaseEventHandler {
             let tbl_name = table_name.clone();
             let tbl_node_id = table_node_id.clone();
             let state = global_state.clone();
-            let tbl_name_display = table_name.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let tbl_name_display = table_name.as_deref().unwrap_or("");
             let tree = tree_view.clone();
             let panel = objects_panel.clone();
             let db_name = database_name.clone();
@@ -3007,7 +3077,7 @@ impl DatabaseEventHandler {
         let database_name = node.get_database_name().unwrap_or_default();
         let schema_name = node.get_schema_name();
         let source_table_name = node.name.clone();
-        let database_type = node.database_type;
+        let database_type = node.database_type.clone();
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -3055,126 +3125,132 @@ impl DatabaseEventHandler {
                                 .child(div().flex_1().child(Input::new(&input))),
                         ),
                 )
-                .on_ok(move |_, _, cx| {
-                    let target_name = input.read(cx).text().to_string().trim().to_string();
-                    if target_name.is_empty() || target_name == source_name {
-                        return false;
-                    }
+                .on_ok({
+                    let database_type = database_type.clone();
+                    move |_, _, cx| {
+                        let target_name = input.read(cx).text().to_string().trim().to_string();
+                        if target_name.is_empty() || target_name == source_name {
+                            return false;
+                        }
 
-                    let conn_id = conn_id.clone();
-                    let db_name = db_name.clone();
-                    let schema = schema.clone();
-                    let source_name = source_name.clone();
-                    let state = state.clone();
-                    let tree = tree.clone();
-                    let panel = panel.clone();
-                    let window_id = cx.active_window();
+                        let conn_id = conn_id.clone();
+                        let db_name = db_name.clone();
+                        let schema = schema.clone();
+                        let source_name = source_name.clone();
+                        let state = state.clone();
+                        let tree = tree.clone();
+                        let panel = panel.clone();
+                        let window_id = cx.active_window();
 
-                    cx.spawn(async move |cx: &mut AsyncApp| {
-                        let plugin = match state.get_plugin(&database_type) {
-                            Ok(plugin) => plugin,
-                            Err(err) => {
-                                let _ = cx.update(|cx| {
-                                    Self::show_error_async(
-                                        cx,
-                                        t!("DbTreeEvent.copy_table_failed", error = err)
-                                            .to_string(),
-                                    );
-                                });
-                                return;
-                            }
-                        };
-
-                        let sql = plugin.build_backup_table_sql(
-                            &db_name,
-                            schema.as_deref(),
-                            &source_name,
-                            &target_name,
-                        );
-
-                        let result = state
-                            .execute_script(
-                                cx,
-                                conn_id.clone(),
-                                sql,
-                                Some(db_name.clone()),
-                                schema.clone(),
-                                None,
-                            )
-                            .await;
-
-                        let Some(window_id) = window_id else { return };
-                        let state_for_refresh = state.clone();
-                        let refresh_node_id = if let Some(schema_name) = schema.clone() {
-                            format!("{}:{}:{}", conn_id, db_name, schema_name)
-                        } else {
-                            format!("{}:{}", conn_id, db_name)
-                        };
-                        let source_name_for_message = source_name.clone();
-                        let target_name_for_message = target_name.clone();
-
-                        let _ = cx.update_window(window_id, |_entity, window, cx| match &result {
-                            Ok(results) => {
-                                let has_error = results.iter().any(|result| result.is_error());
-                                if has_error {
-                                    let error_message = results
-                                        .iter()
-                                        .filter_map(|result| {
-                                            if let SqlResult::Error(err) = result {
-                                                Some(err.message.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("; ");
-                                    window.push_notification(
-                                        Notification::error(
-                                            t!(
-                                                "DbTreeEvent.copy_table_failed",
-                                                error = error_message
-                                            )
-                                            .to_string(),
-                                        )
-                                        .autohide(true),
-                                        cx,
-                                    );
-                                } else {
-                                    window.close_dialog(cx);
-                                    tree.update(cx, |tree, cx| {
-                                        tree.refresh_tree(refresh_node_id.clone(), cx);
+                        let database_type = database_type.clone();
+                        cx.spawn(async move |cx: &mut AsyncApp| {
+                            let plugin = match state.get_plugin(&database_type) {
+                                Ok(plugin) => plugin,
+                                Err(err) => {
+                                    let _ = cx.update(|cx| {
+                                        Self::show_error_async(
+                                            cx,
+                                            t!("DbTreeEvent.copy_table_failed", error = err)
+                                                .to_string(),
+                                        );
                                     });
-                                    panel.update(cx, |panel, cx| {
-                                        panel.refresh(state_for_refresh.clone(), cx);
-                                    });
-                                    window.push_notification(
-                                        Notification::success(
-                                            t!(
-                                                "DbTreeEvent.copy_table_success",
-                                                source = source_name_for_message,
-                                                target = target_name_for_message
-                                            )
-                                            .to_string(),
-                                        )
-                                        .autohide(true),
-                                        cx,
-                                    );
+                                    return;
                                 }
-                            }
-                            Err(err) => {
-                                window.push_notification(
-                                    Notification::error(
-                                        t!("DbTreeEvent.copy_table_failed", error = err)
-                                            .to_string(),
-                                    )
-                                    .autohide(true),
+                            };
+
+                            let sql = plugin.build_backup_table_sql(
+                                &db_name,
+                                schema.as_deref(),
+                                &source_name,
+                                &target_name,
+                            );
+
+                            let result = state
+                                .execute_script(
                                     cx,
-                                );
-                            }
-                        });
-                    })
-                    .detach();
-                    false
+                                    conn_id.clone(),
+                                    sql,
+                                    Some(db_name.clone()),
+                                    schema.clone(),
+                                    None,
+                                )
+                                .await;
+
+                            let Some(window_id) = window_id else { return };
+                            let state_for_refresh = state.clone();
+                            let refresh_node_id = if let Some(schema_name) = schema.clone() {
+                                format!("{}:{}:{}", conn_id, db_name, schema_name)
+                            } else {
+                                format!("{}:{}", conn_id, db_name)
+                            };
+                            let source_name_for_message = source_name.clone();
+                            let target_name_for_message = target_name.clone();
+
+                            let _ =
+                                cx.update_window(window_id, |_entity, window, cx| match &result {
+                                    Ok(results) => {
+                                        let has_error =
+                                            results.iter().any(|result| result.is_error());
+                                        if has_error {
+                                            let error_message = results
+                                                .iter()
+                                                .filter_map(|result| {
+                                                    if let SqlResult::Error(err) = result {
+                                                        Some(err.message.clone())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("; ");
+                                            window.push_notification(
+                                                Notification::error(
+                                                    t!(
+                                                        "DbTreeEvent.copy_table_failed",
+                                                        error = error_message
+                                                    )
+                                                    .to_string(),
+                                                )
+                                                .autohide(true),
+                                                cx,
+                                            );
+                                        } else {
+                                            window.close_dialog(cx);
+                                            tree.update(cx, |tree, cx| {
+                                                tree.refresh_tree(refresh_node_id.clone(), cx);
+                                            });
+                                            panel.update(cx, |panel, cx| {
+                                                panel.refresh(state_for_refresh.clone(), cx);
+                                            });
+                                            window.push_notification(
+                                                Notification::success(
+                                                    t!(
+                                                        "DbTreeEvent.copy_table_success",
+                                                        source = source_name_for_message,
+                                                        target = target_name_for_message
+                                                    )
+                                                    .to_string(),
+                                                )
+                                                .autohide(true),
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        window.push_notification(
+                                            Notification::error(
+                                                t!("DbTreeEvent.copy_table_failed", error = err)
+                                                    .to_string(),
+                                            )
+                                            .autohide(true),
+                                            cx,
+                                        );
+                                    }
+                                });
+                        })
+                        .detach();
+                        false
+                    }
                 })
         });
     }
@@ -3378,7 +3454,7 @@ impl DatabaseEventHandler {
         if let Some(path) = file_path {
             let connection_id = node.connection_id.clone();
             let query_name = node.name.clone();
-            let database_type = node.database_type;
+            let database_type = node.database_type.clone();
             let database = node.get_database_name();
             let schema = node.get_schema_name();
             let tab_id = format!("query-{}", query_name);
@@ -3391,13 +3467,15 @@ impl DatabaseEventHandler {
                     tab_id.clone(),
                     move |window, cx| {
                         let sql_editor = cx.new(|cx| {
-                            SqlEditorTab::new_with_file_path(
-                                path.clone(),
-                                query_name.clone(),
-                                connection_id.clone(),
-                                database_type,
-                                database.clone(),
-                                schema.clone(),
+                            SqlEditorTab::new_with_config(
+                                crate::sql_editor_view::SqlEditorTabConfig {
+                                    title: query_name.clone().into(),
+                                    connection_id: connection_id.clone(),
+                                    database_type,
+                                    file_path: Some(path.clone()),
+                                    initial_database: database.clone(),
+                                    initial_schema: schema.clone(),
+                                },
                                 window,
                                 cx,
                             )
@@ -3715,13 +3793,15 @@ impl DatabaseEventHandler {
                                 .size(800.0, 510.0),
                             move |window, cx| {
                                 SqlDumpView::new(
-                                    config_id,
-                                    server_info,
-                                    database,
-                                    schema,
-                                    table,
-                                    output_path,
-                                    mode,
+                                    crate::import_export::sql_dump_view::SqlDumpViewParams {
+                                        connection_id: config_id,
+                                        server_info,
+                                        database,
+                                        schema,
+                                        table,
+                                        output_path,
+                                        mode,
+                                    },
                                     window,
                                     cx,
                                 )
@@ -3764,5 +3844,101 @@ impl DatabaseEventHandler {
         tree_view.update(cx, |tree, cx| {
             tree.locate_and_select_node(&node_id, cx);
         });
+    }
+
+    #[cfg(feature = "compare")]
+    /// 处理数据比较事件
+    fn handle_compare_data(node: DbNode, window: &mut Window, cx: &mut App) {
+        use crate::compare::DataCompareWindow;
+
+        let title = DataCompareWindow::popup_title_for(&node);
+        let compare_view = DataCompareWindow::new(node, window, cx);
+        open_popup_window(
+            PopupWindowOptions::new(title).size(1100.0, 780.0),
+            move |_window, _cx| compare_view.clone(),
+            cx,
+        );
+    }
+
+    #[cfg(feature = "compare")]
+    /// 处理结构比较事件
+    fn handle_compare_schema(node: DbNode, window: &mut Window, cx: &mut App) {
+        use crate::compare::SchemaCompareWindow;
+
+        let title = SchemaCompareWindow::popup_title_for(&node);
+        let compare_view = SchemaCompareWindow::new(node, window, cx);
+        open_popup_window(
+            PopupWindowOptions::new(title).size(1100.0, 780.0),
+            move |_window, _cx| compare_view.clone(),
+            cx,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseEventHandler;
+    use db::{DbNode, DbNodeType, GlobalDbState};
+    use one_core::storage::DatabaseType;
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_select_all_sql_uses_table_reference() {
+        assert_eq!(
+            "select * from `app`.`users`;",
+            DatabaseEventHandler::build_select_all_sql("`app`.`users`")
+        );
+    }
+
+    #[test]
+    fn query_title_for_table_uses_table_name() {
+        let node = DbNode::new(
+            "table-1",
+            "users",
+            DbNodeType::Table,
+            "conn-1".to_string(),
+            DatabaseType::MySQL,
+        );
+
+        assert_eq!(
+            "users - Query",
+            DatabaseEventHandler::query_title_for_node(&node, Some("app"))
+        );
+    }
+
+    #[test]
+    fn query_table_reference_can_use_database_prefix() {
+        let mut metadata = HashMap::new();
+        metadata.insert("database".to_string(), "app_db".to_string());
+        metadata.insert("schema".to_string(), "public".to_string());
+        let node = DbNode::new(
+            "table-1",
+            "users",
+            DbNodeType::Table,
+            "conn-1".to_string(),
+            DatabaseType::MySQL,
+        )
+        .with_metadata(metadata);
+
+        assert_eq!(
+            Some("`app_db`.`users`".to_string()),
+            DatabaseEventHandler::format_query_table_reference(&node, &GlobalDbState::default())
+        );
+    }
+
+    #[test]
+    fn query_title_for_database_uses_database_name() {
+        let node = DbNode::new(
+            "database-1",
+            "app",
+            DbNodeType::Database,
+            "conn-1".to_string(),
+            DatabaseType::MySQL,
+        );
+
+        assert_eq!(
+            "app - Query",
+            DatabaseEventHandler::query_title_for_node(&node, Some("app"))
+        );
     }
 }

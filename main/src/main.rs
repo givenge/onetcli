@@ -5,6 +5,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 mod auth;
 
 mod app_init;
+mod external_driver_display;
 mod home;
 mod home_tab;
 mod license;
@@ -16,11 +17,74 @@ mod update;
 mod user_avatar;
 
 use crate::onetcli_app::OnetCliApp;
-use db::GlobalDbState;
 use gpui::*;
 
 use gpui_component::Root;
 use gpui_component_assets::Assets;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+struct AppAssets {
+    builtin: Assets,
+    driver: db::ipc::DriverAssetSource,
+}
+
+impl AppAssets {
+    fn new() -> Self {
+        Self {
+            builtin: Assets,
+            driver: db::ipc::DriverAssetSource::new(
+                Arc::new(db::ipc::DriverResourceLoader::new()),
+                Arc::new(db::ipc::IpcDriverRegistry::load_default()),
+            ),
+        }
+    }
+}
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match self.driver.load(path) {
+            Ok(Some(asset)) => {
+                if path.starts_with("driver://") {
+                    info!(
+                        target: "driver_icon",
+                        asset_path = path,
+                        bytes = asset.len(),
+                        "app asset source served driver asset"
+                    );
+                }
+                Ok(Some(asset))
+            }
+            Ok(None) => {
+                if path.starts_with("driver://") {
+                    info!(
+                        target: "driver_icon",
+                        asset_path = path,
+                        "driver asset source returned none; trying builtin assets"
+                    );
+                }
+                self.builtin.load(path)
+            }
+            Err(error) => {
+                warn!(
+                    target: "driver_icon",
+                    asset_path = path,
+                    error = %error,
+                    "driver asset source failed; trying builtin assets"
+                );
+                self.builtin.load(path)
+            }
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut assets = self.driver.list(path).unwrap_or_default();
+        assets.extend(self.builtin.list(path).unwrap_or_default());
+        assets.sort();
+        assets.dedup();
+        Ok(assets)
+    }
+}
 
 fn main() {
     if update::handle_update_command() {
@@ -28,18 +92,12 @@ fn main() {
     }
 
     let app = Application::new()
-        .with_assets(Assets)
+        .with_assets(AppAssets::new())
         .with_quit_mode(QuitMode::LastWindowClosed);
 
     app.run(move |cx| {
         onetcli_app::init(cx);
-
-        setting_tab::init_settings(cx);
-        let db_state = GlobalDbState::new();
-        db_state.start_cleanup_task(cx);
-        cx.set_global(db_state);
-
-        db_view::init_ask_ai_notifier(cx);
+        extension_runtime::init(cx);
 
         let mut window_size = size(px(1600.0), px(1200.0));
         if let Some(display) = cx.primary_display() {

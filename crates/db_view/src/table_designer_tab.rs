@@ -1,10 +1,11 @@
+use crate::search_shortcut::{DB_SEARCH_CONTEXT, FocusSearchInput, focus_search_input};
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, UniformListScrollHandle,
-    Window, div, px, uniform_list,
+    AnyElement, App, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, ParentElement,
+    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, IndexPath, Sizable, Size, WindowExt,
@@ -30,8 +31,10 @@ use crate::database_view_plugin::{
     get_table_designer_capabilities_for,
 };
 use db::GlobalDbState;
-#[cfg(test)]
+#[cfg(all(test, feature = "builtin-duckdb"))]
 use db::duckdb::DuckDbPlugin;
+#[cfg(all(test, not(feature = "builtin-duckdb")))]
+use db::ipc::ExternalDatabasePlugin;
 use db::plugin::DatabasePlugin;
 use db::types::{
     CharsetInfo, CollationInfo, ColumnDefinition, ColumnInfo, IndexDefinition, IndexInfo,
@@ -41,6 +44,44 @@ use gpui_component::select::SearchableVec;
 use one_core::storage::DatabaseType;
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent};
 use rust_i18n::t;
+
+const COLUMN_EDITOR_RESIZE_HANDLE_WIDTH: Pixels = px(6.0);
+const COLUMN_EDITOR_COLUMN_COUNT: usize = 7;
+const COLUMN_NAME_COL: usize = 0;
+const COLUMN_TYPE_COL: usize = 1;
+const COLUMN_LENGTH_COL: usize = 2;
+const COLUMN_SCALE_COL: usize = 3;
+const COLUMN_NULLABLE_COL: usize = 4;
+const COLUMN_PRIMARY_KEY_COL: usize = 5;
+const COLUMN_AUTO_INCREMENT_COL: usize = 6;
+const COLUMN_DRAG_HANDLE_WIDTH: Pixels = px(24.0);
+const COLUMN_EDITOR_DEFAULT_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
+    px(160.0),
+    px(140.0),
+    px(60.0),
+    px(60.0),
+    px(50.0),
+    px(50.0),
+    px(50.0),
+];
+const COLUMN_EDITOR_MIN_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
+    px(96.0),
+    px(96.0),
+    px(48.0),
+    px(48.0),
+    px(42.0),
+    px(42.0),
+    px(42.0),
+];
+const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
+    px(360.0),
+    px(320.0),
+    px(160.0),
+    px(160.0),
+    px(120.0),
+    px(120.0),
+    px(140.0),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DesignerTab {
@@ -119,13 +160,13 @@ pub(crate) fn build_table_design_from_metadata(
             let parsed = plugin
                 .map(|plugin| plugin.parse_column_type(&col.data_type))
                 .unwrap_or_else(|| fallback_parse_column_type(&col.data_type));
-            column_info_to_definition(database_type, col, parsed)
+            column_info_to_definition(database_type.clone(), col, parsed)
         })
         .collect();
 
     let index_defs: Vec<IndexDefinition> = indexes
         .iter()
-        .filter(|idx| idx.name.to_uppercase() != "PRIMARY")
+        .filter(|idx| !idx.is_primary && idx.name.to_uppercase() != "PRIMARY")
         .map(|idx| IndexDefinition {
             name: idx.name.clone(),
             columns: idx.columns.clone(),
@@ -319,11 +360,11 @@ impl TableDesigner {
             Vec<EngineSelectItem>,
             ColumnEditorCapabilities,
         ) = {
-            let engines = get_engines_for(config.database_type, cx)
+            let engines = get_engines_for(config.database_type.clone(), cx)
                 .into_iter()
                 .map(|name| EngineSelectItem { name })
                 .collect();
-            let capabilities = get_column_editor_capabilities_for(config.database_type, cx);
+            let capabilities = get_column_editor_capabilities_for(config.database_type.clone(), cx);
             (engines, capabilities)
         };
 
@@ -369,7 +410,7 @@ impl TableDesigner {
 
         let columns_editor = cx.new(|cx| {
             ColumnsEditor::new(
-                config.database_type,
+                config.database_type.clone(),
                 charsets.clone(),
                 column_editor_capabilities,
                 window,
@@ -876,6 +917,81 @@ impl TableDesigner {
         });
     }
 
+    fn build_and_maybe_execute(
+        &mut self,
+        design: TableDesign,
+        column_renames: Vec<(String, String)>,
+        success_behavior: ExecuteSuccessBehavior,
+        cx: &mut Context<Self>,
+    ) {
+        let global_state = cx.global::<GlobalDbState>().clone();
+        let connection_id = self.config.connection_id.clone();
+        let database_name = self.config.database_name.clone();
+        let schema_name = self.config.schema_name.clone();
+        let original = self.original_design.clone();
+        let is_new_table = original.is_none();
+        let table_name = design.table_name.clone();
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let sql_result = global_state
+                .build_table_design_sql(
+                    cx,
+                    connection_id.clone(),
+                    database_name.clone(),
+                    schema_name.clone(),
+                    original,
+                    design,
+                    column_renames,
+                )
+                .await;
+
+            let _ = cx.update(|cx: &mut App| {
+                let Some(window_id) = cx.active_window() else {
+                    return;
+                };
+                let _ = cx.update_window(window_id, |_, window, cx| {
+                    let _ = this.update(cx, |designer, cx| match sql_result {
+                        Ok(sql) if !Self::sql_has_changes(&sql) => match &success_behavior {
+                            ExecuteSuccessBehavior::StayOpen { .. } => {
+                                window.push_notification(t!("Table.no_changes").to_string(), cx);
+                            }
+                            ExecuteSuccessBehavior::CloseTab {
+                                tab_container,
+                                tab_id,
+                                ..
+                            } => {
+                                tab_container.update(cx, |container: &mut TabContainer, cx| {
+                                    container.force_close_tab_by_id(tab_id, cx);
+                                });
+                            }
+                        },
+                        Ok(sql) => {
+                            let request = TableDesignerExecutionRequest {
+                                connection_id,
+                                database_name,
+                                schema_name,
+                                sql,
+                                table_name,
+                                is_new_table,
+                                success_behavior,
+                            };
+                            designer.maybe_confirm_and_execute(request, window, cx);
+                        }
+                        Err(error) => {
+                            let msg = if is_new_table {
+                                t!("Table.create_failed").to_string()
+                            } else {
+                                t!("Table.modify_failed").to_string()
+                            };
+                            window.push_notification(format!("{}: {}", msg, error), cx);
+                        }
+                    });
+                });
+            });
+        })
+        .detach();
+    }
+
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         let sql = self.sql_preview_input.read(cx).text().to_string();
         Self::sql_has_changes(&sql)
@@ -903,30 +1019,12 @@ impl TableDesigner {
         }
 
         let column_renames = self.collect_column_renames(cx);
-        let sql = self.build_diff_preview_sql(&design, &column_renames, cx);
-
-        if !Self::sql_has_changes(&sql) {
-            tab_container.update(cx, |container: &mut TabContainer, cx| {
-                container.force_close_tab_by_id(&tab_id, cx);
-            });
-            return;
-        }
-
-        let request = TableDesignerExecutionRequest {
-            connection_id: self.config.connection_id.clone(),
-            database_name: self.config.database_name.clone(),
-            schema_name: self.config.schema_name.clone(),
-            sql,
-            table_name: design.table_name.clone(),
-            is_new_table: self.original_design.is_none(),
-            success_behavior: ExecuteSuccessBehavior::CloseTab {
-                tab_container,
-                tab_id,
-                emitted_tab_id: self.config.tab_id.clone(),
-            },
+        let success_behavior = ExecuteSuccessBehavior::CloseTab {
+            tab_container,
+            tab_id,
+            emitted_tab_id: self.config.tab_id.clone(),
         };
-
-        self.maybe_confirm_and_execute(request, window, cx);
+        self.build_and_maybe_execute(design, column_renames, success_behavior, cx);
     }
 
     pub fn load_table_structure(&mut self, reason: &'static str, cx: &mut Context<Self>) {
@@ -1033,7 +1131,7 @@ impl TableDesigner {
             .get_plugin(&self.config.database_type)
             .ok();
         build_table_design_from_metadata(
-            self.config.database_type,
+            self.config.database_type.clone(),
             self.config.database_name.clone(),
             self.config.table_name.clone().unwrap_or_default(),
             &columns,
@@ -1059,26 +1157,10 @@ impl TableDesigner {
         }
 
         let column_renames = self.collect_column_renames(cx);
-        let sql = self.build_diff_preview_sql(&design, &column_renames, cx);
-
-        if !Self::sql_has_changes(&sql) {
-            window.push_notification(t!("Table.no_changes").to_string(), cx);
-            return;
-        }
-
-        let request = TableDesignerExecutionRequest {
-            connection_id: self.config.connection_id.clone(),
-            database_name: self.config.database_name.clone(),
-            schema_name: self.config.schema_name.clone(),
-            sql,
-            table_name: design.table_name.clone(),
-            is_new_table: self.original_design.is_none(),
-            success_behavior: ExecuteSuccessBehavior::StayOpen {
-                tab_id: self.config.tab_id.clone(),
-            },
+        let success_behavior = ExecuteSuccessBehavior::StayOpen {
+            tab_id: self.config.tab_id.clone(),
         };
-
-        self.maybe_confirm_and_execute(request, window, cx);
+        self.build_and_maybe_execute(design, column_renames, success_behavior, cx);
     }
 
     fn render_toolbar(&self, cx: &Context<Self>) -> AnyElement {
@@ -1175,7 +1257,8 @@ impl TableDesigner {
     }
 
     fn render_options(&self, cx: &Context<Self>) -> AnyElement {
-        let capabilities = get_table_designer_capabilities_for(self.config.database_type, cx);
+        let capabilities =
+            get_table_designer_capabilities_for(self.config.database_type.clone(), cx);
 
         v_flex()
             .size_full()
@@ -1434,10 +1517,23 @@ impl Render for DragColumn {
     }
 }
 
+#[derive(Clone)]
+struct ResizeColumnEditorColumn {
+    entity_id: EntityId,
+    col_ix: usize,
+}
+
+impl Render for ResizeColumnEditorColumn {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.0))
+    }
+}
+
 pub struct ColumnsEditor {
     focus_handle: FocusHandle,
     columns: Vec<ColumnEditorRow>,
     selected_index: Option<usize>,
+    column_widths: [Pixels; COLUMN_EDITOR_COLUMN_COUNT],
     data_types: Vec<String>,
     charsets: Vec<CharsetInfo>,
     database_type: DatabaseType,
@@ -1468,6 +1564,15 @@ struct ColumnEditorRow {
 }
 
 impl ColumnsEditor {
+    fn on_action_focus_search(
+        &mut self,
+        _: &FocusSearchInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        focus_search_input(&self.search_input, window, cx);
+    }
+
     pub fn new(
         database_type: DatabaseType,
         charsets: Vec<CharsetInfo>,
@@ -1495,6 +1600,7 @@ impl ColumnsEditor {
             focus_handle,
             columns: vec![],
             selected_index: None,
+            column_widths: COLUMN_EDITOR_DEFAULT_WIDTHS,
             data_types,
             charsets,
             database_type,
@@ -1506,6 +1612,26 @@ impl ColumnsEditor {
             _search_subscription: search_sub,
             _subscriptions: vec![],
         }
+    }
+
+    fn resize_column_width(
+        widths: &mut [Pixels; COLUMN_EDITOR_COLUMN_COUNT],
+        col_ix: usize,
+        width: Pixels,
+    ) {
+        let Some(column_width) = widths.get_mut(col_ix) else {
+            return;
+        };
+        *column_width = width
+            .max(COLUMN_EDITOR_MIN_WIDTHS[col_ix])
+            .min(COLUMN_EDITOR_MAX_WIDTHS[col_ix]);
+    }
+
+    fn column_width(&self, col_ix: usize) -> Pixels {
+        self.column_widths
+            .get(col_ix)
+            .copied()
+            .unwrap_or(COLUMN_EDITOR_DEFAULT_WIDTHS[COLUMN_NAME_COL])
     }
 
     fn update_collation_for_charset(
@@ -1597,6 +1723,18 @@ impl ColumnsEditor {
                 "DATETIME".to_string(),
             ]
         }
+    }
+
+    fn ensure_loaded_type_option(data_types: &mut Vec<String>, base_type: &str) -> usize {
+        if let Some(idx) = data_types
+            .iter()
+            .position(|t| t.eq_ignore_ascii_case(base_type))
+        {
+            return idx;
+        }
+
+        data_types.push(base_type.to_string());
+        data_types.len() - 1
     }
 
     fn add_column(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1708,7 +1846,7 @@ impl ColumnsEditor {
             window,
             move |this, _, _event: &SelectEvent<Vec<CharsetSelectItem>>, window, cx| {
                 Self::update_collation_for_charset(
-                    this.database_type,
+                    this.database_type.clone(),
                     &charset_select_clone,
                     &collation_select_clone,
                     window,
@@ -1985,17 +2123,13 @@ impl ColumnsEditor {
                 input
             });
 
-            let select_type_items = SearchableVec::new(self.data_types.clone());
             let parsed_type = plugin
                 .as_ref()
                 .map(|p| p.parse_column_type(&col.data_type))
                 .unwrap_or_else(|| fallback_parse_column_type(&col.data_type));
             let base_type = parsed_type.base_type.clone();
-            let type_idx = self
-                .data_types
-                .iter()
-                .position(|t| t.to_uppercase() == base_type.to_uppercase())
-                .unwrap_or(0);
+            let type_idx = Self::ensure_loaded_type_option(&mut self.data_types, &base_type);
+            let select_type_items = SearchableVec::new(self.data_types.clone());
             let type_select = cx.new(|cx| {
                 SelectState::new(
                     select_type_items,
@@ -2154,7 +2288,7 @@ impl ColumnsEditor {
                 window,
                 move |this, _, _event: &SelectEvent<Vec<CharsetSelectItem>>, window, cx| {
                     Self::update_collation_for_charset(
-                        this.database_type,
+                        this.database_type.clone(),
                         &charset_select_clone,
                         &collation_select_clone,
                         window,
@@ -2323,7 +2457,7 @@ impl ColumnsEditor {
             .into_any_element()
     }
 
-    fn render_table_header(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_table_header(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
             .gap_3()
             .px_3()
@@ -2331,65 +2465,120 @@ impl ColumnsEditor {
             .bg(cx.theme().muted.opacity(0.5))
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(div().w(px(24.)))
-            .child(
-                div()
-                    .w(px(160.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("Table.column_name").to_string()),
-            )
-            .child(
-                div()
-                    .w(px(140.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("Table.type").to_string()),
-            )
-            .child(
-                div()
-                    .w(px(60.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("Table.length").to_string()),
-            )
-            .child(
-                div()
-                    .w(px(60.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("Table.decimal_places").to_string()),
-            )
-            .child(
-                div()
-                    .w(px(50.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .text_center()
-                    .child(t!("Table.nullable").to_string()),
-            )
-            .child(
-                div()
-                    .w(px(50.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .text_center()
-                    .child(t!("Table.primary_key").to_string()),
-            )
-            .child(
-                div()
-                    .w(px(50.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .text_center()
-                    .child(t!("Table.auto_increment_column").to_string()),
-            )
+            .child(div().w(COLUMN_DRAG_HANDLE_WIDTH))
+            .child(self.render_header_cell(
+                COLUMN_NAME_COL,
+                t!("Table.column_name").to_string(),
+                false,
+                cx,
+            ))
+            .child(self.render_header_cell(
+                COLUMN_TYPE_COL,
+                t!("Table.type").to_string(),
+                false,
+                cx,
+            ))
+            .child(self.render_header_cell(
+                COLUMN_LENGTH_COL,
+                t!("Table.length").to_string(),
+                false,
+                cx,
+            ))
+            .child(self.render_header_cell(
+                COLUMN_SCALE_COL,
+                t!("Table.decimal_places").to_string(),
+                false,
+                cx,
+            ))
+            .child(self.render_header_cell(
+                COLUMN_NULLABLE_COL,
+                t!("Table.nullable").to_string(),
+                true,
+                cx,
+            ))
+            .child(self.render_header_cell(
+                COLUMN_PRIMARY_KEY_COL,
+                t!("Table.primary_key").to_string(),
+                true,
+                cx,
+            ))
+            .child(self.render_header_cell(
+                COLUMN_AUTO_INCREMENT_COL,
+                t!("Table.auto_increment_column").to_string(),
+                true,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(t!("Table.comment").to_string()),
+            )
+            .into_any_element()
+    }
+
+    fn render_header_cell(
+        &self,
+        col_ix: usize,
+        label: String,
+        centered: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .relative()
+            .w(self.column_width(col_ix))
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .when(centered, |this| this.text_center())
+            .child(label)
+            .child(self.render_column_resize_handle(col_ix, cx))
+            .into_any_element()
+    }
+
+    fn render_column_resize_handle(&self, col_ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let group_id = SharedString::from(format!("column-editor-resize:{col_ix}"));
+        div()
+            .id(("column-editor-resize", col_ix))
+            .group(group_id.clone())
+            .absolute()
+            .right_0()
+            .top_0()
+            .bottom_0()
+            .w(COLUMN_EDITOR_RESIZE_HANDLE_WIDTH)
+            .cursor_col_resize()
+            .occlude()
+            .flex()
+            .justify_end()
+            .child(
+                div()
+                    .h_full()
+                    .w(px(1.0))
+                    .bg(cx.theme().border.opacity(0.4))
+                    .group_hover(&group_id, |el| el.bg(cx.theme().primary)),
+            )
+            .on_drag_move(cx.listener(
+                move |this, e: &DragMoveEvent<ResizeColumnEditorColumn>, _window, cx| {
+                    let drag = e.drag(cx);
+                    if drag.entity_id != cx.entity_id() || drag.col_ix != col_ix {
+                        return;
+                    }
+
+                    let width = this.column_width(col_ix);
+                    let delta = e.event.position.x - e.bounds.center().x;
+                    Self::resize_column_width(&mut this.column_widths, col_ix, width + delta);
+                    cx.notify();
+                },
+            ))
+            .on_drag(
+                ResizeColumnEditorColumn {
+                    entity_id: cx.entity_id(),
+                    col_ix,
+                },
+                |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                },
             )
             .into_any_element()
     }
@@ -2424,7 +2613,7 @@ impl ColumnsEditor {
             .child(
                 div()
                     .id(("col-row-drag-handle", idx))
-                    .w(px(24.))
+                    .w(COLUMN_DRAG_HANDLE_WIDTH)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -2441,51 +2630,65 @@ impl ColumnsEditor {
             )
             .child(
                 div()
-                    .w(px(160.))
+                    .w(self.column_width(COLUMN_NAME_COL))
                     .child(Input::new(&row.name_input).w_full().small()),
             )
             .child(
                 div()
-                    .w(px(140.))
+                    .w(self.column_width(COLUMN_TYPE_COL))
                     .child(Select::new(&row.type_select).w_full().small()),
             )
             .child(
                 div()
-                    .w(px(60.))
+                    .w(self.column_width(COLUMN_LENGTH_COL))
                     .child(Input::new(&row.length_input).w_full().small()),
             )
             .child(
                 div()
-                    .w(px(60.))
+                    .w(self.column_width(COLUMN_SCALE_COL))
                     .child(Input::new(&row.scale_input).w_full().small()),
             )
             .child(
-                div().w(px(50.)).flex().justify_center().child(
-                    Checkbox::new(("null", idx))
-                        .checked(row.nullable)
-                        .small()
-                        .on_click(
-                            cx.listener(move |this, _, _window, cx| this.toggle_nullable(idx, cx)),
-                        ),
-                ),
+                div()
+                    .w(self.column_width(COLUMN_NULLABLE_COL))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        Checkbox::new(("null", idx))
+                            .checked(row.nullable)
+                            .small()
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_nullable(idx, cx)
+                            })),
+                    ),
             )
             .child(
-                div().w(px(50.)).flex().justify_center().child(
-                    Checkbox::new(("pk", idx))
-                        .checked(row.is_pk)
-                        .small()
-                        .on_click(cx.listener(move |this, _, _window, cx| this.toggle_pk(idx, cx))),
-                ),
+                div()
+                    .w(self.column_width(COLUMN_PRIMARY_KEY_COL))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        Checkbox::new(("pk", idx))
+                            .checked(row.is_pk)
+                            .small()
+                            .on_click(
+                                cx.listener(move |this, _, _window, cx| this.toggle_pk(idx, cx)),
+                            ),
+                    ),
             )
             .child(
-                div().w(px(50.)).flex().justify_center().child(
-                    Checkbox::new(("ai", idx))
-                        .checked(row.auto_increment)
-                        .small()
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_auto_increment(idx, cx)
-                        })),
-                ),
+                div()
+                    .w(self.column_width(COLUMN_AUTO_INCREMENT_COL))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        Checkbox::new(("ai", idx))
+                            .checked(row.auto_increment)
+                            .small()
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_auto_increment(idx, cx)
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -2617,6 +2820,9 @@ impl Render for ColumnsEditor {
 
         v_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context(DB_SEARCH_CONTEXT)
+            .on_action(cx.listener(Self::on_action_focus_search))
             .child(self.render_header(cx))
             .child(self.render_table_header(cx))
             .child(
@@ -2777,7 +2983,7 @@ impl IndexesEditor {
         self._subscriptions.clear();
 
         for idx in indexes {
-            if idx.name.to_uppercase() == "PRIMARY" {
+            if idx.is_primary || idx.name.to_uppercase() == "PRIMARY" {
                 continue;
             }
 
@@ -3235,6 +3441,35 @@ mod tests {
         plugin::DatabasePlugin, postgresql::PostgresPlugin, sqlite::SqlitePlugin,
     };
 
+    #[test]
+    fn column_editor_resize_updates_width_with_bounds() {
+        let mut widths = COLUMN_EDITOR_DEFAULT_WIDTHS;
+
+        ColumnsEditor::resize_column_width(&mut widths, COLUMN_NAME_COL, px(260.0));
+        assert_eq!(px(260.0), widths[COLUMN_NAME_COL]);
+
+        ColumnsEditor::resize_column_width(&mut widths, COLUMN_NAME_COL, px(8.0));
+        assert_eq!(
+            COLUMN_EDITOR_MIN_WIDTHS[COLUMN_NAME_COL],
+            widths[COLUMN_NAME_COL]
+        );
+
+        ColumnsEditor::resize_column_width(&mut widths, COLUMN_NAME_COL, px(900.0));
+        assert_eq!(
+            COLUMN_EDITOR_MAX_WIDTHS[COLUMN_NAME_COL],
+            widths[COLUMN_NAME_COL]
+        );
+    }
+
+    #[test]
+    fn column_editor_resize_ignores_invalid_column_index() {
+        let mut widths = COLUMN_EDITOR_DEFAULT_WIDTHS;
+
+        ColumnsEditor::resize_column_width(&mut widths, COLUMN_EDITOR_COLUMN_COUNT, px(260.0));
+
+        assert_eq!(COLUMN_EDITOR_DEFAULT_WIDTHS, widths);
+    }
+
     fn build_col(name: &str) -> ColumnDefinition {
         ColumnDefinition {
             name: name.to_string(),
@@ -3271,16 +3506,19 @@ mod tests {
         }
     }
 
-    fn build_plugin(database_type: DatabaseType) -> Box<dyn DatabasePlugin> {
+    fn build_plugin(database_type: &DatabaseType) -> Box<dyn DatabasePlugin> {
         match database_type {
             DatabaseType::MySQL => Box::new(MySqlPlugin::new()),
             DatabaseType::PostgreSQL => Box::new(PostgresPlugin::new()),
             DatabaseType::SQLite => Box::new(SqlitePlugin::new()),
+            #[cfg(feature = "builtin-duckdb")]
             DatabaseType::DuckDB => Box::new(DuckDbPlugin::new()),
+            #[cfg(not(feature = "builtin-duckdb"))]
+            DatabaseType::DuckDB => Box::new(ExternalDatabasePlugin::new()),
             DatabaseType::MSSQL => Box::new(MsSqlPlugin::new()),
             DatabaseType::Oracle => Box::new(OraclePlugin::new()),
             DatabaseType::ClickHouse => Box::new(ClickHousePlugin::new()),
-            DatabaseType::External => Box::new(MySqlPlugin::new()),
+            DatabaseType::External { .. } => Box::new(MySqlPlugin::new()),
         }
     }
 
@@ -3464,6 +3702,46 @@ mod tests {
     }
 
     #[test]
+    fn test_loaded_column_type_missing_from_picker_is_preserved() {
+        let mut data_types = vec!["INT".to_string(), "VARCHAR".to_string()];
+
+        let idx = ColumnsEditor::ensure_loaded_type_option(&mut data_types, "jsonb");
+
+        assert_eq!(idx, 2);
+        assert_eq!(data_types, vec!["INT", "VARCHAR", "jsonb"]);
+    }
+
+    #[test]
+    fn test_primary_indexes_with_database_specific_names_are_not_editable_indexes() {
+        let design = build_table_design_from_metadata(
+            DatabaseType::PostgreSQL,
+            "app".to_string(),
+            "users".to_string(),
+            &[],
+            &[
+                IndexInfo {
+                    name: "users_pkey".to_string(),
+                    columns: vec!["id".to_string()],
+                    is_unique: true,
+                    is_primary: true,
+                    index_type: Some("btree".to_string()),
+                },
+                IndexInfo {
+                    name: "idx_users_email".to_string(),
+                    columns: vec!["email".to_string()],
+                    is_unique: true,
+                    is_primary: false,
+                    index_type: Some("btree".to_string()),
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(design.indexes.len(), 1);
+        assert_eq!(design.indexes[0].name, "idx_users_email");
+    }
+
+    #[test]
     fn test_mysql_rename_sql_uses_change_column() {
         let plugin = MySqlPlugin::new();
         let col = build_col("a");
@@ -3527,8 +3805,8 @@ mod tests {
     fn test_build_alter_table_sql_with_renames_contains_rename_for_all_databases() {
         let (original, current, renames) = build_delete_and_rename_conflict_case();
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             assert_contains_rename_sql(&sql, database_type);
         }
@@ -3538,8 +3816,8 @@ mod tests {
     fn test_build_alter_table_sql_with_renames_not_drop_source_for_all_databases() {
         let (original, current, renames) = build_delete_and_rename_conflict_case();
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             assert_not_drop_source_column(&sql, plugin.as_ref());
         }
@@ -3568,8 +3846,8 @@ mod tests {
         );
         let renames = vec![("b".to_string(), "b2".to_string())];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 不应包含 DROP COLUMN
             let drop_b = format!("DROP COLUMN {}", plugin.quote_identifier("b"));
@@ -3673,8 +3951,8 @@ mod tests {
     fn test_no_changes_returns_no_changes_for_all_databases() {
         let design = build_design(vec![build_col("a"), build_col("b")], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&design, &design);
             assert_eq!(
                 sql, "-- No changes detected",
@@ -3690,8 +3968,8 @@ mod tests {
         let original = build_design(vec![build_col("a")], vec![]);
         let current = build_design(vec![build_col("a"), build_col("b")], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             let quoted_b = plugin.quote_identifier("b");
             assert!(
@@ -3713,8 +3991,8 @@ mod tests {
         let original = build_design(vec![build_col("a"), build_col("b")], vec![]);
         let current = build_design(vec![build_col("a")], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             // SQLite 使用 table recreation 方式，不包含 DROP COLUMN 关键词
             if !matches!(database_type, DatabaseType::SQLite | DatabaseType::DuckDB) {
@@ -3740,8 +4018,8 @@ mod tests {
         modified_col.data_type = "BIGINT".to_string();
         let current = build_design(vec![modified_col], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             assert!(
                 sql.contains("BIGINT"),
@@ -3764,8 +4042,8 @@ mod tests {
         nullable_col.is_nullable = true;
         let current = build_design(vec![nullable_col], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             assert!(
                 !sql.starts_with("-- No changes"),
@@ -3785,8 +4063,8 @@ mod tests {
         );
         let renames = vec![("a".to_string(), "a_new".to_string())];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 应包含重命名
             let has_rename = sql.contains("RENAME COLUMN")
@@ -3818,8 +4096,8 @@ mod tests {
         let current = build_design(vec![build_col("a2"), build_col("b")], vec![]);
         let renames = vec![("a".to_string(), "a2".to_string())];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 应包含重命名
             let has_rename = sql.contains("RENAME COLUMN")
@@ -3855,8 +4133,8 @@ mod tests {
         let current = build_design(vec![build_col("a_new"), modified_b], vec![]);
         let renames = vec![("a".to_string(), "a_new".to_string())];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 应包含重命名
             let has_rename = sql.contains("RENAME COLUMN")
@@ -3882,8 +4160,8 @@ mod tests {
             ("b".to_string(), "y".to_string()),
         ];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 不应 DROP 源列
             let drop_a = format!("DROP COLUMN {}", plugin.quote_identifier("a"));
@@ -3931,8 +4209,8 @@ mod tests {
         current.indexes[0].name = "idx_test".to_string();
         let renames = vec![("b".to_string(), "b2".to_string())];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 应包含重命名语句
             let has_rename = sql.contains("RENAME COLUMN")
@@ -3954,8 +4232,8 @@ mod tests {
         let original = build_design(vec![build_col("a"), build_col("b")], vec![]);
         let current = build_design(vec![build_col("a"), build_col("b")], vec!["a"]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             // 应包含 INDEX 相关关键字
             assert!(
@@ -3972,8 +4250,8 @@ mod tests {
         let original = build_design(vec![build_col("a"), build_col("b")], vec!["a"]);
         let current = build_design(vec![build_col("a"), build_col("b")], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             assert!(
                 sql.to_uppercase().contains("DROP") && sql.to_uppercase().contains("INDEX"),
@@ -4198,8 +4476,8 @@ mod tests {
         let current = build_design(vec![renamed_and_modified, build_col("b")], vec![]);
         let renames = vec![("a".to_string(), "a_new".to_string())];
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql_with_renames(&original, &current, &renames);
             // 应包含重命名
             let has_rename = sql.contains("RENAME COLUMN")
@@ -4231,8 +4509,8 @@ mod tests {
         let original = build_design(vec![build_col("a"), build_col("b")], vec![]);
         let current = build_design(vec![], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             // 应生成非空 SQL（而非 no changes）
             assert!(
@@ -4249,8 +4527,8 @@ mod tests {
         let original = build_design(vec![], vec![]);
         let current = build_design(vec![build_col("a"), build_col("b"), build_col("c")], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             let quoted_a = plugin.quote_identifier("a");
             let quoted_b = plugin.quote_identifier("b");
@@ -4278,8 +4556,8 @@ mod tests {
         );
         current.indexes[0].name = "idx_new".to_string();
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             let upper = sql.to_uppercase();
             assert!(
@@ -4331,8 +4609,8 @@ mod tests {
         col_new.default_value = Some("1".to_string());
         let current = build_design(vec![col_new], vec![]);
 
-        for database_type in DatabaseType::all().iter().copied() {
-            let plugin = build_plugin(database_type);
+        for database_type in DatabaseType::all().iter().cloned() {
+            let plugin = build_plugin(&database_type);
             let sql = plugin.build_alter_table_sql(&original, &current);
             assert!(
                 !sql.starts_with("-- No changes"),

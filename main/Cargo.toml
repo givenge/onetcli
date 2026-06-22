@@ -1,6 +1,6 @@
 [package]
 name = "main"
-version = "0.4.8"
+version = "0.6.1"
 publish.workspace = true
 edition.workspace = true
 
@@ -26,11 +26,17 @@ dirs = {workspace = true}
 futures = { workspace = true }
 smol = { workspace = true }
 db_view = { workspace = true }
+extension-runtime = { workspace = true }
+extension_view = { workspace = true }
 terminal = { workspace = true }
 terminal_view = { workspace = true }
+port_forwarding = { workspace = true }
+port_forwarding_view = { workspace = true }
 sftp_view = { workspace = true }
 redis_view = { workspace = true }
 mongodb_view = { workspace = true }
+remote_desktop = { workspace = true }
+remote_desktop_view = { workspace = true }
 remote_file_editor = { workspace = true, features = ["ui"] }
 one-core.workspace = true
 one-ui.workspace = true
@@ -46,6 +52,19 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+
+[features]
+default = ["wasm-components"]
+builtin-duckdb = ["db/builtin-duckdb", "db_view/builtin-duckdb"]
+compare = ["db/compare", "db_view/compare"]
+github-distribution = ["github-updates", "github-marketplace"]
+github-marketplace = ["extension-runtime/github-marketplace"]
+github-updates = []
+wasm-components = ["extension-runtime/wasm-components"]
 
 [lints]
 workspace = true

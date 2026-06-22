@@ -591,6 +591,8 @@ impl FileListPanel {
         let name_for_download = name.to_string();
         let path_for_download = full_path.to_string();
         let path_for_edit = full_path.to_string();
+        let name_for_extract = name.to_string();
+        let path_for_extract = full_path.to_string();
         let name_for_permissions = name.to_string();
         let path_for_permissions = full_path.to_string();
         let path_for_terminal = full_path.to_string();
@@ -667,6 +669,20 @@ impl FileListPanel {
                         .on_click(window.listener_for(&view_edit, move |_this, _, _, cx| {
                             cx.emit(FileListPanelEvent::Edit {
                                 full_path: path_for_edit.clone(),
+                            });
+                        })),
+                );
+            }
+
+            if !is_dir && crate::archive_kind_for_name(name).is_some() {
+                let view_extract = view_ref.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t!("File.extract").to_string())
+                        .icon(IconName::Unarchive)
+                        .on_click(window.listener_for(&view_extract, move |_this, _, _, cx| {
+                            cx.emit(FileListPanelEvent::Extract {
+                                name: name_for_extract.clone(),
+                                full_path: path_for_extract.clone(),
                             });
                         })),
                 );
@@ -866,6 +882,10 @@ pub enum FileListPanelEvent {
         full_path: String,
     },
     Edit {
+        full_path: String,
+    },
+    Extract {
+        name: String,
         full_path: String,
     },
     /// 修改权限

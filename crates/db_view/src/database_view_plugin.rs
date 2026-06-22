@@ -1,5 +1,5 @@
 use db::DbNodeType;
-use db::ipc::{EXTERNAL_DRIVER_ID_PARAM, IpcDriverManifest, IpcDriverRegistry};
+use db::ipc::{IpcDriverManifest, IpcDriverRegistry};
 use db::plugin::DatabasePlugin;
 use db::plugin_manifest::{
     DatabaseActionDescriptor, DatabaseActionId, DatabaseActionPlacement,
@@ -8,13 +8,14 @@ use db::plugin_manifest::{
 use gpui::{App, AppContext, Entity, Window};
 use gpui_component::IconName;
 use one_core::storage::DatabaseType;
+use std::rc::Rc;
 
 use crate::common::db_connection_form::{
     DbConnectionForm, DbFormConfig, FormField, FormFieldType, TabGroup,
 };
 use crate::common::manifest_bridge::{
     find_form, matches_node_type, to_column_editor_capabilities, to_connection_form_config,
-    to_table_designer_capabilities, translate,
+    to_connection_form_config_with_text_resolver, to_table_designer_capabilities, translate,
 };
 use crate::common::{DatabaseEditorView, GenericDatabaseForm, GenericSchemaForm, SchemaEditorView};
 use crate::database_objects_tab::DatabaseObjectsEvent;
@@ -140,7 +141,7 @@ impl ContextMenuItem {
 }
 
 /// 表设计器 UI 配置能力
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TableDesignerCapabilities {
     /// 是否支持存储引擎选择（MySQL: InnoDB/MyISAM）
     pub supports_engine: bool,
@@ -154,20 +155,8 @@ pub struct TableDesignerCapabilities {
     pub supports_tablespace: bool,
 }
 
-impl Default for TableDesignerCapabilities {
-    fn default() -> Self {
-        Self {
-            supports_engine: false,
-            supports_charset: false,
-            supports_collation: false,
-            supports_auto_increment: false,
-            supports_tablespace: false,
-        }
-    }
-}
-
 /// 列编辑器 UI 配置能力
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ColumnEditorCapabilities {
     /// 是否支持 unsigned（MySQL 特有）
     pub supports_unsigned: bool,
@@ -179,21 +168,11 @@ pub struct ColumnEditorCapabilities {
     pub show_collation_in_detail: bool,
 }
 
-impl Default for ColumnEditorCapabilities {
-    fn default() -> Self {
-        Self {
-            supports_unsigned: false,
-            supports_enum_values: false,
-            show_charset_in_detail: false,
-            show_collation_in_detail: false,
-        }
-    }
-}
-
 struct ManifestDatabaseViewPlugin {
     database_type: DatabaseType,
     manifest: DatabaseUiManifest,
     capabilities: DatabaseCapabilities,
+    external_driver: Option<IpcDriverManifest>,
 }
 
 impl ManifestDatabaseViewPlugin {
@@ -202,6 +181,23 @@ impl ManifestDatabaseViewPlugin {
             database_type,
             manifest: plugin.ui_manifest(),
             capabilities: plugin.capabilities(),
+            external_driver: plugin.external_driver_manifest(),
+        }
+    }
+
+    fn translate_text(&self, key_or_text: &str) -> String {
+        if let Some(driver) = &self.external_driver {
+            translate_external_driver_text(driver, key_or_text)
+        } else {
+            translate(key_or_text)
+        }
+    }
+
+    fn text_resolver(&self) -> Rc<dyn Fn(&str) -> String> {
+        if let Some(driver) = self.external_driver.clone() {
+            Rc::new(move |key| translate_external_driver_text(&driver, key))
+        } else {
+            Rc::new(translate)
         }
     }
 
@@ -247,7 +243,7 @@ impl ManifestDatabaseViewPlugin {
             .expect("database plugin should exist");
         let form = find_form(&self.manifest, DatabaseFormKind::Connection)
             .expect("connection form manifest should exist");
-        let config = to_connection_form_config(self.database_type, &form, plugin.as_ref());
+        let config = to_connection_form_config(self.database_type.clone(), &form, plugin.as_ref());
         cx.new(|cx| DbConnectionForm::new(config, window, cx))
     }
 
@@ -259,9 +255,18 @@ impl ManifestDatabaseViewPlugin {
     ) -> Entity<DatabaseEditorView> {
         let manifest = find_form(&self.manifest, DatabaseFormKind::CreateDatabase)
             .expect("create database form manifest should exist");
-        let database_type = self.database_type;
+        let database_type = self.database_type.clone();
+        let text_resolver = self.text_resolver();
         cx.new(|cx| {
-            let form = cx.new(|cx| GenericDatabaseForm::new(database_type, manifest, window, cx));
+            let form = cx.new(|cx| {
+                GenericDatabaseForm::new_with_text_resolver(
+                    database_type.clone(),
+                    manifest,
+                    text_resolver,
+                    window,
+                    cx,
+                )
+            });
             DatabaseEditorView::new(form, database_type, false, window, cx)
         })
     }
@@ -275,9 +280,18 @@ impl ManifestDatabaseViewPlugin {
     ) -> Entity<DatabaseEditorView> {
         let manifest = find_form(&self.manifest, DatabaseFormKind::EditDatabase)
             .expect("edit database form manifest should exist");
-        let database_type = self.database_type;
+        let database_type = self.database_type.clone();
+        let text_resolver = self.text_resolver();
         cx.new(|cx| {
-            let form = cx.new(|cx| GenericDatabaseForm::new(database_type, manifest, window, cx));
+            let form = cx.new(|cx| {
+                GenericDatabaseForm::new_with_text_resolver(
+                    database_type.clone(),
+                    manifest,
+                    text_resolver,
+                    window,
+                    cx,
+                )
+            });
             DatabaseEditorView::new(form, database_type, true, window, cx)
         })
     }
@@ -290,7 +304,7 @@ impl ManifestDatabaseViewPlugin {
         cx: &mut App,
     ) -> Option<Entity<SchemaEditorView>> {
         let manifest = find_form(&self.manifest, DatabaseFormKind::CreateSchema)?;
-        let database_type = self.database_type;
+        let database_type = self.database_type.clone();
         Some(cx.new(|cx| {
             let form = cx.new(|cx| GenericSchemaForm::new(manifest, window, cx));
             SchemaEditorView::new(form, database_type, window, cx)
@@ -332,7 +346,11 @@ impl ManifestDatabaseViewPlugin {
                 let mut sub_items = Vec::new();
 
                 while index < actions.len() && is_dump_sql_action(actions[index].id) {
-                    if let Some(item) = action_to_context_menu_item(actions[index], node_id) {
+                    if let Some(item) = action_to_context_menu_item(
+                        actions[index],
+                        node_id,
+                        self.translate_text(&actions[index].label_i18n_key),
+                    ) {
                         sub_items.push(item);
                     }
                     index += 1;
@@ -347,12 +365,17 @@ impl ManifestDatabaseViewPlugin {
                 continue;
             }
 
-            if let Some(item) = action_to_context_menu_item(actions[index], node_id) {
+            if let Some(item) = action_to_context_menu_item(
+                actions[index],
+                node_id,
+                self.translate_text(&actions[index].label_i18n_key),
+            ) {
                 items.push(item);
             }
             index += 1;
         }
 
+        insert_query_table_context_menu_item(&mut items, node_type, node_id);
         items
     }
 
@@ -373,7 +396,7 @@ impl ManifestDatabaseViewPlugin {
                 Some(ToolbarButton::current_node(
                     action_id(action),
                     toolbar_icon(action),
-                    translate(&action.label_i18n_key),
+                    self.translate_text(&action.label_i18n_key),
                     event_fn,
                 ))
             });
@@ -390,7 +413,7 @@ impl ManifestDatabaseViewPlugin {
                 Some(ToolbarButton::selected_row(
                     action_id(action),
                     toolbar_icon(action),
-                    translate(&action.label_i18n_key),
+                    self.translate_text(&action.label_i18n_key),
                     event_fn,
                 ))
             });
@@ -413,8 +436,8 @@ fn manifest_plugin(
 fn action_to_context_menu_item(
     action: &DatabaseActionDescriptor,
     node_id: &str,
+    label: String,
 ) -> Option<ContextMenuItem> {
-    let label = translate(&action.label_i18n_key);
     let event = map_tree_event(action.id, node_id)?;
     Some(if action.requires_active_connection {
         ContextMenuItem::item(label, event)
@@ -501,6 +524,25 @@ fn context_menu_rank(node_type: DbNodeType, action_id: DatabaseActionId) -> usiz
     }
 }
 
+fn insert_query_table_context_menu_item(
+    items: &mut Vec<ContextMenuItem>,
+    node_type: DbNodeType,
+    node_id: &str,
+) {
+    if !matches!(node_type, DbNodeType::Table | DbNodeType::View) {
+        return;
+    }
+
+    let query_item = ContextMenuItem::item(
+        translate("Query.query_table"),
+        DbTreeViewEvent::CreateNewQuery {
+            node_id: node_id.to_string(),
+        },
+    );
+    let insert_index = items.len().min(2);
+    items.insert(insert_index, query_item);
+}
+
 fn context_menu_group(node_type: DbNodeType, action: &DatabaseActionDescriptor) -> Option<String> {
     action.group.clone().or_else(|| {
         let group = match node_type {
@@ -569,6 +611,9 @@ pub fn create_connection_form_for(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<DbConnectionForm> {
+    if let Some(config) = duckdb_ipc_connection_form_config(&database_type, cx) {
+        return cx.new(|cx| DbConnectionForm::new(config, window, cx));
+    }
     manifest_plugin(database_type, cx).create_connection_form(window, cx)
 }
 
@@ -583,65 +628,287 @@ pub fn create_external_connection_form_for(
 }
 
 fn external_form_config(driver: &IpcDriverManifest, cx: &mut App) -> Option<DbFormConfig> {
+    let database_type = DatabaseType::external(driver.id.clone());
+    external_form_config_for_database_type(driver, database_type, cx)
+}
+
+fn duckdb_ipc_connection_form_config(
+    database_type: &DatabaseType,
+    cx: &mut App,
+) -> Option<DbFormConfig> {
+    if database_type != &DatabaseType::DuckDB {
+        return None;
+    }
+    let db_state = cx.global::<db::GlobalDbState>();
+    let duckdb_plugin = db_state.get_plugin(&DatabaseType::DuckDB).ok()?;
+    if duckdb_plugin.name() != DatabaseType::external("duckdb") {
+        return None;
+    }
+    let driver = IpcDriverRegistry::load_default().find("duckdb")?;
+    let plugin_type = DatabaseType::external(driver.id.clone());
+    let plugin = db_state.get_plugin(&plugin_type).ok()?;
+    duckdb_ipc_form_config_with_plugin(&driver, plugin.as_ref())
+}
+
+fn external_form_config_for_database_type(
+    driver: &IpcDriverManifest,
+    database_type: DatabaseType,
+    cx: &mut App,
+) -> Option<DbFormConfig> {
+    let plugin_type = DatabaseType::external(driver.id.clone());
     let plugin = cx
         .global::<db::GlobalDbState>()
-        .get_plugin(&DatabaseType::External)
+        .get_plugin(&plugin_type)
         .ok()?;
-    let mut config = if let Some(manifest) = driver.ui.form.clone() {
-        let form = find_form(&manifest, DatabaseFormKind::Connection)?;
-        to_connection_form_config(DatabaseType::External, &form, plugin.as_ref())
-    } else {
-        default_external_form_config(driver)
-    };
-    config.title = format!("{} ({})", translate("Common.new"), driver.name);
-    config.hidden_params =
-        HashMap::from([(EXTERNAL_DRIVER_ID_PARAM.to_string(), driver.id.clone())]);
+    external_form_config_with_plugin(driver, database_type, plugin.as_ref())
+}
+
+fn external_form_config_with_plugin(
+    driver: &IpcDriverManifest,
+    database_type: DatabaseType,
+    plugin: &dyn DatabasePlugin,
+) -> Option<DbFormConfig> {
+    let mut config = raw_external_form_config_with_plugin(driver, database_type, plugin)?;
+    apply_external_driver_defaults(&mut config, driver);
     Some(config)
 }
 
+fn raw_external_form_config_with_plugin(
+    driver: &IpcDriverManifest,
+    database_type: DatabaseType,
+    plugin: &dyn DatabasePlugin,
+) -> Option<DbFormConfig> {
+    let mut config = if let Some(manifest) = driver.ui.form.clone() {
+        let form = find_form(&manifest, DatabaseFormKind::Connection)?;
+        to_connection_form_config_with_text_resolver(database_type.clone(), &form, plugin, |key| {
+            translate_external_driver_text(driver, key)
+        })
+    } else {
+        default_external_form_config_for_database_type(driver, database_type)
+    };
+    if config.title.trim().is_empty() {
+        config.title = format!("{} ({})", translate("Common.new"), driver.name);
+    }
+    Some(config)
+}
+
+fn duckdb_ipc_form_config_with_plugin(
+    driver: &IpcDriverManifest,
+    plugin: &dyn DatabasePlugin,
+) -> Option<DbFormConfig> {
+    let mut config = raw_external_form_config_with_plugin(driver, DatabaseType::DuckDB, plugin)?;
+    apply_duckdb_host_defaults(&mut config);
+    apply_external_driver_defaults(&mut config, driver);
+    Some(config)
+}
+
+fn apply_duckdb_host_defaults(config: &mut DbFormConfig) {
+    let host_defaults = DbFormConfig::duckdb();
+    for group in &mut config.tab_groups {
+        let Some(default_group) = host_defaults
+            .tab_groups
+            .iter()
+            .find(|default_group| default_group.name == group.name)
+        else {
+            continue;
+        };
+        for field in &mut group.fields {
+            let Some(default_field) = default_group
+                .fields
+                .iter()
+                .find(|default_field| default_field.name == field.name)
+            else {
+                continue;
+            };
+            if field.default_value.trim().is_empty() {
+                field.default_value = default_field.default_value.clone();
+            }
+            if field.placeholder.trim().is_empty() {
+                field.placeholder = default_field.placeholder.clone();
+            }
+        }
+    }
+}
+
+fn apply_external_driver_defaults(config: &mut DbFormConfig, driver: &IpcDriverManifest) {
+    if config.title.trim().is_empty() {
+        config.title = format!("{} ({})", translate("Common.new"), driver.name);
+    }
+    apply_external_driver_empty_tab_defaults(config, driver);
+    apply_external_driver_name_defaults(config, driver);
+}
+
+fn apply_external_driver_empty_tab_defaults(config: &mut DbFormConfig, driver: &IpcDriverManifest) {
+    for group in &mut config.tab_groups {
+        if !group.fields.is_empty() {
+            continue;
+        }
+
+        if let Some(default_group) = external_driver_default_tab(driver, &group.name) {
+            group.fields = default_group.fields;
+        }
+    }
+}
+
+fn external_driver_default_tab(driver: &IpcDriverManifest, tab_name: &str) -> Option<TabGroup> {
+    match tab_name {
+        "general" => find_tab(default_external_form_config(driver), "general"),
+        "ssh" => find_tab(DbFormConfig::mysql(), "ssh"),
+        "ssl" => find_compatible_ssl_tab(driver),
+        "notes" | "remark" => find_tab(DbFormConfig::mysql(), "notes").map(|mut group| {
+            group.name = tab_name.to_string();
+            group
+        }),
+        _ => None,
+    }
+}
+
+fn find_compatible_ssl_tab(driver: &IpcDriverManifest) -> Option<TabGroup> {
+    find_tab(external_driver_compatible_host_form(driver), "ssl")
+        .or_else(|| find_tab(DbFormConfig::mysql(), "ssl"))
+}
+
+fn external_driver_compatible_host_form(driver: &IpcDriverManifest) -> DbFormConfig {
+    match driver.dialect.compatible_database_type.as_ref() {
+        Some(DatabaseType::PostgreSQL) => DbFormConfig::postgres(),
+        Some(DatabaseType::SQLite) => DbFormConfig::sqlite(),
+        Some(DatabaseType::DuckDB) => DbFormConfig::duckdb(),
+        Some(DatabaseType::MSSQL) => DbFormConfig::mssql(),
+        Some(DatabaseType::Oracle) => DbFormConfig::oracle(),
+        Some(DatabaseType::ClickHouse) => DbFormConfig::clickhouse(),
+        _ => DbFormConfig::mysql(),
+    }
+}
+
+fn find_tab(config: DbFormConfig, tab_name: &str) -> Option<TabGroup> {
+    config
+        .tab_groups
+        .into_iter()
+        .find(|group| group.name == tab_name)
+}
+
+fn apply_external_driver_name_defaults(config: &mut DbFormConfig, driver: &IpcDriverManifest) {
+    for group in &mut config.tab_groups {
+        for field in &mut group.fields {
+            if field.name != "name" {
+                continue;
+            }
+            if field.default_value.trim().is_empty() {
+                field.default_value = driver.name.clone();
+            }
+            if field.placeholder.trim().is_empty() {
+                field.placeholder = driver.name.clone();
+            }
+            return;
+        }
+    }
+}
+
+fn translate_external_driver_text(driver: &IpcDriverManifest, key_or_text: &str) -> String {
+    if driver.locales_dir().is_some() {
+        let translated = crate::t_driver(driver, key_or_text);
+        if translated != key_or_text {
+            return translated;
+        }
+    }
+
+    let translated = translate_db_view_or_raw_for_locale(rust_i18n::locale().as_ref(), key_or_text);
+    if translated != key_or_text {
+        return translated;
+    }
+
+    db::translate_or_raw_for_locale(rust_i18n::locale().as_ref(), key_or_text)
+}
+
+fn translate_db_view_or_raw_for_locale(locale: &str, key_or_text: &str) -> String {
+    let translated = crate::_rust_i18n_translate(locale, key_or_text).into_owned();
+    let missing_with_locale = format!("{locale}.{key_or_text}");
+
+    if translated == key_or_text || translated == missing_with_locale {
+        key_or_text.to_string()
+    } else {
+        translated
+    }
+}
+
 fn default_external_form_config(driver: &IpcDriverManifest) -> DbFormConfig {
+    default_external_form_config_for_database_type(
+        driver,
+        DatabaseType::external(driver.id.clone()),
+    )
+}
+
+fn default_external_form_config_for_database_type(
+    driver: &IpcDriverManifest,
+    database_type: DatabaseType,
+) -> DbFormConfig {
+    let t = |driver_key: &str, fallback_key: &str| -> String {
+        let text = translate_external_driver_text(driver, driver_key);
+        if text != driver_key {
+            text
+        } else {
+            translate(fallback_key)
+        }
+    };
+    let placeholder = |driver_key: &str, default: &str| -> String {
+        let text = translate_external_driver_text(driver, driver_key);
+        if text != driver_key {
+            text
+        } else {
+            default.to_string()
+        }
+    };
+    let title = {
+        let text = translate_external_driver_text(driver, "connection.title");
+        if text != "connection.title" {
+            text
+        } else {
+            format!("{} ({})", translate("Common.new"), driver.name)
+        }
+    };
+
     DbFormConfig {
-        db_type: DatabaseType::External,
-        title: format!("{} ({})", translate("Common.new"), driver.name),
+        db_type: database_type,
+        title,
         hidden_params: HashMap::new(),
         tab_groups: vec![
-            TabGroup::new("general", translate("ConnectionForm.general")).fields(vec![
+            TabGroup::new("general", t("tabs.general", "ConnectionForm.general")).fields(vec![
                 FormField::new(
                     "name",
-                    translate("ConnectionForm.connection_name"),
+                    t("fields.name.label", "ConnectionForm.connection_name"),
                     FormFieldType::Text,
                 )
                 .placeholder(driver.name.clone())
                 .default(driver.name.clone()),
                 FormField::new(
                     "host",
-                    translate("ConnectionForm.host"),
+                    t("fields.host.label", "ConnectionForm.host"),
                     FormFieldType::Text,
                 )
-                .placeholder("localhost")
+                .placeholder(placeholder("fields.host.placeholder", "localhost"))
                 .default("localhost"),
                 FormField::new(
                     "port",
-                    translate("ConnectionForm.port"),
+                    t("fields.port.label", "ConnectionForm.port"),
                     FormFieldType::Number,
                 )
                 .placeholder("0")
                 .default(driver.ui.default_port.unwrap_or_default().to_string()),
                 FormField::new(
                     "username",
-                    translate("ConnectionForm.username"),
+                    t("fields.username.label", "ConnectionForm.username"),
                     FormFieldType::Text,
                 )
                 .optional(),
                 FormField::new(
                     "password",
-                    translate("ConnectionForm.password"),
+                    t("fields.password.label", "ConnectionForm.password"),
                     FormFieldType::Password,
                 )
                 .optional(),
                 FormField::new(
                     "database",
-                    translate("ConnectionForm.database"),
+                    t("fields.database.label", "ConnectionForm.database"),
                     FormFieldType::Text,
                 )
                 .optional(),
@@ -697,6 +964,7 @@ pub fn build_context_menu_for(
 ) -> Vec<ContextMenuItem> {
     let mut items = manifest_plugin(database_type, cx).build_context_menu(node_id, node_type);
     append_er_diagram_item(&mut items, node_id, node_type);
+    append_compare_items(&mut items, node_id, node_type);
     items
 }
 
@@ -722,6 +990,39 @@ fn append_er_diagram_item(items: &mut Vec<ContextMenuItem>, node_id: &str, node_
             node_id: node_id.to_string(),
         },
     ));
+}
+
+#[cfg(feature = "compare")]
+fn append_compare_items(items: &mut Vec<ContextMenuItem>, node_id: &str, node_type: DbNodeType) {
+    // 数据比较：仅对表显示
+    if matches!(node_type, DbNodeType::Table) {
+        if !items.is_empty() {
+            items.push(ContextMenuItem::separator());
+        }
+        items.push(ContextMenuItem::item(
+            "数据比较",
+            DbTreeViewEvent::CompareData {
+                node_id: node_id.to_string(),
+            },
+        ));
+    }
+
+    // 结构比较：对数据库和 Schema 显示
+    if matches!(node_type, DbNodeType::Database | DbNodeType::Schema) {
+        if items.is_empty() || !matches!(items.last(), Some(ContextMenuItem::Separator)) {
+            items.push(ContextMenuItem::separator());
+        }
+        items.push(ContextMenuItem::item(
+            "结构比较",
+            DbTreeViewEvent::CompareSchema {
+                node_id: node_id.to_string(),
+            },
+        ));
+    }
+}
+
+#[cfg(not(feature = "compare"))]
+fn append_compare_items(_items: &mut Vec<ContextMenuItem>, _node_id: &str, _node_type: DbNodeType) {
 }
 
 pub fn get_table_designer_capabilities_for(
@@ -897,7 +1198,12 @@ fn action_id(action: &DatabaseActionDescriptor) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::ipc::{ExternalDatabasePlugin, IpcDriverEntry, IpcDriverManifest, IpcDriverTransport};
     use db::mysql::MySqlPlugin;
+    use db::plugin_manifest::{
+        DatabaseFormField, DatabaseFormFieldType, DatabaseFormManifest, DatabaseFormTab,
+    };
+    use std::path::PathBuf;
 
     fn mysql_manifest_plugin() -> ManifestDatabaseViewPlugin {
         let plugin = MySqlPlugin::new();
@@ -914,6 +1220,442 @@ mod tests {
         })
     }
 
+    fn field_names(tab_group: &TabGroup) -> Vec<&str> {
+        tab_group
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect()
+    }
+
+    fn tab_fields<'a>(config: &'a DbFormConfig, tab_name: &str) -> Vec<&'a str> {
+        field_names(
+            config
+                .tab_groups
+                .iter()
+                .find(|group| group.name == tab_name)
+                .expect("tab should exist"),
+        )
+    }
+
+    fn config_field<'a>(config: &'a DbFormConfig, field_name: &str) -> &'a FormField {
+        config
+            .tab_groups
+            .iter()
+            .flat_map(|group| group.fields.iter())
+            .find(|field| field.name == field_name)
+            .expect("field should exist")
+    }
+
+    fn manifest_field(
+        id: &str,
+        label_i18n_key: &str,
+        field_type: DatabaseFormFieldType,
+    ) -> DatabaseFormField {
+        DatabaseFormField {
+            id: id.into(),
+            label_i18n_key: label_i18n_key.into(),
+            field_type,
+            required: true,
+            default_value: None,
+            placeholder_i18n_key: None,
+            help_i18n_key: None,
+            options: Vec::new(),
+            options_source: None,
+            visible_when: Vec::new(),
+            default_when: Vec::new(),
+            disabled_when_editing: false,
+            rows: None,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn duckdb_driver_form() -> DatabaseUiManifest {
+        DatabaseUiManifest {
+            forms: vec![DatabaseFormManifest {
+                kind: DatabaseFormKind::Connection,
+                title_i18n_key: "connection.title".into(),
+                submit_i18n_key: "Common.save".into(),
+                tabs: vec![DatabaseFormTab {
+                    id: "general".into(),
+                    label_i18n_key: "ConnectionForm.general".into(),
+                    fields: vec![
+                        manifest_field(
+                            "name",
+                            "ConnectionForm.connection_name",
+                            DatabaseFormFieldType::Text,
+                        ),
+                        manifest_field(
+                            "host",
+                            "database.connection.field.host",
+                            DatabaseFormFieldType::FilePath,
+                        ),
+                    ],
+                }],
+            }],
+            ..DatabaseUiManifest::default()
+        }
+    }
+
+    fn demo_driver() -> IpcDriverManifest {
+        IpcDriverManifest {
+            id: "demo".into(),
+            name: "DemoDB".into(),
+            category: None,
+            description: String::new(),
+            version: String::new(),
+            entry: IpcDriverEntry {
+                command: "driver".into(),
+                commands: Default::default(),
+                args: Vec::new(),
+                working_dir: None,
+                env_from_config: Default::default(),
+            },
+            transport: IpcDriverTransport::local_socket("demo.sock"),
+            dialect: Default::default(),
+            capabilities: None,
+            connection: Default::default(),
+            methods: Vec::new(),
+            ui: Default::default(),
+            manifest_dir: PathBuf::from("."),
+        }
+    }
+
+    fn demo_driver_with_locales(root: &std::path::Path) -> IpcDriverManifest {
+        let locales_dir = root.join("locales");
+        std::fs::create_dir_all(&locales_dir).unwrap();
+        let locale = rust_i18n::locale().to_string();
+        let content = r#"
+connection:
+  title: "Driver Connection"
+database:
+  connection:
+    field:
+      host: "Driver Host"
+"#;
+        std::fs::write(locales_dir.join(format!("{locale}.yml")), content).unwrap();
+        std::fs::write(locales_dir.join("en.yml"), content).unwrap();
+        let mut driver = demo_driver();
+        driver.ui.locales_dir = Some("locales".to_string());
+        driver.manifest_dir = root.to_path_buf();
+        driver
+    }
+
+    fn demo_driver_with_database_locale(root: &std::path::Path) -> IpcDriverManifest {
+        let locales_dir = root.join("locales");
+        std::fs::create_dir_all(&locales_dir).unwrap();
+        let locale = rust_i18n::locale().to_string();
+        let content = r#"
+driver:
+  database:
+    create: "New Driver Group"
+    delete: "Delete Driver Group"
+    name: "Driver Group Name"
+    placeholder: "root.demo"
+"#;
+        std::fs::write(locales_dir.join(format!("{locale}.yml")), content).unwrap();
+        std::fs::write(locales_dir.join("en.yml"), content).unwrap();
+
+        let mut driver = demo_driver();
+        driver.ui.locales_dir = Some("locales".to_string());
+        driver.ui.form = Some(DatabaseUiManifest {
+            forms: vec![DatabaseFormManifest {
+                kind: DatabaseFormKind::CreateDatabase,
+                title_i18n_key: "driver.database.create".into(),
+                submit_i18n_key: "Common.create".into(),
+                tabs: vec![DatabaseFormTab {
+                    id: "general".into(),
+                    label_i18n_key: "ConnectionForm.general".into(),
+                    fields: vec![DatabaseFormField {
+                        placeholder_i18n_key: Some("driver.database.placeholder".into()),
+                        ..manifest_field(
+                            "name",
+                            "driver.database.name",
+                            DatabaseFormFieldType::Text,
+                        )
+                    }],
+                }],
+            }],
+            actions: db::plugin_manifest::DatabaseActionManifest {
+                actions: vec![db::plugin_manifest::DatabaseActionDescriptor {
+                    id: DatabaseActionId::CreateDatabase,
+                    label_i18n_key: "driver.database.create".into(),
+                    icon: None,
+                    targets: vec![db::plugin_manifest::DatabaseActionTarget {
+                        node_type: DbNodeType::Connection,
+                    }],
+                    placement: DatabaseActionPlacement::Both,
+                    requires_active_connection: true,
+                    group: None,
+                    submenu_of: None,
+                    toolbar_scope: Some(DatabaseActionToolbarScope::CurrentNode),
+                }],
+            },
+            ..DatabaseUiManifest::default()
+        });
+        driver.manifest_dir = root.to_path_buf();
+        driver
+    }
+
+    fn to_database_form_config_for_test(
+        driver: &IpcDriverManifest,
+        plugin: &dyn DatabasePlugin,
+        form: DatabaseFormManifest,
+    ) -> DbFormConfig {
+        to_connection_form_config_with_text_resolver(
+            DatabaseType::external(driver.id.clone()),
+            &form,
+            plugin,
+            |key| translate_external_driver_text(driver, key),
+        )
+    }
+
+    fn temp_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("onetcli-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn external_driver_text_uses_driver_locale_then_app_locale() {
+        let temp = temp_test_dir("driver-i18n");
+        let driver = demo_driver_with_locales(&temp);
+
+        assert_eq!(
+            "Driver Connection",
+            translate_external_driver_text(&driver, "connection.title")
+        );
+        assert_eq!(
+            "Driver Host",
+            translate_external_driver_text(&driver, "database.connection.field.host")
+        );
+        assert_eq!(
+            translate("ConnectionForm.general"),
+            translate_external_driver_text(&driver, "ConnectionForm.general")
+        );
+        assert_eq!(
+            translate("Table.new_table"),
+            translate_external_driver_text(&driver, "Table.new_table")
+        );
+        assert_eq!(
+            "literal text",
+            translate_external_driver_text(&driver, "literal text")
+        );
+    }
+
+    #[test]
+    fn default_external_form_config_uses_driver_title_locale() {
+        let temp = temp_test_dir("driver-title-i18n");
+        let driver = demo_driver_with_locales(&temp);
+
+        let config = default_external_form_config(&driver);
+
+        assert_eq!("Driver Connection", config.title);
+    }
+
+    #[test]
+    fn external_driver_database_form_uses_driver_locale() {
+        let temp = temp_test_dir("driver-database-form-i18n");
+        let driver = demo_driver_with_database_locale(&temp);
+        let plugin = ExternalDatabasePlugin::for_driver(driver.clone());
+        let manifest = driver
+            .ui
+            .form
+            .as_ref()
+            .and_then(|form| {
+                form.forms
+                    .iter()
+                    .find(|form| form.kind == DatabaseFormKind::CreateDatabase)
+                    .cloned()
+            })
+            .expect("driver should expose create database form");
+
+        let config = to_database_form_config_for_test(&driver, &plugin, manifest);
+
+        assert_eq!("New Driver Group", config.title);
+        assert_eq!("Driver Group Name", config_field(&config, "name").label);
+    }
+
+    #[test]
+    fn external_driver_context_menu_uses_driver_locale() {
+        let temp = temp_test_dir("driver-action-i18n");
+        let driver = demo_driver_with_database_locale(&temp);
+        let plugin = ExternalDatabasePlugin::for_driver(driver.clone());
+        let view_plugin = ManifestDatabaseViewPlugin::new(DatabaseType::external("demo"), &plugin);
+
+        let items = view_plugin.build_context_menu("node-1", DbNodeType::Connection);
+
+        assert!(has_label(&items, "New Driver Group"));
+    }
+
+    #[test]
+    fn external_driver_context_menu_falls_back_to_host_locale() {
+        let temp = temp_test_dir("driver-action-host-i18n");
+        let mut driver = demo_driver_with_database_locale(&temp);
+        if let Some(form) = driver.ui.form.as_mut() {
+            if let Some(action) = form.actions.actions.first_mut() {
+                action.label_i18n_key = "Table.new_table".into();
+            }
+        }
+        let plugin = ExternalDatabasePlugin::for_driver(driver.clone());
+        let view_plugin = ManifestDatabaseViewPlugin::new(DatabaseType::external("demo"), &plugin);
+
+        let items = view_plugin.build_context_menu("node-1", DbNodeType::Connection);
+
+        assert!(has_label(&items, &translate("Table.new_table")));
+    }
+
+    #[test]
+    fn duckdb_ipc_form_keeps_builtin_type_and_applies_host_defaults() {
+        let temp = temp_test_dir("duckdb-ipc-host-defaults");
+        let mut driver = demo_driver_with_locales(&temp);
+        driver.id = "duckdb".into();
+        driver.name = "DuckDB".into();
+        driver.ui.form = Some(duckdb_driver_form());
+        let plugin = ExternalDatabasePlugin::for_driver(driver.clone());
+
+        let config = duckdb_ipc_form_config_with_plugin(&driver, &plugin)
+            .expect("DuckDB IPC form should be converted");
+        let name = config_field(&config, "name");
+        let host = config_field(&config, "host");
+
+        assert_eq!(DatabaseType::DuckDB, config.db_type);
+        assert_eq!("Driver Connection", config.title);
+        assert_eq!("Local DuckDB", name.default_value);
+        assert_eq!("My DuckDB Database", name.placeholder);
+        assert_eq!("Driver Host", host.label);
+        assert!(host.default_value.ends_with("onetcli_default.duckdb"));
+        assert_eq!("/path/to/database.duckdb", host.placeholder);
+    }
+
+    #[test]
+    fn external_driver_form_defaults_preserve_manifest_title() {
+        let mut config = DbFormConfig {
+            db_type: DatabaseType::external("demo"),
+            title: "Driver Connection".into(),
+            hidden_params: HashMap::new(),
+            tab_groups: vec![
+                TabGroup::new("general", "General").field(
+                    FormField::new("name", "Name", FormFieldType::Text)
+                        .placeholder("")
+                        .default(""),
+                ),
+            ],
+        };
+
+        apply_external_driver_defaults(&mut config, &demo_driver());
+
+        assert_eq!("Driver Connection", config.title);
+        assert_eq!(
+            None,
+            config.hidden_params.get("external_driver_id"),
+            "external driver identity must be stored in DatabaseType, not hidden params"
+        );
+        assert_eq!("DemoDB", config.tab_groups[0].fields[0].default_value);
+        assert_eq!("DemoDB", config.tab_groups[0].fields[0].placeholder);
+    }
+
+    #[test]
+    fn external_driver_empty_manifest_tabs_use_host_defaults() {
+        let mut driver = demo_driver();
+        driver.dialect.compatible_database_type = Some(DatabaseType::PostgreSQL);
+        let mut config = DbFormConfig {
+            db_type: DatabaseType::external("demo"),
+            title: "Driver Connection".into(),
+            hidden_params: HashMap::new(),
+            tab_groups: vec![
+                TabGroup::new("general", "General"),
+                TabGroup::new("ssl", "SSL"),
+                TabGroup::new("ssh", "SSH"),
+                TabGroup::new("remark", "Remark"),
+            ],
+        };
+
+        apply_external_driver_defaults(&mut config, &driver);
+
+        assert_eq!(
+            tab_fields(&config, "general"),
+            vec!["name", "host", "port", "username", "password", "database"]
+        );
+        assert_eq!(
+            tab_fields(&config, "ssl"),
+            vec![
+                "ssl_mode",
+                "ssl_root_cert_path",
+                "ssl_accept_invalid_certs",
+                "ssl_accept_invalid_hostnames"
+            ]
+        );
+        assert_eq!(
+            tab_fields(&config, "ssh"),
+            vec![
+                "ssh_tunnel_enabled",
+                "ssh_connection_id",
+                "ssh_host",
+                "ssh_port",
+                "ssh_username",
+                "ssh_auth_type",
+                "ssh_password",
+                "ssh_private_key_path",
+                "ssh_private_key_passphrase",
+                "ssh_target_host",
+                "ssh_target_port"
+            ]
+        );
+        assert_eq!(tab_fields(&config, "remark"), vec!["remark"]);
+    }
+
+    #[test]
+    fn external_driver_non_empty_manifest_tab_keeps_driver_fields() {
+        let mut config = DbFormConfig {
+            db_type: DatabaseType::external("demo"),
+            title: "Driver Connection".into(),
+            hidden_params: HashMap::new(),
+            tab_groups: vec![
+                TabGroup::new("general", "General")
+                    .field(FormField::new("dsn", "DSN", FormFieldType::Text).default("demo-dsn")),
+            ],
+        };
+
+        apply_external_driver_defaults(&mut config, &demo_driver());
+
+        assert_eq!(tab_fields(&config, "general"), vec!["dsn"]);
+    }
+
+    #[test]
+    fn external_driver_empty_ssh_tab_uses_host_defaults_for_file_compatible_driver() {
+        let mut driver = demo_driver();
+        driver.dialect.compatible_database_type = Some(DatabaseType::DuckDB);
+        let mut config = DbFormConfig {
+            db_type: DatabaseType::external("duckdb"),
+            title: "Driver Connection".into(),
+            hidden_params: HashMap::new(),
+            tab_groups: vec![TabGroup::new("ssh", "SSH")],
+        };
+
+        apply_external_driver_defaults(&mut config, &driver);
+
+        assert_eq!(
+            tab_fields(&config, "ssh"),
+            vec![
+                "ssh_tunnel_enabled",
+                "ssh_connection_id",
+                "ssh_host",
+                "ssh_port",
+                "ssh_username",
+                "ssh_auth_type",
+                "ssh_password",
+                "ssh_private_key_path",
+                "ssh_private_key_passphrase",
+                "ssh_target_host",
+                "ssh_target_port"
+            ]
+        );
+    }
+
     #[test]
     fn mysql_table_context_menu_keeps_design_table_action() {
         let items = mysql_manifest_plugin().build_context_menu("node-1", DbNodeType::Table);
@@ -922,6 +1664,13 @@ mod tests {
             has_label(&items, &translate("Table.design_table")),
             "设计表菜单项不应因 toolbar_scope 过滤而丢失"
         );
+    }
+
+    #[test]
+    fn table_context_menu_includes_query_table_action() {
+        let items = mysql_manifest_plugin().build_context_menu("node-1", DbNodeType::Table);
+
+        assert!(has_label(&items, &translate("Query.query_table")));
     }
 
     #[test]
@@ -953,6 +1702,36 @@ mod tests {
             ),
             "导出结构和数据菜单项应存在于二级菜单中"
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "compare"))]
+    fn compare_context_menu_items_are_hidden_without_compare_feature() {
+        let mut table_items = Vec::new();
+        append_compare_items(&mut table_items, "table-1", DbNodeType::Table);
+        assert!(
+            !has_label(&table_items, "数据比较"),
+            "默认构建不应暴露未完成的数据比较入口"
+        );
+
+        let mut database_items = Vec::new();
+        append_compare_items(&mut database_items, "database-1", DbNodeType::Database);
+        assert!(
+            !has_label(&database_items, "结构比较"),
+            "默认构建不应暴露未完成的结构比较入口"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "compare")]
+    fn compare_context_menu_items_are_available_with_compare_feature() {
+        let mut table_items = Vec::new();
+        append_compare_items(&mut table_items, "table-1", DbNodeType::Table);
+        assert!(has_label(&table_items, "数据比较"));
+
+        let mut database_items = Vec::new();
+        append_compare_items(&mut database_items, "database-1", DbNodeType::Database);
+        assert!(has_label(&database_items, "结构比较"));
     }
 
     #[test]

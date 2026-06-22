@@ -99,6 +99,59 @@ pub struct DatabaseOperationRequest {
     pub field_values: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionLifecycle {
+    pub close_on_release: bool,
+    pub physical_open_lock_key: Option<String>,
+}
+
+impl ConnectionLifecycle {
+    pub fn single_file(
+        driver_id: &str,
+        config: &DbConnectionConfig,
+        path_fields: &[String],
+    ) -> Self {
+        let path = first_config_value(config, path_fields)
+            .or_else(|| first_config_value(config, &default_file_path_fields()))
+            .unwrap_or(config.id.as_str());
+
+        Self {
+            close_on_release: true,
+            physical_open_lock_key: Some(format!("{driver_id}:{}", normalize_file_lock_path(path))),
+        }
+    }
+}
+
+fn default_file_path_fields() -> Vec<String> {
+    vec![
+        "host".to_string(),
+        "database".to_string(),
+        "extra_params.path".to_string(),
+    ]
+}
+
+fn first_config_value<'a>(config: &'a DbConnectionConfig, fields: &[String]) -> Option<&'a str> {
+    fields
+        .iter()
+        .filter_map(|field| config_value_for_field(config, field))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn config_value_for_field<'a>(config: &'a DbConnectionConfig, field: &str) -> Option<&'a str> {
+    match field {
+        "host" => Some(config.host.as_str()),
+        "database" => config.database.as_deref(),
+        other => other
+            .strip_prefix("extra_params.")
+            .and_then(|key| config.extra_params.get(key).map(String::as_str)),
+    }
+}
+
+fn normalize_file_lock_path(path: &str) -> &str {
+    path.strip_prefix("file:").unwrap_or(path)
+}
+
 impl SqlCompletionInfo {
     /// Create completion info with standard SQL functions and keywords included
     pub fn with_standard_sql(mut self) -> Self {
@@ -133,6 +186,17 @@ pub trait DatabasePlugin: Send + Sync {
         &self,
         config: DbConnectionConfig,
     ) -> Result<Box<dyn DbConnection + Send + Sync>, DbError>;
+
+    fn connection_lifecycle(&self, _config: &DbConnectionConfig) -> ConnectionLifecycle {
+        ConnectionLifecycle::default()
+    }
+
+    async fn test_connection(&self, config: DbConnectionConfig) -> Result<(), DbError> {
+        let mut connection = self.create_connection(config).await?;
+        let ping_result = connection.ping().await;
+        let _ = connection.disconnect().await;
+        ping_result
+    }
 
     // === Database/Schema Level Operations ===
     async fn list_databases(&self, connection: &dyn DbConnection) -> Result<Vec<String>>;
@@ -435,6 +499,10 @@ pub trait DatabasePlugin: Send + Sync {
         DatabaseUiManifest::default()
     }
 
+    fn external_driver_manifest(&self) -> Option<crate::ipc::IpcDriverManifest> {
+        None
+    }
+
     fn resolve_reference_data(
         &self,
         kind: ReferenceDataKind,
@@ -491,11 +559,22 @@ pub trait DatabasePlugin: Send + Sync {
     /// Build SQL for creating a new database
     fn build_create_database_sql(&self, request: &DatabaseOperationRequest) -> String;
 
+    async fn build_create_database_sql_async(
+        &self,
+        request: &DatabaseOperationRequest,
+    ) -> Result<String> {
+        Ok(self.build_create_database_sql(request))
+    }
+
     /// Build SQL for modifying an existing database
     fn build_modify_database_sql(&self, request: &DatabaseOperationRequest) -> String;
 
     /// Build SQL for dropping a database
     fn build_drop_database_sql(&self, database_name: &str) -> String;
+
+    async fn build_drop_database_sql_async(&self, database_name: &str) -> Result<String> {
+        Ok(self.build_drop_database_sql(database_name))
+    }
 
     // === Schema Management Operations ===
     /// Build SQL for creating a new schema
@@ -529,7 +608,7 @@ pub trait DatabasePlugin: Send + Sync {
                     db.clone(),
                     DbNodeType::Database,
                     node.id.clone(),
-                    node.database_type,
+                    node.database_type.clone(),
                 )
                 .with_parent_context(id)
             })
@@ -561,7 +640,7 @@ pub trait DatabasePlugin: Send + Sync {
                 schema.clone(),
                 DbNodeType::Schema,
                 node.connection_id.clone(),
-                node.database_type,
+                node.database_type.clone(),
             )
             .with_parent_context(id)
             .with_metadata(metadata.clone());
@@ -597,7 +676,7 @@ pub trait DatabasePlugin: Send + Sync {
             "DbTree.Tables".to_string(),
             DbNodeType::TablesFolder,
             node.connection_id.clone(),
-            node.database_type,
+            node.database_type.clone(),
         )
         .with_parent_context(id)
         .with_metadata(metadata.clone());
@@ -617,7 +696,7 @@ pub trait DatabasePlugin: Send + Sync {
                         table_info.name.clone(),
                         DbNodeType::Table,
                         node.connection_id.clone(),
-                        node.database_type,
+                        node.database_type.clone(),
                     )
                     .with_parent_context(format!("{}:table_folder", id))
                     .with_metadata(meta)
@@ -636,7 +715,7 @@ pub trait DatabasePlugin: Send + Sync {
             "DbTree.Views".to_string(),
             DbNodeType::ViewsFolder,
             node.connection_id.clone(),
-            node.database_type,
+            node.database_type.clone(),
         )
         .with_parent_context(id)
         .with_metadata(metadata.clone());
@@ -654,7 +733,7 @@ pub trait DatabasePlugin: Send + Sync {
                         view.name.clone(),
                         DbNodeType::View,
                         node.connection_id.clone(),
-                        node.database_type,
+                        node.database_type.clone(),
                     )
                     .with_parent_context(format!("{}:views_folder", id));
 
@@ -682,7 +761,7 @@ pub trait DatabasePlugin: Send + Sync {
                 "DbTree.Functions".to_string(),
                 DbNodeType::FunctionsFolder,
                 node.connection_id.clone(),
-                node.database_type,
+                node.database_type.clone(),
             )
             .with_parent_context(id)
             .with_metadata(metadata.clone());
@@ -695,7 +774,7 @@ pub trait DatabasePlugin: Send + Sync {
                             func.name.clone(),
                             DbNodeType::Function,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(format!("{}:functions_folder", id))
                         .with_metadata(metadata.clone())
@@ -718,7 +797,7 @@ pub trait DatabasePlugin: Send + Sync {
                 "DbTree.Procedures".to_string(),
                 DbNodeType::ProceduresFolder,
                 node.connection_id.clone(),
-                node.database_type,
+                node.database_type.clone(),
             )
             .with_parent_context(id)
             .with_metadata(metadata.clone());
@@ -731,7 +810,7 @@ pub trait DatabasePlugin: Send + Sync {
                             proc.name.clone(),
                             DbNodeType::Procedure,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(format!("{}:procedures_folder", id))
                         .with_metadata(metadata.clone())
@@ -754,7 +833,7 @@ pub trait DatabasePlugin: Send + Sync {
                 "DbTree.Sequences".to_string(),
                 DbNodeType::SequencesFolder,
                 node.connection_id.clone(),
-                node.database_type,
+                node.database_type.clone(),
             )
             .with_parent_context(id)
             .with_metadata(metadata.clone());
@@ -780,7 +859,7 @@ pub trait DatabasePlugin: Send + Sync {
                             seq.name.clone(),
                             DbNodeType::Sequence,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(format!("{}:sequences_folder", id))
                         .with_metadata(seq_meta)
@@ -809,7 +888,7 @@ pub trait DatabasePlugin: Send + Sync {
             "DbTree.Queries".to_string(),
             DbNodeType::QueriesFolder,
             connection_id_for_queries.clone(),
-            node.database_type,
+            node.database_type.clone(),
         )
         .with_parent_context(node_id_for_queries.clone())
         .with_metadata(metadata);
@@ -900,7 +979,7 @@ pub trait DatabasePlugin: Send + Sync {
                             t.name.clone(),
                             DbNodeType::Table,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(id)
                         .with_metadata(meta)
@@ -921,7 +1000,7 @@ pub trait DatabasePlugin: Send + Sync {
                             v.name.clone(),
                             DbNodeType::View,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(id)
                         .with_metadata(meta)
@@ -941,7 +1020,7 @@ pub trait DatabasePlugin: Send + Sync {
                             f.name.clone(),
                             DbNodeType::Function,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(id)
                         .with_metadata(node.metadata.clone())
@@ -961,7 +1040,7 @@ pub trait DatabasePlugin: Send + Sync {
                             p.name.clone(),
                             DbNodeType::Procedure,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(id)
                         .with_metadata(node.metadata.clone())
@@ -1001,7 +1080,7 @@ pub trait DatabasePlugin: Send + Sync {
                             seq.name.clone(),
                             DbNodeType::Sequence,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_parent_context(id)
                         .with_metadata(meta)
@@ -1015,7 +1094,7 @@ pub trait DatabasePlugin: Send + Sync {
     async fn load_queries_children(&self, node: &DbNode, id: &str) -> Result<Vec<DbNode>> {
         let metadata = node.metadata.clone();
         let database_name = node.get_database_name().unwrap_or_default();
-        let database_type = node.database_type.as_str();
+        let database_type = node.database_type.path_key();
 
         let queries_dir = match get_queries_dir() {
             Ok(dir) => dir,
@@ -1060,7 +1139,7 @@ pub trait DatabasePlugin: Send + Sync {
                     file_name.clone(),
                     DbNodeType::NamedQuery,
                     node.connection_id.clone(),
-                    node.database_type,
+                    node.database_type.clone(),
                 )
                 .with_parent_context(id)
                 .with_metadata(meta);
@@ -1246,7 +1325,7 @@ pub trait DatabasePlugin: Send + Sync {
             display_prefix,
             folder_type,
             node.connection_id.clone(),
-            node.database_type,
+            node.database_type.clone(),
         )
         .with_parent_context(parent_id)
         .with_metadata(folder_metadata.clone());
@@ -1259,7 +1338,7 @@ pub trait DatabasePlugin: Send + Sync {
                         name,
                         node_type,
                         node.connection_id.clone(),
-                        node.database_type,
+                        node.database_type.clone(),
                     )
                     .with_metadata(meta)
                     .with_parent_context(&folder_id)
@@ -1300,7 +1379,7 @@ pub trait DatabasePlugin: Send + Sync {
                             c.name,
                             DbNodeType::Column,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_metadata(meta)
                         .with_parent_context(id)
@@ -1325,7 +1404,7 @@ pub trait DatabasePlugin: Send + Sync {
                             idx.name,
                             DbNodeType::Index,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_metadata(meta)
                         .with_parent_context(id)
@@ -1349,7 +1428,7 @@ pub trait DatabasePlugin: Send + Sync {
                             fk.name,
                             DbNodeType::ForeignKey,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_metadata(meta)
                         .with_parent_context(id)
@@ -1372,7 +1451,7 @@ pub trait DatabasePlugin: Send + Sync {
                             t.name,
                             DbNodeType::Trigger,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_metadata(meta)
                         .with_parent_context(id)
@@ -1396,7 +1475,7 @@ pub trait DatabasePlugin: Send + Sync {
                             c.name,
                             DbNodeType::Check,
                             node.connection_id.clone(),
-                            node.database_type,
+                            node.database_type.clone(),
                         )
                         .with_metadata(meta)
                         .with_parent_context(id)
@@ -2216,6 +2295,10 @@ pub trait DatabasePlugin: Send + Sync {
         )
     }
 
+    async fn drop_database_async(&self, database: &str) -> Result<String> {
+        Ok(self.drop_database(database))
+    }
+
     /// Drop table
     fn drop_table(&self, database: &str, schema: Option<&str>, table: &str) -> String {
         // Default implementation for MySQL/ClickHouse: database.table
@@ -2272,6 +2355,19 @@ pub trait DatabasePlugin: Send + Sync {
     /// Build CREATE TABLE SQL from TableDesign
     fn build_create_table_sql(&self, design: &TableDesign) -> String;
 
+    /// Build CREATE TABLE SQL through an async-capable path.
+    ///
+    /// The default implementation deliberately calls the synchronous local builder.
+    /// External IPC plugins can override this to ask the driver for dialect-specific
+    /// SQL without forcing synchronous UI preview code to block on IPC.
+    async fn build_create_table_sql_async(
+        &self,
+        _connection: &dyn DbConnection,
+        design: &TableDesign,
+    ) -> Result<String> {
+        Ok(self.build_create_table_sql(design))
+    }
+
     /// Build ALTER TABLE SQL from original and new TableDesign
     /// Returns a series of ALTER TABLE statements for the differences
     fn build_alter_table_sql(&self, original: &TableDesign, new: &TableDesign) -> String;
@@ -2312,6 +2408,21 @@ pub trait DatabasePlugin: Send + Sync {
             })
             .collect();
         merge_alter_sql(base_sql, rename_statements)
+    }
+
+    /// Async-capable ALTER TABLE builder.
+    ///
+    /// Use this in execution paths that already run off the UI thread. Synchronous
+    /// preview paths should keep using [`DatabasePlugin::build_alter_table_sql_with_renames`]
+    /// so methods that do not require a connection never block on IPC.
+    async fn build_alter_table_sql_with_renames_async(
+        &self,
+        _connection: &dyn DbConnection,
+        original: &TableDesign,
+        new: &TableDesign,
+        column_renames: &[(String, String)],
+    ) -> Result<String> {
+        Ok(self.build_alter_table_sql_with_renames(original, new, column_renames))
     }
 
     /// Check if a column definition has changed
@@ -2801,6 +2912,16 @@ mod tests {
         assert!(capabilities.supports_procedures);
     }
 
+    #[test]
+    fn mysql_plugin_exposes_split_plugin_traits() {
+        let plugin = MySqlPlugin::new();
+        assert_eq!(DatabaseType::MySQL, plugin.name());
+        assert_eq!("`users`", plugin.quote_identifier("users"));
+        assert!(plugin.capabilities().supports_functions);
+
+        assert_eq!(" LIMIT 10 OFFSET 20", plugin.format_pagination(10, 20, ""));
+    }
+
     // ==================== is_query_stmt tests (AST-based) ====================
 
     #[test]
@@ -2900,7 +3021,7 @@ mod tests {
  ------------------------------------------------------------------------
 "#;
 
-        assert!(plugin.split_sql_statements(sql).is_empty());
+        assert!(DatabasePlugin::split_sql_statements(&plugin, sql).is_empty());
     }
 
     // ==================== classify_stmt tests (AST-based) ====================

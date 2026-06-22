@@ -32,9 +32,16 @@ use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
     ActiveConnections, ConnectionRepository, ConnectionType, DatabaseType, GlobalStorageState,
-    PendingCloudDeletionRepository, StoredConnection, Workspace, WorkspaceRepository,
+    PendingCloudDeletionRepository, RemoteDesktopParams,
+    RemoteDesktopProtocol as StoredRemoteDesktopProtocol, StoredConnection, Workspace,
+    WorkspaceRepository,
 };
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent};
+use port_forwarding::{
+    DynamicForwardingRequest, LocalForwardingRequest, PortForwardingRuntime,
+    build_dynamic_forwarding_request, build_local_forwarding_request,
+};
+use port_forwarding_view::{PortForwardingFormWindow, PortForwardingFormWindowConfig};
 use redis_view::{RedisFormWindow, RedisFormWindowConfig};
 use rust_i18n::t;
 use terminal_view::{SerialFormWindow, SerialFormWindowConfig};
@@ -47,6 +54,9 @@ use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home::home_workspace_filter::WorkspaceFilterDelegate;
 use crate::license::{get_license_service, is_feature_enabled};
 use crate::new_connection::NewConnectionWindow;
+use crate::new_connection::remote_desktop_form::{
+    RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
+};
 use crate::setting_tab::GlobalCurrentUser;
 
 actions!(home_tab, [OpenConnectionQuickOpen, NewConnectionShortcut]);
@@ -153,6 +163,96 @@ pub struct HomePage {
     master_key_unlock_prompt_pending: bool,
     /// 防止主密钥对话框被启动提示和用户点击重复打开。
     master_key_dialog_open: bool,
+    port_forwarding_runtime: Arc<tokio::sync::Mutex<PortForwardingRuntime>>,
+}
+
+fn external_driver_id_for_connection_form(
+    db_type: &DatabaseType,
+    editing_conn: Option<&StoredConnection>,
+) -> Option<String> {
+    db_type
+        .external_driver_id()
+        .map(str::to_string)
+        .or_else(|| {
+            editing_conn
+                .and_then(|connection| connection.to_db_connection().ok())
+                .and_then(|config| {
+                    config
+                        .database_type
+                        .external_driver_id()
+                        .map(str::to_string)
+                })
+        })
+}
+
+#[cfg(test)]
+mod external_driver_form_tests {
+    use super::*;
+    use one_core::storage::DbConnectionConfig;
+
+    fn stored_external_connection(driver_id: &str) -> StoredConnection {
+        StoredConnection::new_database(
+            "demo".to_string(),
+            DbConnectionConfig {
+                id: String::new(),
+                database_type: DatabaseType::external(driver_id),
+                name: "demo".to_string(),
+                host: "localhost".to_string(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                database: None,
+                service_name: None,
+                sid: None,
+                workspace_id: None,
+                extra_params: std::collections::HashMap::new(),
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn external_driver_id_for_connection_form_uses_editing_connection() {
+        let connection = stored_external_connection("dm");
+
+        assert_eq!(
+            Some("dm".to_string()),
+            external_driver_id_for_connection_form(&DatabaseType::MySQL, Some(&connection))
+        );
+    }
+
+    #[test]
+    fn remote_desktop_connection_info_uses_remote_desktop_params() {
+        let params = RemoteDesktopParams {
+            protocol: StoredRemoteDesktopProtocol::Rdp,
+            host: "10.0.0.8".to_string(),
+            port: 3389,
+            username: Some("administrator".to_string()),
+            password: None,
+            domain: None,
+            read_only: false,
+        };
+
+        assert_eq!(
+            "administrator@10.0.0.8:3389",
+            remote_desktop_connection_info(&params)
+        );
+    }
+
+    #[test]
+    fn remote_desktop_connection_info_omits_missing_username() {
+        let params = RemoteDesktopParams {
+            protocol: StoredRemoteDesktopProtocol::Vnc,
+            host: "10.0.0.9".to_string(),
+            port: 5900,
+            username: None,
+            password: None,
+            domain: None,
+            read_only: false,
+        };
+
+        assert_eq!("10.0.0.9:5900", remote_desktop_connection_info(&params));
+    }
 }
 
 impl HomePage {
@@ -210,6 +310,9 @@ impl HomePage {
             auth_error: None,
             master_key_unlock_prompt_pending: false,
             master_key_dialog_open: false,
+            port_forwarding_runtime: Arc::new(
+                tokio::sync::Mutex::new(PortForwardingRuntime::new()),
+            ),
         };
 
         // 异步加载工作区
@@ -1174,7 +1277,7 @@ impl HomePage {
         let list_for_focus = list.clone();
         window.open_dialog(cx, move |dialog, _window, cx| {
             dialog
-                .title("打开连接".to_string())
+                .title(t!("Home.open_connection").to_string())
                 .w(px(520.0))
                 .child(
                     v_flex().gap_2().child(
@@ -1226,12 +1329,31 @@ impl HomePage {
             return;
         }
 
+        let connection = connection.clone();
+        self.touch_connection_last_used(connection.id, cx);
         let workspace = connection
             .workspace_id
             .and_then(|id| self.workspaces.iter().find(|w| w.id == Some(id)).cloned());
-        let strategy = build_connection_open_strategy(connection.clone(), workspace);
+        let strategy = build_connection_open_strategy(connection, workspace);
         strategy.open(self, window, cx);
         cx.notify();
+    }
+
+    fn touch_connection_last_used(&mut self, connection_id: Option<i64>, cx: &mut Context<Self>) {
+        let Some(connection_id) = connection_id else {
+            return;
+        };
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let result = storage
+            .get::<ConnectionRepository>()
+            .ok_or_else(|| anyhow::anyhow!("ConnectionRepository not found"))
+            .and_then(|repo| repo.touch_last_used(connection_id));
+
+        if let Err(err) = result {
+            tracing::warn!("更新连接最近使用时间失败: {err}");
+            return;
+        }
+        self.load_connections(cx);
     }
 
     pub(crate) fn handle_save_workspace(
@@ -1440,13 +1562,40 @@ impl HomePage {
         let editing_conn = self
             .editing_connection_id
             .and_then(|id| self.connections.iter().find(|c| c.id == Some(id)).cloned());
+        if let Some(driver_id) =
+            external_driver_id_for_connection_form(&db_type, editing_conn.as_ref())
+        {
+            if db::ipc::IpcDriverRegistry::load_default()
+                .find(&driver_id)
+                .is_none()
+            {
+                let connection_name = editing_conn
+                    .as_ref()
+                    .map(|connection| connection.name.clone())
+                    .unwrap_or_else(|| driver_id.clone());
+                extension_runtime::database_driver_install::prompt_install_database_driver(
+                    driver_id,
+                    connection_name,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        let ssh_connections = self
+            .connections
+            .iter()
+            .filter(|connection| connection.connection_type == ConnectionType::SshSftp)
+            .cloned()
+            .collect();
 
         let config = ConnectionFormWindowConfig {
-            db_type,
+            db_type: db_type.clone(),
             external_driver_id: None,
             editing_connection: editing_conn,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
+            ssh_connections,
         };
 
         self.editing_connection_id = None;
@@ -1595,6 +1744,200 @@ impl HomePage {
             })
             .size(700.0, 600.0),
             move |window, cx| cx.new(|cx| SerialFormWindow::new(config, window, cx)),
+            cx,
+        );
+    }
+
+    pub(crate) fn show_port_forwarding_form(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
+            return;
+        }
+
+        let editing_connection = self.editing_connection_id.and_then(|id| {
+            self.connections
+                .iter()
+                .find(|c| c.id == Some(id) && c.connection_type == ConnectionType::PortForwarding)
+                .cloned()
+        });
+        let ssh_connections = self
+            .connections
+            .iter()
+            .filter(|connection| connection.connection_type == ConnectionType::SshSftp)
+            .cloned()
+            .collect();
+
+        let config = PortForwardingFormWindowConfig {
+            editing_connection,
+            ssh_connections,
+            workspaces: self.workspaces.clone(),
+            teams: get_cached_team_options(cx),
+        };
+
+        self.editing_connection_id = None;
+
+        open_popup_window(
+            PopupWindowOptions::new(if config.editing_connection.is_some() {
+                t!("PortForwarding.edit").to_string()
+            } else {
+                t!("PortForwarding.new").to_string()
+            })
+            .size(700.0, 520.0),
+            move |window, cx| cx.new(|cx| PortForwardingFormWindow::new(config, window, cx)),
+            cx,
+        );
+    }
+
+    pub(crate) fn open_port_forwarding(
+        &mut self,
+        connection: StoredConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let connection_name = connection.name.clone();
+        let Some(connection_id) = connection.id else {
+            window.push_notification(
+                t!(
+                    "Home.port_forwarding_failed",
+                    name = connection_name,
+                    error = "missing connection id"
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        };
+        let params = match connection.to_port_forwarding_params() {
+            Ok(params) => params,
+            Err(error) => {
+                window.push_notification(
+                    t!(
+                        "Home.port_forwarding_failed",
+                        name = connection_name,
+                        error = error.to_string()
+                    )
+                    .to_string(),
+                    cx,
+                );
+                return;
+            }
+        };
+        let Some(ssh_connection) = self
+            .connections
+            .iter()
+            .find(|conn| conn.id == Some(params.ssh_connection_id))
+            .cloned()
+        else {
+            window.push_notification(t!("Home.port_forwarding_missing_ssh").to_string(), cx);
+            return;
+        };
+
+        enum StartRequest {
+            Local(LocalForwardingRequest),
+            Dynamic(DynamicForwardingRequest),
+        }
+
+        let request = match params.kind {
+            one_core::storage::PortForwardingKind::Local => {
+                build_local_forwarding_request(&connection, &ssh_connection)
+                    .map(StartRequest::Local)
+            }
+            one_core::storage::PortForwardingKind::Dynamic => {
+                build_dynamic_forwarding_request(&connection, &ssh_connection)
+                    .map(StartRequest::Dynamic)
+            }
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                window.push_notification(
+                    t!(
+                        "Home.port_forwarding_failed",
+                        name = connection_name,
+                        error = error.to_string()
+                    )
+                    .to_string(),
+                    cx,
+                );
+                return;
+            }
+        };
+
+        let runtime = Arc::clone(&self.port_forwarding_runtime);
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let result = {
+                let mut runtime = runtime.lock().await;
+                match request {
+                    StartRequest::Local(request) => {
+                        runtime.start_local(connection_id, request).await
+                    }
+                    StartRequest::Dynamic(request) => {
+                        runtime.start_dynamic(connection_id, request).await
+                    }
+                }
+            };
+            if result.is_ok() {
+                let _ = cx.update(|cx| {
+                    cx.global_mut::<ActiveConnections>().add(connection_id);
+                });
+            }
+            let message = match result {
+                Ok(local_addr) => t!(
+                    "Home.port_forwarding_started",
+                    name = connection_name,
+                    addr = local_addr.to_string()
+                )
+                .to_string(),
+                Err(error) => t!(
+                    "Home.port_forwarding_failed",
+                    name = connection_name,
+                    error = error.to_string()
+                )
+                .to_string(),
+            };
+            push_notification_on_active_window(message, cx);
+        })
+        .detach();
+    }
+
+    pub(crate) fn show_remote_desktop_form(
+        &mut self,
+        protocol: StoredRemoteDesktopProtocol,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
+            return;
+        }
+
+        let connection_type = protocol.connection_type();
+        let editing_conn = self.editing_connection_id.and_then(|id| {
+            self.connections
+                .iter()
+                .find(|c| c.id == Some(id) && c.connection_type == connection_type)
+                .cloned()
+        });
+
+        let config = RemoteDesktopFormWindowConfig {
+            protocol,
+            editing_connection: editing_conn,
+            workspaces: self.workspaces.clone(),
+            teams: get_cached_team_options(cx),
+        };
+
+        self.editing_connection_id = None;
+
+        open_popup_window(
+            PopupWindowOptions::new(if config.editing_connection.is_some() {
+                t!("RemoteDesktopForm.title_edit", protocol = protocol.label()).to_string()
+            } else {
+                t!("RemoteDesktopForm.title_new", protocol = protocol.label()).to_string()
+            })
+            .size(700.0, 560.0),
+            move |window, cx| cx.new(|cx| RemoteDesktopFormWindow::new(config, window, cx)),
             cx,
         );
     }
@@ -1909,6 +2252,23 @@ impl HomePage {
                     }
                 }
             }
+            ConnectionType::Rdp | ConnectionType::Vnc => {
+                if let Ok(params) = conn.to_ssh_params() {
+                    if params.host.to_lowercase().contains(query) {
+                        return true;
+                    }
+                    if params.port.to_string().contains(query) {
+                        return true;
+                    }
+                    if params.username.to_lowercase().contains(query) {
+                        return true;
+                    }
+                    let conn_str = format!("{}@{}:{}", params.username, params.host, params.port);
+                    if conn_str.to_lowercase().contains(query) {
+                        return true;
+                    }
+                }
+            }
             ConnectionType::Redis => {
                 if let Ok(params) = conn.to_redis_params() {
                     if params.host.to_lowercase().contains(query) {
@@ -1953,11 +2313,50 @@ impl HomePage {
                     }
                 }
             }
+            ConnectionType::PortForwarding => {
+                if let Ok(params) = conn.to_port_forwarding_params() {
+                    if port_forwarding_connection_info(&params)
+                        .to_lowercase()
+                        .contains(query)
+                    {
+                        return true;
+                    }
+                }
+            }
             _ => {}
         }
 
         false
     }
+}
+
+fn remote_desktop_connection_info(params: &RemoteDesktopParams) -> String {
+    match params.username.as_deref() {
+        Some(username) => format!("{}@{}:{}", username, params.host, params.port),
+        None => format!("{}:{}", params.host, params.port),
+    }
+}
+
+fn port_forwarding_connection_info(params: &one_core::storage::PortForwardingParams) -> String {
+    match params.kind {
+        one_core::storage::PortForwardingKind::Local => format!(
+            "{}:{} -> {}:{}",
+            params.bind_host, params.bind_port, params.target_host, params.target_port
+        ),
+        one_core::storage::PortForwardingKind::Dynamic => {
+            format!("SOCKS {}:{}", params.bind_host, params.bind_port)
+        }
+    }
+}
+
+fn push_notification_on_active_window(message: String, cx: &mut AsyncApp) {
+    let _ = cx.update(|cx| {
+        if let Some(window_id) = cx.active_window() {
+            let _ = cx.update_window(window_id, |_, window, cx| {
+                window.push_notification(message.clone(), cx);
+            });
+        }
+    });
 }
 
 impl Focusable for HomePage {

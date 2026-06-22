@@ -2,11 +2,13 @@ use crate::cache::CacheContext;
 use crate::cache_manager::GlobalNodeCache;
 use crate::clickhouse::ClickHousePlugin;
 use crate::connection::{DbConnection, DbError, StreamingProgress};
+use crate::connection_config_resolver::ConnectionConfigResolver;
+#[cfg(feature = "builtin-duckdb")]
 use crate::duckdb::DuckDbPlugin;
 use crate::import_export::{
     ExportConfig, ExportProgressSender, ExportResult, ImportConfig, ImportResult,
 };
-use crate::ipc::ExternalDatabasePlugin;
+use crate::ipc::{ExternalDatabasePlugin, IpcDriverRegistry};
 use crate::mssql::MsSqlPlugin;
 use crate::mysql::MySqlPlugin;
 use crate::oracle::OraclePlugin;
@@ -15,19 +17,24 @@ use crate::plugin_manifest::DatabaseCapabilities;
 use crate::postgresql::PostgresPlugin;
 use crate::sqlite::SqlitePlugin;
 use crate::{
-    DbNode, DbNodeType, ExecOptions, SqlErrorInfo, SqlResult, SqlSource, TableSaveResponse,
+    DbNode, DbNodeType, ExecOptions, SqlErrorInfo, SqlResult, SqlSource, TableDesign,
+    TableSaveResponse,
 };
 use dashmap::DashMap;
 use gpui::{AppContext, AsyncApp, Global};
 use one_core::connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifier};
 use one_core::gpui_tokio::Tokio;
-use one_core::storage::{DatabaseType, DbConnectionConfig};
+use one_core::storage::{ConnectionRepository, DatabaseType, DbConnectionConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+type ExternalRegistryReloader = dyn Fn() -> IpcDriverRegistry + Send + Sync;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, mpsc};
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+
+const BUSY_CLOSE_ON_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Macro to reduce boilerplate for plugin operations with session management
 macro_rules! with_plugin_session {
@@ -156,20 +163,45 @@ pub struct DbManager {
     clickhouse: Arc<dyn DatabasePlugin>,
     mssql: Arc<dyn DatabasePlugin>,
     oracle: Arc<dyn DatabasePlugin>,
-    external: Arc<dyn DatabasePlugin>,
+    external_drivers: HashMap<String, Arc<dyn DatabasePlugin>>,
+    external_registry_reloader: Arc<ExternalRegistryReloader>,
 }
 
 impl DbManager {
     pub fn new() -> Self {
+        Self::with_external_registry(IpcDriverRegistry::load_default())
+    }
+
+    fn with_external_registry(registry: IpcDriverRegistry) -> Self {
+        Self::with_external_registry_reloader(registry, Arc::new(IpcDriverRegistry::load_default))
+    }
+
+    fn with_external_registry_reloader(
+        registry: IpcDriverRegistry,
+        external_registry_reloader: Arc<ExternalRegistryReloader>,
+    ) -> Self {
+        let external_drivers = registry
+            .drivers()
+            .iter()
+            .map(|driver| {
+                (
+                    driver.id.clone(),
+                    Arc::new(ExternalDatabasePlugin::for_driver(driver.clone()))
+                        as Arc<dyn DatabasePlugin>,
+                )
+            })
+            .collect();
+
         Self {
             mysql: Arc::new(MySqlPlugin::new()),
             postgresql: Arc::new(PostgresPlugin::new()),
             sqlite: Arc::new(SqlitePlugin::new()),
-            duckdb: Arc::new(DuckDbPlugin::new()),
+            duckdb: default_duckdb_plugin(&registry),
             clickhouse: Arc::new(ClickHousePlugin::new()),
             mssql: Arc::new(MsSqlPlugin::new()),
             oracle: Arc::new(OraclePlugin::new()),
-            external: Arc::new(ExternalDatabasePlugin::new()),
+            external_drivers,
+            external_registry_reloader,
         }
     }
 
@@ -182,9 +214,34 @@ impl DbManager {
             DatabaseType::ClickHouse => Ok(Arc::clone(&self.clickhouse)),
             DatabaseType::MSSQL => Ok(Arc::clone(&self.mssql)),
             DatabaseType::Oracle => Ok(Arc::clone(&self.oracle)),
-            DatabaseType::External => Ok(Arc::clone(&self.external)),
+            DatabaseType::External { driver_id } => {
+                if let Some(driver) = (self.external_registry_reloader)().find(driver_id) {
+                    return Ok(Arc::new(ExternalDatabasePlugin::for_driver(driver))
+                        as Arc<dyn DatabasePlugin>);
+                }
+                if let Some(plugin) = self.external_drivers.get(driver_id).cloned() {
+                    return Ok(plugin);
+                }
+                Err(DbError::connection(format!(
+                    "external driver '{}' not found",
+                    driver_id
+                )))
+            }
         }
     }
+}
+
+#[cfg(feature = "builtin-duckdb")]
+fn default_duckdb_plugin(_registry: &IpcDriverRegistry) -> Arc<dyn DatabasePlugin> {
+    Arc::new(DuckDbPlugin::new())
+}
+
+#[cfg(not(feature = "builtin-duckdb"))]
+fn default_duckdb_plugin(registry: &IpcDriverRegistry) -> Arc<dyn DatabasePlugin> {
+    Arc::new(ExternalDatabasePlugin::with_registry_reloader(
+        registry.clone(),
+        Arc::new(IpcDriverRegistry::load_default),
+    ))
 }
 
 impl Default for DbManager {
@@ -203,7 +260,8 @@ impl Clone for DbManager {
             clickhouse: Arc::clone(&self.clickhouse),
             mssql: Arc::clone(&self.mssql),
             oracle: Arc::clone(&self.oracle),
-            external: Arc::clone(&self.external),
+            external_drivers: self.external_drivers.clone(),
+            external_registry_reloader: Arc::clone(&self.external_registry_reloader),
         }
     }
 }
@@ -211,6 +269,7 @@ impl Clone for DbManager {
 /// Connection session - represents a single database connection
 struct ConnectionSession {
     connection: Box<dyn DbConnection + Send + Sync>,
+    close_on_release: bool,
     last_active: Instant,
     created_at: Instant,
     session_id: String,
@@ -218,10 +277,15 @@ struct ConnectionSession {
 }
 
 impl ConnectionSession {
-    fn new(connection: Box<dyn DbConnection + Send + Sync>, session_id: String) -> Self {
+    fn new(
+        connection: Box<dyn DbConnection + Send + Sync>,
+        session_id: String,
+        close_on_release: bool,
+    ) -> Self {
         let now = Instant::now();
         Self {
             connection,
+            close_on_release,
             last_active: now,
             created_at: now,
             session_id,
@@ -291,6 +355,10 @@ impl ConnectionSession {
 pub struct ConnectionManager {
     /// config_id -> list of sessions for that config
     sessions: Arc<RwLock<HashMap<String, Vec<ConnectionSession>>>>,
+    /// Per file-backed database lock used to serialize physical opens before a session is visible.
+    physical_open_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// Converts stored connection configs into runtime configs before opening sessions.
+    config_resolver: ConnectionConfigResolver,
     /// Connection idle timeout (default: 5 minutes)
     idle_timeout: Duration,
     /// Maximum connection lifetime (default: 30 minutes)
@@ -301,17 +369,34 @@ pub struct ConnectionManager {
 
 impl ConnectionManager {
     pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            idle_timeout: Duration::from_secs(300), // 5 minutes
-            max_lifetime: Duration::from_secs(1800), // 30 minutes
-            session_counter: Arc::new(tokio::sync::Mutex::new(0)),
-        }
+        Self::with_config_resolver(ConnectionConfigResolver::default())
+    }
+
+    pub fn with_config_resolver(config_resolver: ConnectionConfigResolver) -> Self {
+        Self::with_config_and_resolver(
+            Duration::from_secs(300),
+            Duration::from_secs(1800),
+            config_resolver,
+        )
     }
 
     pub fn with_config(idle_timeout: Duration, max_lifetime: Duration) -> Self {
+        Self::with_config_and_resolver(
+            idle_timeout,
+            max_lifetime,
+            ConnectionConfigResolver::default(),
+        )
+    }
+
+    fn with_config_and_resolver(
+        idle_timeout: Duration,
+        max_lifetime: Duration,
+        config_resolver: ConnectionConfigResolver,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            physical_open_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            config_resolver,
             idle_timeout,
             max_lifetime,
             session_counter: Arc::new(tokio::sync::Mutex::new(0)),
@@ -332,8 +417,14 @@ impl ConnectionManager {
         db_manager: &DbManager,
     ) -> Result<String, DbError> {
         let session_started = Instant::now();
+        let config = self.config_resolver.resolve(config)?;
+        let plugin = db_manager.get_plugin(&config.database_type)?;
+        let lifecycle = plugin.connection_lifecycle(&config);
+        let _physical_open_guard = self
+            .physical_open_guard(lifecycle.physical_open_lock_key.as_deref())
+            .await;
         let config_id = config.id.clone();
-        let database_type = config.database_type;
+        let database_type = config.database_type.clone();
         let database = config.database.clone();
 
         // Try to acquire an existing session and switch database if needed
@@ -352,7 +443,6 @@ impl ConnectionManager {
         let session_id = self.generate_session_id(&config_id).await;
 
         // Create new connection
-        let plugin = db_manager.get_plugin(&config.database_type)?;
         let connect_started = Instant::now();
         let connection = plugin.create_connection(config.clone()).await?;
         info!(
@@ -369,7 +459,8 @@ impl ConnectionManager {
         );
 
         // Store session
-        let mut session = ConnectionSession::new(connection, session_id.clone());
+        let mut session =
+            ConnectionSession::new(connection, session_id.clone(), lifecycle.close_on_release);
         session.mark_in_use();
 
         let mut sessions = self.sessions.write().await;
@@ -386,6 +477,20 @@ impl ConnectionManager {
             session_started.elapsed().as_millis()
         );
         Ok(session_id)
+    }
+
+    async fn physical_open_guard(&self, key: Option<&str>) -> Option<OwnedMutexGuard<()>> {
+        let key = key?;
+        let lock = {
+            let mut locks = self.physical_open_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(key.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+
+        Some(lock.lock_owned().await)
     }
 
     /// Get mutable access to a session's connection
@@ -429,52 +534,67 @@ impl ConnectionManager {
         &self,
         config: &DbConnectionConfig,
     ) -> Result<Option<String>, DbError> {
-        let mut sessions = self.sessions.write().await;
+        loop {
+            let mut sessions = self.sessions.write().await;
+            let mut has_busy_close_on_release_session = false;
 
-        let remove_config_entry = {
-            let Some(session_list) = sessions.get_mut(&config.id) else {
-                return Ok(None);
+            let remove_config_entry = {
+                let Some(session_list) = sessions.get_mut(&config.id) else {
+                    return Ok(None);
+                };
+
+                let mut index = 0;
+                while index < session_list.len() {
+                    let session = &session_list[index];
+                    let matches_database = Self::db_equals(session.connection.config(), config);
+                    if matches_database && session.in_use && session.close_on_release {
+                        has_busy_close_on_release_session = true;
+                        index += 1;
+                        continue;
+                    }
+                    let matches_config = !session.in_use && matches_database;
+
+                    if !matches_config {
+                        index += 1;
+                        continue;
+                    }
+
+                    if let Err(error) = session.connection.ping().await {
+                        let mut session = session_list.remove(index);
+                        warn!(
+                            "Discarding stale session {} before reuse: {}",
+                            session.session_id, error
+                        );
+                        session.close().await;
+                        continue;
+                    }
+
+                    let session = &mut session_list[index];
+                    session.mark_in_use();
+
+                    debug!(
+                        "Reusing session: {} (database: {:?})",
+                        session.session_id, config.database
+                    );
+                    return Ok(Some(session.session_id.clone()));
+                }
+
+                session_list.is_empty()
             };
 
-            let mut index = 0;
-            while index < session_list.len() {
-                let session = &session_list[index];
-                let matches_config =
-                    !session.in_use && Self::db_equals(session.connection.config(), config);
-
-                if !matches_config {
-                    index += 1;
-                    continue;
-                }
-
-                if let Err(error) = session.connection.ping().await {
-                    let mut session = session_list.remove(index);
-                    warn!(
-                        "Discarding stale session {} before reuse: {}",
-                        session.session_id, error
-                    );
-                    session.close().await;
-                    continue;
-                }
-
-                let session = &mut session_list[index];
-                session.mark_in_use();
-
-                debug!(
-                    "Reusing session: {} (database: {:?})",
-                    session.session_id, config.database
-                );
-                return Ok(Some(session.session_id.clone()));
+            if remove_config_entry {
+                sessions.remove(&config.id);
             }
 
-            session_list.is_empty()
-        };
+            drop(sessions);
 
-        if remove_config_entry {
-            sessions.remove(&config.id);
+            if has_busy_close_on_release_session {
+                sleep(BUSY_CLOSE_ON_RELEASE_RETRY_DELAY).await;
+                continue;
+            }
+
+            return Ok(None);
         }
-
-        Ok(None)
     }
 }
 
@@ -537,7 +657,7 @@ impl ConnectionManager {
                 let session = &mut session_list[pos];
                 match session.verify_and_sync_database().await {
                     Ok(_) => {
-                        if close_idle_file_connection && session.connection.close_on_release() {
+                        if close_idle_file_connection && session.close_on_release {
                             removed_session = Some(session_list.remove(pos));
                             if session_list.is_empty() {
                                 empty_config_id = Some(config_id.clone());
@@ -714,6 +834,8 @@ impl Clone for ConnectionManager {
     fn clone(&self) -> Self {
         Self {
             sessions: Arc::clone(&self.sessions),
+            physical_open_locks: Arc::clone(&self.physical_open_locks),
+            config_resolver: self.config_resolver.clone(),
             idle_timeout: self.idle_timeout,
             max_lifetime: self.max_lifetime,
             session_counter: Arc::clone(&self.session_counter),
@@ -739,26 +861,13 @@ pub struct SessionInfo {
     pub lifetime: Duration,
 }
 
-/// Connection pool compatibility layer
-#[derive(Clone)]
-pub struct ConnectionPool {
-    db_manager: DbManager,
-}
-
-impl ConnectionPool {
-    pub fn new(db_manager: DbManager) -> Self {
-        Self { db_manager }
-    }
-
-    pub async fn get_connection(
-        &self,
-        config: DbConnectionConfig,
-        _db_manager: &DbManager,
-    ) -> anyhow::Result<Arc<RwLock<Box<dyn DbConnection + Send + Sync>>>> {
-        let plugin = self.db_manager.get_plugin(&config.database_type)?;
-        let connection = plugin.create_connection(config).await?;
-        Ok(Arc::new(RwLock::new(connection)))
-    }
+/// Safe connection metadata for extension and UI callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbConnectionSummary {
+    pub id: String,
+    pub name: String,
+    pub database_type: DatabaseType,
+    pub database: Option<String>,
 }
 
 /// Global database state - stores DbManager and ConnectionManager
@@ -766,20 +875,26 @@ impl ConnectionPool {
 pub struct GlobalDbState {
     pub db_manager: DbManager,
     pub connection_manager: ConnectionManager,
-    pub connection_pool: ConnectionPool,
     /// connection_id -> config mapping
     connections: Arc<DashMap<String, DbConnectionConfig>>,
 }
 
 impl GlobalDbState {
     pub fn new() -> Self {
-        let manager = ConnectionManager::new();
+        Self::with_config_resolver(ConnectionConfigResolver::default())
+    }
+
+    pub fn with_connection_repository(connection_repo: Option<Arc<ConnectionRepository>>) -> Self {
+        Self::with_config_resolver(ConnectionConfigResolver::new(connection_repo))
+    }
+
+    fn with_config_resolver(config_resolver: ConnectionConfigResolver) -> Self {
+        let manager = ConnectionManager::with_config_resolver(config_resolver);
         let db_manager = DbManager::new();
 
         Self {
             db_manager: db_manager.clone(),
             connection_manager: manager,
-            connection_pool: ConnectionPool::new(db_manager),
             connections: Arc::new(DashMap::new()),
         }
     }
@@ -808,6 +923,24 @@ impl GlobalDbState {
         None
     }
 
+    pub fn list_connection_summaries(&self) -> Vec<DbConnectionSummary> {
+        let mut summaries = self
+            .connections
+            .iter()
+            .map(|entry| {
+                let config = entry.value();
+                DbConnectionSummary {
+                    id: config.id.clone(),
+                    name: config.name.clone(),
+                    database_type: config.database_type.clone(),
+                    database: config.database.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| left.id.cmp(&right.id));
+        summaries
+    }
+
     pub fn get_plugin(
         &self,
         database_type: &DatabaseType,
@@ -832,7 +965,7 @@ impl GlobalDbState {
             .get_config(&config_id)
             .ok_or_else(|| anyhow::anyhow!("Connection not found: {}", config_id))?;
         let plugin = self.get_plugin(&config.database_type)?;
-        let sql = plugin.drop_database(&database_name);
+        let sql = plugin.drop_database_async(&database_name).await?;
 
         let result = self.execute_with_session(cx, config, sql, None).await?;
 
@@ -986,6 +1119,23 @@ impl GlobalDbState {
         .await
     }
 
+    pub async fn create_session_direct(
+        &self,
+        connection_id: String,
+        database: Option<String>,
+    ) -> anyhow::Result<String> {
+        let mut config = self
+            .get_config(&connection_id)
+            .ok_or_else(|| anyhow::anyhow!("Connection not found: {}", connection_id))?;
+        if let Some(database) = database {
+            config.database = Some(database);
+        }
+        self.connection_manager
+            .create_session(config, &self.db_manager)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
     /// Execute SQL  (simplified - creates session per execution)
     pub async fn execute_single(
         &self,
@@ -1040,6 +1190,166 @@ impl GlobalDbState {
     ) -> anyhow::Result<Vec<SqlResult>> {
         self.execute_with_session_internal(cx, config, script, opts, None)
             .await
+    }
+
+    pub async fn execute_session(
+        &self,
+        session_id: String,
+        script: String,
+        opts: Option<ExecOptions>,
+    ) -> anyhow::Result<Vec<SqlResult>> {
+        let config = self
+            .connection_manager
+            .get_session_config(&session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+        let plugin = self.get_plugin(&config.database_type)?;
+        let mut guard = self
+            .connection_manager
+            .get_session_connection(&session_id)
+            .await?;
+        let conn = guard
+            .connection()
+            .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
+        conn.execute(plugin.as_ref(), &script, opts.unwrap_or_default())
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    pub async fn list_databases_direct(
+        &self,
+        connection_id: String,
+    ) -> anyhow::Result<Vec<String>> {
+        let config = self
+            .get_config(&connection_id)
+            .ok_or_else(|| anyhow::anyhow!("Connection not found: {}", connection_id))?;
+        let plugin = self.get_plugin(&config.database_type)?;
+        let session_id = self
+            .connection_manager
+            .create_session(config, &self.db_manager)
+            .await?;
+        let result = async {
+            let mut guard = self
+                .connection_manager
+                .get_session_connection(&session_id)
+                .await?;
+            let conn = guard
+                .connection()
+                .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
+            plugin
+                .list_databases(&*conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        }
+        .await;
+        self.connection_manager.close_session(&session_id).await?;
+        result
+    }
+
+    pub async fn list_schemas_direct(
+        &self,
+        connection_id: String,
+        database: String,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut config = self
+            .get_config(&connection_id)
+            .ok_or_else(|| anyhow::anyhow!("Connection not found: {}", connection_id))?;
+        if config.database_type != DatabaseType::Oracle {
+            config.database = Some(database.clone());
+        }
+        let plugin = self.get_plugin(&config.database_type)?;
+        let session_id = self
+            .connection_manager
+            .create_session(config, &self.db_manager)
+            .await?;
+        let result = async {
+            let mut guard = self
+                .connection_manager
+                .get_session_connection(&session_id)
+                .await?;
+            let conn = guard
+                .connection()
+                .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
+            plugin
+                .list_schemas(&*conn, &database)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        }
+        .await;
+        self.connection_manager.close_session(&session_id).await?;
+        result
+    }
+
+    /// Build table-designer DDL SQL on an async path.
+    ///
+    /// This keeps synchronous preview builders local, while allowing external IPC
+    /// drivers to provide dialect-specific DDL through `ddl/build_*` without
+    /// blocking the UI thread.
+    pub async fn build_table_design_sql(
+        &self,
+        cx: &mut AsyncApp,
+        connection_id: String,
+        database: String,
+        schema: Option<String>,
+        original: Option<TableDesign>,
+        design: TableDesign,
+        column_renames: Vec<(String, String)>,
+    ) -> anyhow::Result<String> {
+        let mut config = self
+            .get_config(&connection_id)
+            .ok_or_else(|| anyhow::anyhow!("Connection not found: {}", connection_id))?;
+
+        if config.database_type != DatabaseType::Oracle {
+            config.database = Some(database);
+        }
+
+        let clone_self = self.clone();
+        Tokio::spawn_result(cx, async move {
+            let plugin = clone_self.get_plugin(&config.database_type)?;
+            let session_id = clone_self
+                .connection_manager
+                .create_session(config, &clone_self.db_manager)
+                .await?;
+
+            let result = async {
+                let mut guard = clone_self
+                    .connection_manager
+                    .get_session_connection(&session_id)
+                    .await?;
+                let conn = guard
+                    .connection()
+                    .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
+
+                if let Some(schema) = &schema {
+                    conn.switch_schema(schema)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("Failed to switch schema: {}", error))?;
+                }
+
+                match original.as_ref() {
+                    Some(original) => {
+                        plugin
+                            .build_alter_table_sql_with_renames_async(
+                                conn,
+                                original,
+                                &design,
+                                &column_renames,
+                            )
+                            .await
+                    }
+                    None => plugin.build_create_table_sql_async(conn, &design).await,
+                }
+            }
+            .await;
+
+            let close_result = clone_self
+                .connection_manager
+                .close_session(&session_id)
+                .await;
+            close_result?;
+            result
+        })
+        .await
     }
 
     async fn execute_with_session_internal(
@@ -1997,6 +2307,18 @@ impl GlobalDbState {
         })
     }
 
+    /// List functions
+    pub async fn list_functions(
+        &self,
+        cx: &mut AsyncApp,
+        connection_id: String,
+        database: String,
+    ) -> anyhow::Result<Vec<crate::types::FunctionInfo>> {
+        with_plugin_session_db!(self, cx, connection_id, database.clone(), |plugin, conn| {
+            plugin.list_functions(&*conn, &database).await
+        })
+    }
+
     /// List procedures view
     pub async fn list_procedures_view(
         &self,
@@ -2485,6 +2807,22 @@ impl GlobalDbState {
         self.connection_manager.close_session(&session_id).await?;
         result.map_err(|e| anyhow::anyhow!("{}", e))
     }
+
+    /// 获取数据库的比较能力
+    pub fn get_compare_capabilities(
+        &self,
+        database_type: &DatabaseType,
+    ) -> crate::compare::CompareCapabilities {
+        use crate::compare::CompareCapabilities;
+        match database_type {
+            DatabaseType::PostgreSQL => CompareCapabilities::postgresql(),
+            DatabaseType::MySQL => CompareCapabilities::mysql(),
+            DatabaseType::SQLite => CompareCapabilities::sqlite(),
+            DatabaseType::MSSQL => CompareCapabilities::sqlserver(),
+            DatabaseType::ClickHouse => CompareCapabilities::clickhouse(),
+            _ => CompareCapabilities::default(),
+        }
+    }
 }
 
 impl Default for GlobalDbState {
@@ -2500,10 +2838,16 @@ mod tests {
     use super::*;
     use crate::connection::DbConnection;
     use crate::executor::{ExecOptions, ExecResult, SqlErrorInfo, SqlSource};
+    use crate::ipc::{IpcDriverManifest, IpcDriverRegistry};
+    use crate::plugin::ConnectionLifecycle;
+    use crate::types::*;
+    use crate::{DatabaseOperationRequest, ImportProgressSender};
     use async_trait::async_trait;
     use one_core::storage::DatabaseType;
+    use sqlparser::dialect::{Dialect, GenericDialect};
+    use std::path::PathBuf;
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::sync::mpsc;
@@ -2512,6 +2856,7 @@ mod tests {
         config: DbConnectionConfig,
         healthy: bool,
         disconnect_count: Arc<AtomicUsize>,
+        executed_sql: Option<Arc<StdMutex<Vec<String>>>>,
     }
 
     impl MockConnection {
@@ -2520,6 +2865,7 @@ mod tests {
                 config,
                 healthy,
                 disconnect_count: Arc::new(AtomicUsize::new(0)),
+                executed_sql: None,
             }
         }
 
@@ -2532,7 +2878,346 @@ mod tests {
                 config,
                 healthy,
                 disconnect_count,
+                executed_sql: None,
             }
+        }
+
+        fn with_executed_sql(
+            config: DbConnectionConfig,
+            executed_sql: Arc<StdMutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                config,
+                healthy: true,
+                disconnect_count: Arc::new(AtomicUsize::new(0)),
+                executed_sql: Some(executed_sql),
+            }
+        }
+    }
+
+    struct SlowOpenPlugin {
+        database_type: DatabaseType,
+        lifecycle: ConnectionLifecycle,
+        active_opens: Arc<AtomicUsize>,
+        max_active_opens: Arc<AtomicUsize>,
+        open_started: Arc<tokio::sync::Notify>,
+    }
+
+    impl SlowOpenPlugin {
+        fn new(
+            active_opens: Arc<AtomicUsize>,
+            max_active_opens: Arc<AtomicUsize>,
+            open_started: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self::with_lifecycle(
+                DatabaseType::DuckDB,
+                ConnectionLifecycle {
+                    close_on_release: true,
+                    physical_open_lock_key: Some(
+                        "duckdb:/tmp/duckdb-concurrent-open.duckdb".to_string(),
+                    ),
+                },
+                active_opens,
+                max_active_opens,
+                open_started,
+            )
+        }
+
+        fn with_lifecycle(
+            database_type: DatabaseType,
+            lifecycle: ConnectionLifecycle,
+            active_opens: Arc<AtomicUsize>,
+            max_active_opens: Arc<AtomicUsize>,
+            open_started: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                database_type,
+                lifecycle,
+                active_opens,
+                max_active_opens,
+                open_started,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DatabasePlugin for SlowOpenPlugin {
+        fn name(&self) -> DatabaseType {
+            self.database_type.clone()
+        }
+
+        fn quote_identifier(&self, identifier: &str) -> String {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
+
+        async fn create_connection(
+            &self,
+            config: DbConnectionConfig,
+        ) -> Result<Box<dyn DbConnection + Send + Sync>, DbError> {
+            let active = self.active_opens.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_opens.fetch_max(active, Ordering::SeqCst);
+            self.open_started.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.active_opens.fetch_sub(1, Ordering::SeqCst);
+            Ok(Box::new(MockConnection::new(config, true)))
+        }
+
+        fn connection_lifecycle(&self, _config: &DbConnectionConfig) -> ConnectionLifecycle {
+            self.lifecycle.clone()
+        }
+
+        async fn list_databases(
+            &self,
+            _connection: &dyn DbConnection,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_databases_view(
+            &self,
+            _connection: &dyn DbConnection,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_databases_detailed(
+            &self,
+            _connection: &dyn DbConnection,
+        ) -> anyhow::Result<Vec<DatabaseInfo>> {
+            Ok(Vec::new())
+        }
+
+        fn sql_dialect(&self) -> Box<dyn Dialect> {
+            Box::new(GenericDialect {})
+        }
+
+        async fn list_tables(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+        ) -> anyhow::Result<Vec<TableInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_tables_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_columns(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+            _table: &str,
+        ) -> anyhow::Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_columns_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+            _table: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_indexes(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+            _table: &str,
+        ) -> anyhow::Result<Vec<IndexInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_indexes_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<&str>,
+            _table: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_views(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+        ) -> anyhow::Result<Vec<ViewInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_views_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_functions(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<Vec<FunctionInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_functions_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_procedures(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<Vec<FunctionInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_procedures_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_triggers(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<Vec<TriggerInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_triggers_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        async fn list_sequences(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+            _schema: Option<String>,
+        ) -> anyhow::Result<Vec<SequenceInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sequences_view(
+            &self,
+            _connection: &dyn DbConnection,
+            _database: &str,
+        ) -> anyhow::Result<ObjectView> {
+            Ok(ObjectView::default())
+        }
+
+        fn build_column_definition(&self, column: &ColumnInfo, include_name: bool) -> String {
+            if include_name {
+                format!(
+                    "{} {}",
+                    self.quote_identifier(&column.name),
+                    column.data_type
+                )
+            } else {
+                column.data_type.clone()
+            }
+        }
+
+        fn build_create_database_sql(&self, request: &DatabaseOperationRequest) -> String {
+            format!(
+                "CREATE DATABASE {}",
+                self.quote_identifier(&request.database_name)
+            )
+        }
+
+        fn build_modify_database_sql(&self, _request: &DatabaseOperationRequest) -> String {
+            String::new()
+        }
+
+        fn build_drop_database_sql(&self, database_name: &str) -> String {
+            format!("DROP DATABASE {}", self.quote_identifier(database_name))
+        }
+
+        fn build_limit_clause(&self) -> String {
+            "LIMIT ? OFFSET ?".to_string()
+        }
+
+        fn build_where_and_limit_clause(
+            &self,
+            _request: &TableSaveRequest,
+            _original_data: &[String],
+        ) -> (String, String) {
+            (String::new(), self.build_limit_clause())
+        }
+
+        fn rename_table(&self, _database: &str, old_name: &str, new_name: &str) -> String {
+            format!(
+                "ALTER TABLE {} RENAME TO {}",
+                self.quote_identifier(old_name),
+                self.quote_identifier(new_name)
+            )
+        }
+
+        fn build_column_def(&self, col: &ColumnDefinition) -> String {
+            format!("{} {}", self.quote_identifier(&col.name), col.data_type)
+        }
+
+        fn build_create_table_sql(&self, design: &TableDesign) -> String {
+            format!("CREATE TABLE {}", self.quote_identifier(&design.table_name))
+        }
+
+        fn build_alter_table_sql(&self, _original: &TableDesign, _new: &TableDesign) -> String {
+            String::new()
+        }
+
+        async fn import_data_with_progress(
+            &self,
+            _connection: &dyn DbConnection,
+            _config: &ImportConfig,
+            _data: &str,
+            _file_name: &str,
+            _progress_tx: Option<ImportProgressSender>,
+        ) -> anyhow::Result<ImportResult> {
+            Ok(ImportResult {
+                success: true,
+                rows_imported: 0,
+                errors: Vec::new(),
+                elapsed_ms: 0,
+            })
+        }
+
+        async fn export_data_with_progress(
+            &self,
+            _connection: &dyn DbConnection,
+            _config: &ExportConfig,
+            _progress_tx: Option<ExportProgressSender>,
+        ) -> anyhow::Result<ExportResult> {
+            Ok(ExportResult {
+                success: true,
+                output: String::new(),
+                rows_exported: 0,
+                elapsed_ms: 0,
+            })
         }
     }
 
@@ -2558,10 +3243,18 @@ mod tests {
         async fn execute(
             &self,
             _plugin: &dyn DatabasePlugin,
-            _script: &str,
+            script: &str,
             _options: ExecOptions,
         ) -> Result<Vec<SqlResult>, DbError> {
-            Ok(Vec::new())
+            if let Some(executed_sql) = &self.executed_sql {
+                executed_sql.lock().unwrap().push(script.to_string());
+            }
+            Ok(vec![SqlResult::Exec(ExecResult {
+                sql: script.to_string(),
+                rows_affected: 0,
+                elapsed_ms: 0,
+                message: None,
+            })])
         }
 
         async fn query(&self, query: &str) -> Result<SqlResult, DbError> {
@@ -2616,6 +3309,23 @@ mod tests {
         }
     }
 
+    fn external_driver_manifest(id: &str, quote: &str, supports_schema: bool) -> IpcDriverManifest {
+        let mut driver: IpcDriverManifest = serde_json::from_str(&format!(
+            r#"{{
+                "id":"{id}",
+                "name":"{id}",
+                "entry":{{"command":"driver"}},
+                "transport":{{"name":"{id}.sock"}},
+                "capabilities":{{"supports_schema":{supports_schema}}}
+            }}"#
+        ))
+        .unwrap();
+        driver.dialect.identifier_quote_left = quote.to_string();
+        driver.manifest_dir = PathBuf::from(format!("/drivers/{id}"));
+        driver
+    }
+
+    #[cfg(feature = "builtin-duckdb")]
     #[test]
     fn test_db_manager_registers_duckdb_plugin() {
         let plugin = DbManager::default()
@@ -2623,6 +3333,100 @@ mod tests {
             .expect("DuckDB plugin should be registered");
 
         assert_eq!(plugin.name(), DatabaseType::DuckDB);
+    }
+
+    #[cfg(not(feature = "builtin-duckdb"))]
+    #[test]
+    fn default_db_manager_uses_external_plugin_for_duckdb() {
+        let plugin = DbManager::default()
+            .get_plugin(&DatabaseType::DuckDB)
+            .expect("DuckDB plugin should be available through external IPC");
+
+        assert_eq!(plugin.name(), DatabaseType::external("duckdb"));
+    }
+
+    #[cfg(not(feature = "builtin-duckdb"))]
+    #[tokio::test]
+    async fn external_duckdb_plugin_uses_ipc_driver_id_without_external_param() {
+        let mut config = test_config("duckdb-ipc");
+        config.database_type = DatabaseType::DuckDB;
+        config.host = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("duckdb-ipc.duckdb")
+            .to_string_lossy()
+            .to_string();
+        config.database = Some("main".to_string());
+
+        let plugin = ExternalDatabasePlugin::with_registry(crate::ipc::IpcDriverRegistry::empty());
+
+        let error = plugin.test_connection(config).await.unwrap_err();
+
+        assert!(
+            format!("{error}").contains("external driver 'duckdb' not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn db_manager_resolves_external_plugin_by_connection_driver_id() {
+        let manager = DbManager::with_external_registry(IpcDriverRegistry::from_drivers(vec![
+            external_driver_manifest("alpha", "`", true),
+            external_driver_manifest("beta", "\"", false),
+        ]));
+
+        let alpha = manager
+            .get_plugin(&DatabaseType::external("alpha"))
+            .unwrap();
+        let beta = manager.get_plugin(&DatabaseType::external("beta")).unwrap();
+
+        assert_eq!("`a``b`", alpha.quote_identifier("a`b"));
+        assert!(alpha.capabilities().supports_schema);
+        assert_eq!("\"a\"\"b\"", beta.quote_identifier("a\"b"));
+        assert!(!beta.capabilities().supports_schema);
+    }
+
+    #[test]
+    fn db_manager_reloads_external_driver_added_after_manager_creation() {
+        let manager = DbManager::with_external_registry_reloader(
+            IpcDriverRegistry::empty(),
+            Arc::new(|| {
+                IpcDriverRegistry::from_drivers(vec![external_driver_manifest("dm", "\"", true)])
+            }),
+        );
+
+        let plugin = manager.get_plugin(&DatabaseType::external("dm")).unwrap();
+
+        assert_eq!(DatabaseType::external("dm"), plugin.name());
+        assert!(plugin.capabilities().supports_schema);
+    }
+
+    #[test]
+    fn db_manager_reloads_updated_external_driver_manifest_for_existing_id() {
+        let mut stale = external_driver_manifest("oracle-go", "\"", true);
+        stale
+            .capabilities
+            .as_mut()
+            .expect("test manifest has capabilities")
+            .uses_schema_as_database = false;
+        let mut fresh = stale.clone();
+        fresh
+            .capabilities
+            .as_mut()
+            .expect("test manifest has capabilities")
+            .uses_schema_as_database = true;
+        fresh.dialect.uses_schema_as_database = true;
+
+        let manager = DbManager::with_external_registry_reloader(
+            IpcDriverRegistry::from_drivers(vec![stale]),
+            Arc::new(move || IpcDriverRegistry::from_drivers(vec![fresh.clone()])),
+        );
+
+        let plugin = manager
+            .get_plugin(&DatabaseType::external("oracle-go"))
+            .unwrap();
+
+        assert!(plugin.capabilities().uses_schema_as_database);
     }
 
     #[test]
@@ -2637,6 +3441,60 @@ mod tests {
         .with_children_loaded(true);
 
         assert!(GlobalDbState::cached_children_ready(&node));
+    }
+
+    #[test]
+    fn list_connection_summaries_exposes_safe_metadata() {
+        let mut state = GlobalDbState::new();
+        state.register_connection(test_config("conn1"));
+
+        let summaries = state.list_connection_summaries();
+
+        assert_eq!(1, summaries.len());
+        assert_eq!("conn1", summaries[0].id);
+        assert_eq!("test", summaries[0].name);
+        assert_eq!(DatabaseType::PostgreSQL, summaries[0].database_type);
+        assert_eq!(Some("postgres".to_string()), summaries[0].database);
+    }
+
+    #[tokio::test]
+    async fn execute_session_uses_existing_connection_session() {
+        let state = GlobalDbState::new();
+        let config = test_config("conn1");
+        let session_id = "conn1:session:test".to_string();
+        let executed_sql = Arc::new(StdMutex::new(Vec::new()));
+        let mut session = ConnectionSession::new(
+            Box::new(MockConnection::with_executed_sql(
+                config.clone(),
+                executed_sql.clone(),
+            )),
+            session_id.clone(),
+            false,
+        );
+        session.mark_in_use();
+        state
+            .connection_manager
+            .sessions
+            .write()
+            .await
+            .entry(config.id.clone())
+            .or_default()
+            .push(session);
+
+        let result = state
+            .execute_session(session_id.clone(), "select 1".to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(1, result.len());
+        assert_eq!(vec!["select 1".to_string()], *executed_sql.lock().unwrap());
+        assert!(
+            state
+                .connection_manager
+                .get_session_config(&session_id)
+                .await
+                .is_some()
+        );
     }
 
     #[test]
@@ -2667,6 +3525,7 @@ mod tests {
         let session = ConnectionSession::new(
             Box::new(MockConnection::new(config.clone(), false)),
             "conn1:session:1".to_string(),
+            false,
         );
 
         manager
@@ -2685,6 +3544,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_resolves_ssh_reference_before_opening_connection() {
+        let manager = ConnectionManager::new();
+        let mut config = test_config("conn-with-ssh-ref");
+        config
+            .extra_params
+            .insert("ssh_connection_id".to_string(), "42".to_string());
+
+        let error = manager
+            .create_session(config, &DbManager::new())
+            .await
+            .expect_err("missing repository should fail during config resolution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ConnectionRepository is unavailable")
+        );
+    }
+
+    #[test]
+    fn single_file_lifecycle_uses_declared_file_path_fields() {
+        let mut config = test_config("duckdb-path");
+        config.database_type = DatabaseType::DuckDB;
+        config.host = "file:/tmp/duckdb-path.duckdb".to_string();
+        config.database = Some("main".to_string());
+
+        assert_eq!(
+            Some("duckdb:/tmp/duckdb-path.duckdb".to_string()),
+            ConnectionLifecycle::single_file(
+                "duckdb",
+                &config,
+                &["host".to_string(), "database".to_string()]
+            )
+            .physical_open_lock_key
+        );
+    }
+
+    #[test]
+    fn single_file_lifecycle_can_read_extra_params_path() {
+        let mut config = test_config("external-duckdb-path");
+        config.database_type = DatabaseType::external("singlefile");
+        config.host.clear();
+        config.database = None;
+        config.extra_params.insert(
+            "path".to_string(),
+            "/tmp/external-duckdb-path.duckdb".to_string(),
+        );
+
+        assert_eq!(
+            Some("singlefile:/tmp/external-duckdb-path.duckdb".to_string()),
+            ConnectionLifecycle::single_file(
+                "singlefile",
+                &config,
+                &["extra_params.path".to_string()]
+            )
+            .physical_open_lock_key
+        );
+    }
+
+    #[tokio::test]
     async fn release_session_closes_duckdb_sessions_instead_of_idling() {
         let manager =
             ConnectionManager::with_config(Duration::from_secs(300), Duration::from_secs(1800));
@@ -2698,6 +3617,7 @@ mod tests {
                 Arc::clone(&disconnect_count),
             )),
             "duckdb-conn:session:1".to_string(),
+            true,
         );
         session.mark_in_use();
 
@@ -2732,6 +3652,7 @@ mod tests {
                 Arc::clone(&disconnect_count),
             )),
             "duckdb-transaction:session:1".to_string(),
+            true,
         );
         session.mark_in_use();
 
@@ -2752,5 +3673,167 @@ mod tests {
         assert_eq!(0, disconnect_count.load(Ordering::SeqCst));
         assert_eq!(1, sessions.len());
         assert!(!sessions[0].in_use);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_session_waits_for_busy_close_on_release_session_before_returning_none() {
+        let manager =
+            ConnectionManager::with_config(Duration::from_secs(300), Duration::from_secs(1800));
+        let mut config = test_config("duckdb-busy");
+        config.database_type = DatabaseType::DuckDB;
+        let mut session = ConnectionSession::new(
+            Box::new(MockConnection::new(config.clone(), true)),
+            "duckdb-busy:session:1".to_string(),
+            true,
+        );
+        session.mark_in_use();
+
+        manager
+            .sessions
+            .write()
+            .await
+            .entry(config.id.clone())
+            .or_default()
+            .push(session);
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_manager = manager.clone();
+        tokio::spawn(async move {
+            release_rx.await.unwrap();
+            release_manager
+                .close_session("duckdb-busy:session:1")
+                .await
+                .unwrap();
+        });
+
+        let acquire_manager = manager.clone();
+        let acquire_config = config.clone();
+        let acquire_task =
+            tokio::spawn(async move { acquire_manager.try_acquire_session(&acquire_config).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !acquire_task.is_finished(),
+            "busy close-on-release session should not allow opening a second physical connection"
+        );
+
+        release_tx.send(()).unwrap();
+        let acquired = acquire_task.await.unwrap().unwrap();
+
+        assert!(acquired.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_session_serializes_concurrent_duckdb_physical_opens() {
+        let manager =
+            ConnectionManager::with_config(Duration::from_secs(300), Duration::from_secs(1800));
+        let mut db_manager = DbManager::new();
+        let active_opens = Arc::new(AtomicUsize::new(0));
+        let max_active_opens = Arc::new(AtomicUsize::new(0));
+        let open_started = Arc::new(tokio::sync::Notify::new());
+        db_manager.duckdb = Arc::new(SlowOpenPlugin::new(
+            Arc::clone(&active_opens),
+            Arc::clone(&max_active_opens),
+            Arc::clone(&open_started),
+        ));
+
+        let mut config = test_config("duckdb-concurrent-open");
+        config.database_type = DatabaseType::DuckDB;
+        config.host = "/tmp/duckdb-concurrent-open.duckdb".to_string();
+        config.database = Some("main".to_string());
+
+        let first_manager = manager.clone();
+        let first_db_manager = db_manager.clone();
+        let first_config = config.clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .create_session(first_config, &first_db_manager)
+                .await
+        });
+        open_started.notified().await;
+
+        let second_manager = manager.clone();
+        let second_db_manager = db_manager.clone();
+        let second_config = config.clone();
+        let second = tokio::spawn(async move {
+            second_manager
+                .create_session(second_config, &second_db_manager)
+                .await
+        });
+
+        let first_session = first.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            1,
+            max_active_opens.load(Ordering::SeqCst),
+            "same DuckDB file should not be opened by two physical connections concurrently"
+        );
+
+        manager.close_session(&first_session).await.unwrap();
+        let second_session = second.await.unwrap().unwrap();
+        manager.close_session(&second_session).await.unwrap();
+
+        assert_eq!(1, max_active_opens.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn create_session_serializes_plugin_declared_single_file_physical_opens() {
+        let manager =
+            ConnectionManager::with_config(Duration::from_secs(300), Duration::from_secs(1800));
+        let mut db_manager = DbManager::new();
+        let active_opens = Arc::new(AtomicUsize::new(0));
+        let max_active_opens = Arc::new(AtomicUsize::new(0));
+        let open_started = Arc::new(tokio::sync::Notify::new());
+        db_manager.external_drivers.insert(
+            "singlefile".to_string(),
+            Arc::new(SlowOpenPlugin::with_lifecycle(
+                DatabaseType::external("singlefile"),
+                ConnectionLifecycle {
+                    close_on_release: true,
+                    physical_open_lock_key: Some("singlefile:/tmp/shared.db".to_string()),
+                },
+                Arc::clone(&active_opens),
+                Arc::clone(&max_active_opens),
+                Arc::clone(&open_started),
+            )),
+        );
+
+        let mut config = test_config("singlefile-concurrent-open");
+        config.database_type = DatabaseType::external("singlefile");
+        config.host = "/tmp/shared.db".to_string();
+        config.database = Some("main".to_string());
+
+        let first_manager = manager.clone();
+        let first_db_manager = db_manager.clone();
+        let first_config = config.clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .create_session(first_config, &first_db_manager)
+                .await
+        });
+        open_started.notified().await;
+
+        let second_manager = manager.clone();
+        let second_db_manager = db_manager.clone();
+        let second_config = config.clone();
+        let second = tokio::spawn(async move {
+            second_manager
+                .create_session(second_config, &second_db_manager)
+                .await
+        });
+
+        let first_session = first.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            1,
+            max_active_opens.load(Ordering::SeqCst),
+            "single-file drivers should be serialized by plugin-declared lifecycle"
+        );
+
+        manager.close_session(&first_session).await.unwrap();
+        let second_session = second.await.unwrap().unwrap();
+        manager.close_session(&second_session).await.unwrap();
+
+        assert_eq!(1, max_active_opens.load(Ordering::SeqCst));
     }
 }
