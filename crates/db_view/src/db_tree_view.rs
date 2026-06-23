@@ -870,6 +870,7 @@ impl DbTreeView {
                     }
                 }
             }
+            ConnectionDataEvent::CloudSyncRequested => {}
         }
     }
 

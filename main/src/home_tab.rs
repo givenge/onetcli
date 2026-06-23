@@ -54,10 +54,11 @@ use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home::home_workspace_filter::WorkspaceFilterDelegate;
 use crate::license::{get_license_service, is_feature_enabled};
 use crate::new_connection::NewConnectionWindow;
-use crate::new_connection::remote_desktop_form::{
+use crate::setting_tab::GlobalCurrentUser;
+use crate::user_avatar::render_user_avatar;
+use remote_desktop_view::remote_desktop_form::{
     RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
 };
-use crate::setting_tab::GlobalCurrentUser;
 
 actions!(home_tab, [OpenConnectionQuickOpen, NewConnectionShortcut]);
 

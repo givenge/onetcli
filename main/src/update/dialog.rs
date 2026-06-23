@@ -9,7 +9,7 @@ use super::UpdateDialogInfo;
 use super::download::{build_download_path, download_update_file_from_sources, verify_sha256};
 use super::install::start_install_update;
 use super::util::{UpdateInstallAction, format_bytes};
-use crate::update::github_release::GITHUB_API_URL;
+use crate::update::github_release::GITHUB_LATEST_RELEASE_URL;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, AsyncApp, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render,
@@ -344,7 +344,7 @@ impl Render for UpdateDialogView {
             t!("Update.action_download").to_string()
         };
 
-        let release_page_url = GITHUB_API_URL;
+        let release_page_url = GITHUB_LATEST_RELEASE_URL;
 
         v_flex()
             .gap_3()
