@@ -14,7 +14,6 @@ use one_core::storage::{GlobalStorageState, StorageManager, traits::Repository};
 use rust_i18n::t;
 
 use super::provider_form_dialog::ProviderForm;
-use crate::setting_tab::GlobalCurrentUser;
 
 pub struct LlmProvidersView {
     focus_handle: FocusHandle,
@@ -35,7 +34,7 @@ impl LlmProvidersView {
             storage_manager,
             providers: vec![],
             loading: false,
-            is_logged_in: GlobalCurrentUser::get_user(cx).is_some(),
+            is_logged_in: false,
         };
         cx.spawn(async move |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
             let _ = entity.update(cx, |this, cx| {
@@ -49,7 +48,7 @@ impl LlmProvidersView {
 
     fn load_providers(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
-        let is_logged_in = GlobalCurrentUser::get_user(cx).is_some();
+        let is_logged_in = false;
         self.is_logged_in = is_logged_in;
 
         let repo = self

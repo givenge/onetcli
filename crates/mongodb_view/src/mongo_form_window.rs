@@ -918,6 +918,7 @@ impl Render for MongoFormWindow {
                 div()
                     .id("mongo-form-content")
                     .flex_1()
+                    .min_h_0()
                     .p_4()
                     .overflow_y_scroll()
                     .child(match active_tab {

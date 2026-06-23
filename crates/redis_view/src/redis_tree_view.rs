@@ -1937,7 +1937,9 @@ impl RedisTreeView {
             .items_center()
             .cursor_pointer()
             .rounded(px(4.0))
-            .when(is_selected, |this| this.bg(cx.theme().list_active))
+            .when(is_selected, |this| {
+                this.bg(cx.theme().primary.opacity(0.12))
+            })
             .when(!is_selected, |this| {
                 this.hover(|style| style.bg(cx.theme().list_hover))
             })

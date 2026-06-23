@@ -1,6 +1,6 @@
 use gpui::{
-    AnyView, AnyWindowHandle, App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window,
-    actions,
+    AnyView, AnyWindowHandle, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
+    ScrollHandle, Window, actions,
 };
 
 use crate::home_tab::HomePage;
@@ -25,6 +25,7 @@ pub(crate) struct NewConnectionWindow {
     pub(super) selected_category: NewConnectionCategory,
     pub(super) selected_kind: Option<NewConnectionKind>,
     pub(super) form: Option<AnyView>,
+    pub(super) card_scroll_handle: ScrollHandle,
 }
 
 impl NewConnectionWindow {
@@ -52,6 +53,7 @@ impl NewConnectionWindow {
             selected_category: NewConnectionCategory::All,
             selected_kind: Self::first_visible_item(NewConnectionCategory::All),
             form: None,
+            card_scroll_handle: ScrollHandle::new(),
         }
     }
 

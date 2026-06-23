@@ -2,18 +2,22 @@ use crate::home::home_layout::{CONTENT_PADDING, SECTION_GAP};
 use crate::home_tab::HomePage;
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable as _, v_flex};
 use one_core::storage::{StoredConnection, Workspace};
 use rust_i18n::t;
 
 impl HomePage {
-    pub(crate) fn render_content_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_content_area(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let search_query = self.search_query.read(cx).to_lowercase();
         let selected_id = self.selected_connection_id;
         let reorder_enabled = self.cards_reorder_enabled(cx);
-        self.render_workspace_view(&search_query, selected_id, reorder_enabled, cx)
+        self.render_workspace_view(&search_query, selected_id, reorder_enabled, window, cx)
             .into_any_element()
     }
 
@@ -22,6 +26,7 @@ impl HomePage {
         search_query: &str,
         selected_id: Option<i64>,
         reorder_enabled: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workspaces = self.filtered_workspace_connections(search_query);
@@ -31,13 +36,15 @@ impl HomePage {
             .id("home-content")
             .size_full()
             .overflow_y_scroll()
-            .p(px(CONTENT_PADDING))
-            .child(self.render_workspace_body(
-                workspaces,
-                unassigned,
-                selected_id,
-                reorder_enabled,
-                cx,
+            .child(div().w_full().min_w_0().p(px(CONTENT_PADDING)).child(
+                self.render_workspace_body(
+                    workspaces,
+                    unassigned,
+                    selected_id,
+                    reorder_enabled,
+                    window,
+                    cx,
+                ),
             ))
     }
 
@@ -47,6 +54,7 @@ impl HomePage {
         unassigned: Vec<StoredConnection>,
         selected_id: Option<i64>,
         reorder_enabled: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.connections.is_empty() {
@@ -65,6 +73,7 @@ impl HomePage {
                 connections,
                 selected_id,
                 reorder_enabled,
+                window,
                 cx,
             ));
         }
@@ -77,6 +86,7 @@ impl HomePage {
                     unassigned,
                     selected_id,
                     reorder_enabled,
+                    window,
                     cx,
                 ))
             } else {
@@ -85,6 +95,7 @@ impl HomePage {
                     None,
                     selected_id,
                     reorder_enabled,
+                    window,
                     cx,
                 ))
             };

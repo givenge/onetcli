@@ -2266,7 +2266,7 @@ impl TabContent for ChatPanel {
     }
 
     fn icon(&self, _cx: &App) -> Option<Icon> {
-        Some(IconName::ChatDB.color().with_size(Size::Medium))
+        Some(IconName::ChatDB.mono().with_size(Size::Medium))
     }
 
     fn closeable(&self, _cx: &App) -> bool {

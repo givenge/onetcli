@@ -6519,6 +6519,7 @@ version = "0.6.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "db",
  "db_view",
  "dirs 6.0.0",
@@ -6535,6 +6536,7 @@ dependencies = [
  "one-ui",
  "port_forwarding",
  "port_forwarding_view",
+ "quick-xml 0.38.4",
  "redis_view",
  "remote_desktop",
  "remote_desktop_view",
@@ -8690,6 +8692,15 @@ name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
 dependencies = [
  "memchr",
 ]

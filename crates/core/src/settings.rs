@@ -203,6 +203,62 @@ impl GlobalProxySettings {
         Ok(Some(url))
     }
 }
+
+const DEFAULT_WEBDAV_BACKUP_REMOTE_DIR: &str = "onetcli-backup";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDavBackupSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_webdav_backup_remote_dir")]
+    pub remote_dir: String,
+}
+
+fn default_webdav_backup_remote_dir() -> String {
+    DEFAULT_WEBDAV_BACKUP_REMOTE_DIR.to_string()
+}
+
+impl Default for WebDavBackupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            username: String::new(),
+            password: String::new(),
+            remote_dir: default_webdav_backup_remote_dir(),
+        }
+    }
+}
+
+impl WebDavBackupSettings {
+    pub fn validate_for_backup(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Err("请先在设置中启用 WebDAV 备份".to_string());
+        }
+        self.validate_endpoint()
+    }
+
+    pub fn validate_endpoint(&self) -> Result<(), String> {
+        let endpoint = self.endpoint.trim();
+        if endpoint.is_empty() {
+            return Err("WebDAV 地址不能为空".to_string());
+        }
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            return Err("WebDAV 地址必须以 http:// 或 https:// 开头".to_string());
+        }
+        if self.username.trim().is_empty() && !self.password.is_empty() {
+            return Err("填写 WebDAV 密码时必须同时填写用户名".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -258,6 +314,8 @@ pub struct AppSettings {
     pub table_row_height: u32,
     #[serde(default)]
     pub custom_keybindings: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub webdav_backup: WebDavBackupSettings,
 }
 
 pub(crate) const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
@@ -327,6 +385,7 @@ impl Default for AppSettings {
             system_hotkey_other: default_system_hotkey_other(),
             table_row_height: default_table_row_height(),
             custom_keybindings: HashMap::new(),
+            webdav_backup: WebDavBackupSettings::default(),
         }
     }
 }

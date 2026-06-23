@@ -30,7 +30,7 @@ pub enum SidebarPanel {
 impl SidebarPanel {
     pub fn icon(&self) -> Icon {
         match self {
-            SidebarPanel::AiChat => IconName::ChatDB.color(),
+            SidebarPanel::AiChat => IconName::ChatDB.mono(),
             SidebarPanel::DdlPreview => IconName::Eye.color(),
         }
     }

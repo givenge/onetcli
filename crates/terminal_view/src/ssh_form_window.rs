@@ -1522,6 +1522,7 @@ impl Render for SshFormWindow {
                 div()
                     .id("ssh-form-content")
                     .flex_1()
+                    .min_h_0()
                     .p_3()
                     .overflow_y_scroll()
                     .child(match active_tab {

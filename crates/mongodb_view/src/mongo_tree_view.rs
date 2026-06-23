@@ -1265,7 +1265,9 @@ impl MongoTreeView {
             .px_2()
             .py_1()
             .cursor_pointer()
-            .when(is_selected, |this| this.bg(cx.theme().list_active))
+            .when(is_selected, |this| {
+                this.bg(cx.theme().primary.opacity(0.12))
+            })
             .when(!is_selected, |this| this.text_color(cx.theme().foreground))
             .on_mouse_down(MouseButton::Left, move |event, _window, cx| {
                 if event.click_count == 2 {

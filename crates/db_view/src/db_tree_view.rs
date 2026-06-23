@@ -286,7 +286,7 @@ impl RenderOnce for DatabaseListItem {
             .items_center()
             .cursor_pointer()
             .rounded(px(4.0))
-            .when(self.selected, |el| el.bg(cx.theme().list_active))
+            .when(self.selected, |el| el.bg(cx.theme().primary.opacity(0.12)))
             .when(!self.selected, |el| {
                 el.hover(|style| style.bg(cx.theme().list_hover))
             })

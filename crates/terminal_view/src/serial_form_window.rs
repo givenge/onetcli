@@ -766,6 +766,7 @@ impl Render for SerialFormWindow {
                 div()
                     .id("serial-form-content")
                     .flex_1()
+                    .min_h_0()
                     .p_3()
                     .overflow_y_scroll()
                     .child(

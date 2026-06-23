@@ -184,6 +184,14 @@ fn parse_terminal_agent_decision(
         }
     }
 
+    for (start, _) in trimmed.match_indices('{').rev() {
+        for candidate in json_object_candidates(&trimmed[start..]) {
+            if let Ok(parsed) = serde_json::from_str::<TerminalAgentDecision>(candidate) {
+                return Ok(parsed);
+            }
+        }
+    }
+
     serde_json::from_str(trimmed)
 }
 
@@ -290,9 +298,18 @@ fn append_terminal_agent_tool_result(
 
 fn looks_like_shell_prompt(line: &str) -> bool {
     let trimmed = line.trim();
-    (trimmed.ends_with('$') || trimmed.ends_with('#'))
+    if (trimmed.ends_with('$') || trimmed.ends_with('#'))
         && trimmed.contains('@')
         && trimmed.contains(':')
+    {
+        return true;
+    }
+
+    trimmed.chars().count() <= 120
+        && (trimmed.starts_with("➜")
+            || trimmed.starts_with('❯')
+            || trimmed.starts_with("λ ")
+            || trimmed.starts_with("λ\t"))
 }
 
 fn diff_terminal_output(before: &str, after: &str) -> String {
@@ -336,6 +353,81 @@ fn extract_command_output(before: &str, after: &str, command: &str) -> String {
     }
 
     lines.join("\n").trim().to_string()
+}
+
+fn contains_command_echo(output: &str, command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+
+    if output.contains(command) {
+        return true;
+    }
+
+    let compact_output: String = output.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let compact_command: String = command.chars().filter(|ch| !ch.is_whitespace()).collect();
+
+    compact_output.contains(&compact_command)
+}
+
+fn terminal_agent_command_completed_by_prompt(before: &str, after: &str, command: &str) -> bool {
+    let diff = diff_terminal_output(before, after);
+    if !contains_command_echo(&diff, command) {
+        return false;
+    }
+
+    diff.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(looks_like_shell_prompt)
+}
+
+fn terminal_agent_response_payload(content: &str, thinking: &str) -> String {
+    if content.trim().is_empty() {
+        thinking.trim().to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+fn clean_salvaged_terminal_agent_final(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    let mut lines = Vec::new();
+
+    for line in trimmed.lines() {
+        let line = line.trim_end();
+        let marker = line.trim_start();
+        let is_internal_note = marker.starts_with("我需要返回")
+            || marker.starts_with("最终答复内容")
+            || marker.starts_with("确保返回格式")
+            || marker.starts_with("由于信息已经足够")
+            || marker.contains("返回 final")
+            || marker.contains("JSON 输出");
+        if is_internal_note {
+            break;
+        }
+        lines.push(line);
+    }
+
+    let cleaned = lines.join("\n").trim().to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn salvage_terminal_agent_final_response(
+    response: &str,
+    tool_result_count: usize,
+) -> Option<String> {
+    let trimmed = response.trim();
+    if tool_result_count == 0 || trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with("```") {
+        return None;
+    }
+
+    clean_salvaged_terminal_agent_final(trimmed)
 }
 
 fn prepare_terminal_agent_command(command: &str) -> String {
@@ -409,7 +501,7 @@ async fn collect_terminal_agent_response(
                                     });
                                 }
                             }
-                            return Ok(full_content);
+                            return Ok(terminal_agent_response_payload(&full_content, &full_thinking));
                         }
                     }
                     Some(Err(error)) => return Err(error.to_string()),
@@ -426,7 +518,7 @@ async fn collect_terminal_agent_response(
                                 });
                             }
                         }
-                        return Ok(full_content);
+                        return Ok(terminal_agent_response_payload(&full_content, &full_thinking));
                     }
                 }
             }
@@ -2308,6 +2400,7 @@ impl TerminalView {
             TerminalModelEvent::Wakeup => {
                 self.sync_ssh_mfa_inputs(window, cx);
                 self.focus_terminal_after_connect_if_ready(window, cx);
+                self.finish_pending_agent_command_from_prompt(cx);
                 self.refresh_history_prompt_matches(cx);
                 cx.notify();
             }
@@ -2326,26 +2419,7 @@ impl TerminalView {
                     "terminal agent observed prompt lifecycle event"
                 );
                 if matches!(event, TerminalModelEvent::InputStart) {
-                    if let Some(pending) = self.pending_agent_command.take() {
-                        let after_output = self
-                            .terminal
-                            .read(cx)
-                            .recent_output(TERMINAL_AGENT_OUTPUT_LINES);
-                        let output = extract_command_output(
-                            &pending.before_output,
-                            &after_output,
-                            &pending.command,
-                        );
-                        info!(
-                            target: "terminal.agent",
-                            output_len = output.len(),
-                            "using InputStart as terminal command completion fallback"
-                        );
-                        let _ = pending.responder.send(TerminalAgentCommandResult {
-                            exit_code: None,
-                            output,
-                        });
-                    }
+                    self.finish_pending_agent_command(None, "InputStart fallback", cx);
                 }
                 cx.notify();
             }
@@ -2376,29 +2450,56 @@ impl TerminalView {
                     has_pending = self.pending_agent_command.is_some(),
                     "terminal agent observed command finished event"
                 );
-                if let Some(pending) = self.pending_agent_command.take() {
-                    let after_output = self
-                        .terminal
-                        .read(cx)
-                        .recent_output(TERMINAL_AGENT_OUTPUT_LINES);
-                    let output = extract_command_output(
-                        &pending.before_output,
-                        &after_output,
-                        &pending.command,
-                    );
-                    info!(
-                        target: "terminal.agent",
-                        exit_code = *exit_code,
-                        output_len = output.len(),
-                        "using CommandFinished as terminal command completion signal"
-                    );
-                    let _ = pending.responder.send(TerminalAgentCommandResult {
-                        exit_code: Some(*exit_code),
-                        output,
-                    });
-                }
+                self.finish_pending_agent_command(Some(*exit_code), "CommandFinished signal", cx);
             }
         }
+    }
+
+    fn finish_pending_agent_command_from_prompt(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_agent_command.as_ref() else {
+            return false;
+        };
+        let after_output = self
+            .terminal
+            .read(cx)
+            .recent_output(TERMINAL_AGENT_OUTPUT_LINES);
+        if !terminal_agent_command_completed_by_prompt(
+            &pending.before_output,
+            &after_output,
+            &pending.command,
+        ) {
+            return false;
+        }
+
+        self.finish_pending_agent_command(None, "prompt-return fallback", cx)
+    }
+
+    fn finish_pending_agent_command(
+        &mut self,
+        exit_code: Option<i32>,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pending) = self.pending_agent_command.take() else {
+            return false;
+        };
+        let after_output = self
+            .terminal
+            .read(cx)
+            .recent_output(TERMINAL_AGENT_OUTPUT_LINES);
+        let output =
+            extract_command_output(&pending.before_output, &after_output, &pending.command);
+        info!(
+            target: "terminal.agent",
+            exit_code = ?exit_code,
+            output_len = output.len(),
+            reason,
+            "terminal agent command completed"
+        );
+        let _ = pending
+            .responder
+            .send(TerminalAgentCommandResult { exit_code, output });
+        true
     }
 
     fn sync_ssh_mfa_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2913,6 +3014,7 @@ impl TerminalView {
             };
 
             let mut invalid_decision_count = 0usize;
+            let mut tool_result_count = 0usize;
 
             loop {
                 if cancel_token.is_cancelled() {
@@ -3070,6 +3172,7 @@ impl TerminalView {
                             "read_terminal_output",
                             tool_result,
                         );
+                        tool_result_count += 1;
                     }
                     Ok(TerminalAgentDecision::ExecuteCommand { command, reason }) => {
                         invalid_decision_count = 0;
@@ -3255,6 +3358,7 @@ impl TerminalView {
                             "execute_command",
                             tool_result,
                         );
+                        tool_result_count += 1;
                     }
                     Err(_) => {
                         warn!(
@@ -3263,6 +3367,31 @@ impl TerminalView {
                             invalid_decision_count,
                             "terminal agent response could not be parsed"
                         );
+                        if let Some(content) =
+                            salvage_terminal_agent_final_response(&response, tool_result_count)
+                        {
+                            if let Some(entity) = this.upgrade() {
+                                info!(
+                                    target: "terminal.agent",
+                                    content_len = content.len(),
+                                    "terminal agent salvaged natural language final response"
+                                );
+                                let _ = cx.update(|cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.sidebar.update(cx, |sidebar, cx| {
+                                            sidebar.complete_agent_request(
+                                                &assistant_message_id,
+                                                session_id,
+                                                content.clone(),
+                                                cx,
+                                            );
+                                        });
+                                    });
+                                });
+                            }
+                            return;
+                        }
+
                         invalid_decision_count += 1;
                         if invalid_decision_count >= 2 {
                             let content = terminal_agent_protocol_error_message();
@@ -3270,7 +3399,7 @@ impl TerminalView {
                                 info!(
                                     target: "terminal.agent",
                                     content_len = content.len(),
-                                    "terminal agent run completed with protocol error"
+                                    "terminal agent run completed after invalid protocol response"
                                 );
                                 let _ = cx.update(|cx| {
                                     entity.update(cx, |view, cx| {
@@ -3406,6 +3535,29 @@ impl TerminalView {
             .map_err(|_| "Approval dialog was closed unexpectedly".to_string())
     }
 
+    fn clear_pending_agent_command(this: &WeakEntity<Self>, cx: &mut AsyncApp, command: &str) {
+        let command = command.to_string();
+        if let Some(entity) = this.upgrade() {
+            let _ = cx.update(|cx| {
+                entity.update(cx, |view, cx| {
+                    let matches_command = view
+                        .pending_agent_command
+                        .as_ref()
+                        .is_some_and(|pending| pending.command == command);
+                    if matches_command {
+                        warn!(
+                            target: "terminal.agent",
+                            command = %command,
+                            "clearing stale pending terminal agent command"
+                        );
+                        view.pending_agent_command = None;
+                        cx.notify();
+                    }
+                });
+            });
+        }
+    }
+
     async fn execute_terminal_agent_command(
         this: WeakEntity<Self>,
         cx: &mut AsyncApp,
@@ -3487,6 +3639,7 @@ impl TerminalView {
                     error = %error,
                     "terminal command completion wait failed"
                 );
+                Self::clear_pending_agent_command(&this, cx, &sanitized);
             }
         }
 
@@ -5534,20 +5687,22 @@ mod tests {
         encode_mouse_modifiers, has_trailing_line_continuation, has_unterminated_shell_quote,
         history_prompt_available, history_prompt_dropdown_origin, history_prompt_overlay_bounds,
         json_object_candidates, mouse_button_code, multiline_non_empty_line_count,
-        parse_terminal_agent_decision, prepend_terminal_agent_system_prompt,
+        parse_terminal_agent_decision, prepare_terminal_agent_command,
+        prepend_terminal_agent_system_prompt, salvage_terminal_agent_final_response,
         sgr_mouse_button_report, sgr_mouse_mode_enabled, sgr_mouse_wheel_report,
         should_confirm_local_terminal_close,
         should_defer_inline_history_prompt_input_to_text_system, should_defer_sgr_left_press,
         should_dismiss_history_prompt_for_keystroke, should_dismiss_history_prompt_for_mouse,
         should_dismiss_history_prompt_for_scroll, should_reset_history_prompt_for_terminal_event,
         should_scroll_to_bottom_on_user_input, should_start_selection_from_pending_sgr_press,
-        take_whole_scroll_lines, terminal_agent_protocol_error_message,
+        take_whole_scroll_lines, terminal_agent_command_completed_by_prompt,
+        terminal_agent_protocol_error_message, terminal_agent_response_payload,
     };
     use crate::history_prompt::{HistoryPromptAccept, HistoryPromptState};
-    use crate::llm::{Message, MessageBlock, Role};
     use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
     use alacritty_terminal::term::TermMode;
     use gpui::{Bounds, Keystroke, Modifiers, MouseButton, Point, px, size};
+    use one_core::llm::{Message, MessageBlock, Role};
     use std::cell::Cell as StdCell;
     use terminal::terminal::{TerminalConnectionKind, TerminalModelEvent};
 
@@ -5890,6 +6045,93 @@ mod tests {
             .join("\n");
         assert!(system_text.contains("工具执行后追加的系统提示"));
         assert!(matches!(merged[1].role, Role::User));
+    }
+
+    #[test]
+    fn terminal_agent_prompt_fallback_detects_oh_my_zsh_prompt() {
+        let command = prepare_terminal_agent_command("df -h");
+        let before = "Last login: Fri May 29 13:37:12 2026\n➜  ~";
+        let after = format!(
+            "{before} {command}\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p2  467G  297G  147G  67% /\n➜  ~"
+        );
+
+        assert!(terminal_agent_command_completed_by_prompt(
+            before, &after, &command
+        ));
+    }
+
+    #[test]
+    fn terminal_agent_prompt_fallback_waits_for_prompt_return() {
+        let command = prepare_terminal_agent_command("df -h");
+        let before = "➜  ~";
+        let after = format!("{before} {command}\nFilesystem      Size  Used");
+
+        assert!(!terminal_agent_command_completed_by_prompt(
+            before, &after, &command
+        ));
+    }
+
+    #[test]
+    fn terminal_agent_prompt_fallback_handles_wrapped_command_echo() {
+        let command =
+            prepare_terminal_agent_command("du -h --max-depth=1 / 2>/dev/null | sort -hr");
+        let before = "➜  ~";
+        let after = "\
+➜  ~ SYSTEMD_PAGER=cat SYSTEMD_LESS=FRX PAGER=cat LESS=FRX du -h --max-depth=1 /
+ 2>/dev/null | sort -hr
+297G    /
+➜  ~";
+
+        assert!(terminal_agent_command_completed_by_prompt(
+            before, after, &command
+        ));
+    }
+
+    #[test]
+    fn terminal_agent_response_payload_uses_thinking_when_content_is_empty() {
+        assert_eq!(
+            terminal_agent_response_payload("", r#"{"type":"final","content":"ok"}"#),
+            r#"{"type":"final","content":"ok"}"#
+        );
+        assert_eq!(
+            terminal_agent_response_payload("  ", "natural answer"),
+            "natural answer"
+        );
+        assert_eq!(
+            terminal_agent_response_payload("visible content", "thinking"),
+            "visible content"
+        );
+    }
+
+    #[test]
+    fn salvage_terminal_agent_final_response_only_after_tool_results() {
+        assert_eq!(
+            salvage_terminal_agent_final_response("磁盘还有 147G 可用。", 1).as_deref(),
+            Some("磁盘还有 147G 可用。")
+        );
+        assert!(salvage_terminal_agent_final_response("磁盘还有 147G 可用。", 0).is_none());
+        assert!(
+            salvage_terminal_agent_final_response(r#"{"type":"final","content":"ok""#, 1).is_none()
+        );
+    }
+
+    #[test]
+    fn salvage_terminal_agent_final_response_removes_internal_notes() {
+        let response = "\
+可以清理的内容：
+- /var/cache 5.8G：通常是缓存文件。
+- /var/log 4.7G：可以清理旧日志。
+
+我需要返回一个最终答复，总结可清理的内容。
+确保返回格式是 JSON。";
+
+        assert_eq!(
+            salvage_terminal_agent_final_response(response, 2).as_deref(),
+            Some(
+                "可以清理的内容：\n- /var/cache 5.8G：通常是缓存文件。\n- /var/log 4.7G：可以清理旧日志。"
+            )
+        );
+        assert!(salvage_terminal_agent_final_response("我需要返回 final。", 2).is_none());
     }
 
     #[test]

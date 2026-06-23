@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use crate::app_init::is_valid_system_hotkey;
 use crate::auth::get_auth_service;
-use crate::license::{get_license_service, offline_license_public_key};
 use crate::settings::llm_providers_view::LlmProvidersView;
 use crate::update;
+use crate::webdav_backup;
 use gpui::http_client::{AsyncBody, Method, Request};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, AsyncApp, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
-    PathPromptOptions, Render, SharedString, Styled, WeakEntity, Window, div,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement, Render,
+    SharedString, Styled, WeakEntity, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, Size, Theme, ThemeMode, TitleBar,
@@ -36,7 +36,7 @@ pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-space";
 
 pub use one_core::settings::{
     AppSettings, DatabaseOpenMode, GlobalCurrentUser, GlobalProxySettings,
-    LargeTextCellEditorOpenMode, ProxyType,
+    LargeTextCellEditorOpenMode, ProxyType, WebDavBackupSettings,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
@@ -464,6 +464,11 @@ impl SettingsPanel {
                             render_global_proxy_settings_item(cx)
                         })),
                 ]),
+            SettingPage::new(t!("Settings.Backup.title")).group(SettingGroup::new().item(
+                SettingItem::render(move |_options, _window, cx| {
+                    render_webdav_backup_settings_item(cx)
+                }),
+            )),
             // 快捷键页面
             SettingPage::new(t!("Settings.Shortcuts.title")).group(
                 SettingGroup::new().item(SettingItem::render(move |_options, window, cx| {
@@ -474,10 +479,6 @@ impl SettingsPanel {
                 SettingItem::render(move |_options, _window, _cx| {
                     llm_view.clone().into_any_element()
                 }),
-            )),
-            // 账户设置页
-            SettingPage::new(t!("Settings.Account.title")).group(SettingGroup::new().item(
-                SettingItem::render(move |_options, window, cx| render_account_section(window, cx)),
             )),
             // 关于页面
             SettingPage::new(t!("Settings.About.title")).group(SettingGroup::new().item(
@@ -1042,153 +1043,334 @@ async fn test_proxy_connectivity(
     Ok(())
 }
 
-/// 渲染账户设置区域
-fn render_account_section(_window: &mut Window, cx: &App) -> gpui::AnyElement {
-    let user = GlobalCurrentUser::get_user(cx);
+fn render_webdav_backup_settings_item(cx: &mut App) -> gpui::AnyElement {
+    h_flex()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .gap_3()
+        .child(
+            v_flex()
+                .gap_1()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .child(t!("Settings.Backup.WebDav.title").to_string()),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("Settings.Backup.WebDav.description").to_string()),
+                ),
+        )
+        .child(
+            Button::new("settings-webdav-backup")
+                .icon(IconName::Upload)
+                .label(t!("Settings.Backup.WebDav.open").to_string())
+                .on_click(|_, _window, cx| {
+                    show_webdav_backup_settings_window(cx);
+                }),
+        )
+        .into_any_element()
+}
 
-    if let Some(user) = user {
-        // 已登录状态：显示用户信息和登出按钮
-        let email: SharedString = user.email.clone().into();
-        let display_name: SharedString = user
-            .username
-            .clone()
-            .unwrap_or_else(|| {
-                user.email
-                    .split('@')
-                    .next()
-                    .unwrap_or(&user.email)
-                    .to_string()
-            })
-            .into();
+struct WebDavBackupSettingsView {
+    focus_handle: FocusHandle,
+    enabled: bool,
+    endpoint_input: Entity<InputState>,
+    remote_dir_input: Entity<InputState>,
+    username_input: Entity<InputState>,
+    password_input: Entity<InputState>,
+    testing: bool,
+    status_message: Option<(bool, String)>,
+}
 
-        v_flex()
-            .gap_4()
-            .p_4()
-            // 用户信息区域
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(t!("Settings.Account.username").to_string()),
-                            )
-                            .child(div().text_sm().child(display_name)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(t!("Settings.Account.email").to_string()),
-                            )
-                            .child(div().text_sm().child(email)),
-                    ),
-            )
-            // 登出按钮
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("import-license-button")
-                            .icon(IconName::File)
-                            .label(t!("License.import_offline").to_string())
-                            .on_click(move |_, window, cx| {
-                                let public_key = match offline_license_public_key() {
-                                    Ok(key) => key,
-                                    Err(msg) => {
-                                        window.push_notification(msg, cx);
-                                        return;
-                                    }
-                                };
-                                let license_service = get_license_service(cx);
-                                let future = cx.prompt_for_paths(PathPromptOptions {
-                                    files: true,
-                                    directories: false,
-                                    multiple: false,
-                                    prompt: Some(t!("License.select_file").to_string().into()),
-                                });
+impl WebDavBackupSettingsView {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let current = AppSettings::global(cx).webdav_backup.clone();
+        let endpoint_input = text_input(
+            window,
+            cx,
+            current.endpoint.clone(),
+            "https://example.com/dav".to_string(),
+            false,
+        );
+        let remote_dir_input = text_input(
+            window,
+            cx,
+            current.remote_dir.clone(),
+            "onetcli-backup".to_string(),
+            false,
+        );
+        let username_input = text_input(
+            window,
+            cx,
+            current.username.clone(),
+            t!("Settings.Backup.WebDav.username_placeholder").to_string(),
+            false,
+        );
+        let password_input = text_input(
+            window,
+            cx,
+            current.password.clone(),
+            t!("Settings.Backup.WebDav.password_placeholder").to_string(),
+            true,
+        );
 
-                                window
-                                    .spawn(cx, async move |cx| {
-                                        if let Ok(Ok(Some(paths))) = future.await {
-                                            if let Some(path) = paths.into_iter().next() {
-                                                let result = license_service
-                                                    .import_offline_license_from_path(
-                                                        &path,
-                                                        &public_key,
-                                                        None,
-                                                    );
-                                                let message = match result {
-                                                    Ok(_) => {
-                                                        t!("License.import_success").to_string()
-                                                    }
-                                                    Err(err) => t!(
-                                                        "License.import_failed",
-                                                        error = err.to_string()
-                                                    )
-                                                    .to_string(),
-                                                };
-                                                let _ = cx.update(|_view, cx: &mut App| {
-                                                    if let Some(window_id) = cx.active_window() {
-                                                        let _ = cx.update_window(
-                                                            window_id,
-                                                            |_, window, cx| {
-                                                                window
-                                                                    .push_notification(message, cx);
-                                                            },
-                                                        );
-                                                    }
-                                                });
-                                            }
-                                        }
-                                    })
-                                    .detach();
-                            }),
-                    )
-                    .child(
-                        Button::new("logout-button")
-                            .icon(IconName::Close)
-                            .label(t!("Auth.logout"))
-                            .danger()
-                            .on_click(move |_, _window, cx| {
-                                // 清除 License
-                                get_license_service(cx).clear();
+        Self {
+            focus_handle: cx.focus_handle(),
+            enabled: current.enabled,
+            endpoint_input,
+            remote_dir_input,
+            username_input,
+            password_input,
+            testing: false,
+            status_message: None,
+        }
+    }
 
-                                // 执行登出
-                                let auth = get_auth_service(cx);
-                                cx.spawn(async move |cx: &mut AsyncApp| {
-                                    auth.sign_out().await;
-                                    cx.update(|cx| {
-                                        GlobalCurrentUser::set_user(None, cx);
-                                    });
-                                })
-                                .detach();
-                            }),
-                    ),
-            )
-            .into_any_element()
-    } else {
-        // 未登录状态：显示提示信息
-        v_flex()
-            .gap_2()
-            .p_4()
+    fn build_settings(&self, cx: &App) -> WebDavBackupSettings {
+        WebDavBackupSettings {
+            enabled: self.enabled,
+            endpoint: input_text(&self.endpoint_input, cx).trim().to_string(),
+            remote_dir: input_text(&self.remote_dir_input, cx).trim().to_string(),
+            username: input_text(&self.username_input, cx).trim().to_string(),
+            password: input_text(&self.password_input, cx),
+        }
+    }
+
+    fn on_test(&mut self, cx: &mut Context<Self>) {
+        if self.testing {
+            return;
+        }
+
+        let settings = self.build_settings(cx);
+        let http_client = cx.http_client();
+        self.testing = true;
+        self.status_message = None;
+        cx.notify();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = webdav_backup::test_webdav_connection(settings, http_client).await;
+            let _ = this.update(cx, |view, cx| {
+                view.testing = false;
+                view.status_message = Some(match result {
+                    Ok(()) => (true, t!("Settings.Backup.WebDav.test_success").to_string()),
+                    Err(err) => (false, err),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn on_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.build_settings(cx);
+        if settings.enabled
+            && let Err(err) = settings.validate_for_backup()
+        {
+            self.status_message = Some((false, err));
+            cx.notify();
+            return;
+        }
+
+        cx.defer(move |cx| {
+            let app_settings = AppSettings::global_mut(cx);
+            app_settings.webdav_backup = settings;
+            app_settings.save();
+        });
+        window.push_notification(t!("Settings.Backup.WebDav.save_success").to_string(), cx);
+        window.remove_window();
+    }
+
+    fn form_row(&self, label: String, child: impl IntoElement, disabled: bool) -> gpui::AnyElement {
+        h_flex()
+            .gap_3()
+            .items_center()
+            .child(div().w(px(120.0)).text_sm().child(label))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("Settings.Account.not_logged_in").to_string()),
+                    .flex_1()
+                    .child(child)
+                    .when(disabled, |this| this.opacity(0.55)),
             )
             .into_any_element()
     }
+}
+
+impl Focusable for WebDavBackupSettingsView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for WebDavBackupSettingsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let disabled = !self.enabled;
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .child(settings_dialog_title(
+                t!("Settings.Backup.WebDav.dialog_title").to_string(),
+            ))
+            .child(self.render_form(disabled, cx))
+            .child(self.render_footer(cx))
+    }
+}
+
+impl WebDavBackupSettingsView {
+    fn render_form(&self, disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex_1().min_h_0().overflow_y_scrollbar().p_4().child(
+            v_flex()
+                .gap_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("Settings.Backup.WebDav.dialog_desc").to_string()),
+                )
+                .child(toggle_row(self.enabled, cx))
+                .child(self.form_row(
+                    t!("Settings.Backup.WebDav.endpoint").to_string(),
+                    Input::new(&self.endpoint_input).disabled(disabled),
+                    disabled,
+                ))
+                .child(self.form_row(
+                    t!("Settings.Backup.WebDav.remote_dir").to_string(),
+                    Input::new(&self.remote_dir_input).disabled(disabled),
+                    disabled,
+                ))
+                .child(self.form_row(
+                    t!("Settings.Backup.WebDav.username").to_string(),
+                    Input::new(&self.username_input).disabled(disabled),
+                    disabled,
+                ))
+                .child(
+                    self.form_row(
+                        t!("Settings.Backup.WebDav.password").to_string(),
+                        Input::new(&self.password_input)
+                            .mask_toggle()
+                            .disabled(disabled),
+                        disabled,
+                    ),
+                )
+                .when_some(self.status_message.clone(), |this, (success, message)| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(if success {
+                                cx.theme().muted_foreground
+                            } else {
+                                cx.theme().danger
+                            })
+                            .child(message),
+                    )
+                }),
+        )
+    }
+
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_shrink_0()
+            .justify_end()
+            .gap_2()
+            .p_4()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("webdav-test")
+                    .small()
+                    .label(if self.testing {
+                        t!("Settings.Backup.WebDav.testing").to_string()
+                    } else {
+                        t!("Settings.Backup.WebDav.test").to_string()
+                    })
+                    .disabled(self.testing || !self.enabled)
+                    .on_click(cx.listener(|view, _, _, cx| view.on_test(cx))),
+            )
+            .child(
+                Button::new("webdav-cancel")
+                    .small()
+                    .label(t!("Common.cancel").to_string())
+                    .disabled(self.testing)
+                    .on_click(|_, window, _| window.remove_window()),
+            )
+            .child(
+                Button::new("webdav-save")
+                    .small()
+                    .primary()
+                    .label(t!("Common.save").to_string())
+                    .disabled(self.testing)
+                    .on_click(cx.listener(|view, _, window, cx| view.on_save(window, cx))),
+            )
+    }
+}
+
+fn text_input(
+    window: &mut Window,
+    cx: &mut Context<WebDavBackupSettingsView>,
+    value: String,
+    placeholder: String,
+    masked: bool,
+) -> Entity<InputState> {
+    cx.new(move |cx| {
+        let mut state = InputState::new(window, cx)
+            .placeholder(placeholder)
+            .masked(masked);
+        if !value.is_empty() {
+            state.set_value(value, window, cx);
+        }
+        state
+    })
+}
+
+fn input_text(input: &Entity<InputState>, cx: &App) -> String {
+    input.read(cx).text().to_string()
+}
+
+fn toggle_row(enabled: bool, cx: &mut Context<WebDavBackupSettingsView>) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(t!("Settings.Backup.WebDav.enable").to_string()),
+        )
+        .child(
+            Switch::new("webdav-backup-enabled")
+                .checked(enabled)
+                .on_click(cx.listener(|view, checked, _, cx| {
+                    view.enabled = *checked;
+                    view.status_message = None;
+                    cx.notify();
+                })),
+        )
+}
+
+fn settings_dialog_title(title: String) -> impl IntoElement {
+    TitleBar::new().child(
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_1()
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .child(title),
+    )
+}
+
+pub(crate) fn show_webdav_backup_settings_window(cx: &mut App) {
+    open_popup_window(
+        PopupWindowOptions::new(t!("Settings.Backup.WebDav.dialog_title").to_string())
+            .size(580.0, 430.0),
+        move |window, cx| cx.new(|cx| WebDavBackupSettingsView::new(window, cx)),
+        cx,
+    );
 }
 
 // ============================================================================

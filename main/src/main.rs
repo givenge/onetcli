@@ -2,9 +2,8 @@
 
 rust_i18n::i18n!("locales", fallback = "en");
 
-mod auth;
-
 mod app_init;
+mod auth;
 mod external_driver_display;
 mod home;
 mod home_tab;
@@ -15,6 +14,8 @@ mod setting_tab;
 mod settings;
 mod update;
 mod user_avatar;
+mod webdav_backup;
+mod webdav_backup_manager;
 
 use crate::onetcli_app::OnetCliApp;
 use gpui::*;

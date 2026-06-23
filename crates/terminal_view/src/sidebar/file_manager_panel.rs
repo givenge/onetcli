@@ -3083,7 +3083,9 @@ impl FileManagerPanel {
                             .rounded_md()
                             .p(px(5.))
                             .when(!can_go_back, |el| el.opacity(0.4))
-                            .when(can_go_back, |el| el.hover(|s| s.bg(cx.theme().list_active)))
+                            .when(can_go_back, |el| {
+                                el.hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -3107,7 +3109,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -3133,7 +3135,7 @@ impl FileManagerPanel {
                             .p(px(5.))
                             .when(self.is_at_root(), |el| el.opacity(0.4))
                             .when(!self.is_at_root(), |el| {
-                                el.hover(|s| s.bg(cx.theme().list_active))
+                                el.hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -3202,7 +3204,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _, _window, cx| {
@@ -3226,7 +3228,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -3250,8 +3252,10 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
-                            .when(self.show_hidden, |el| el.bg(cx.theme().list_active))
+                            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
+                            .when(self.show_hidden, |el| {
+                                el.bg(cx.theme().primary.opacity(0.15))
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -3278,7 +3282,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _, _window, cx| {
@@ -3328,7 +3332,7 @@ impl FileManagerPanel {
                             .bg(cx.theme().secondary)
                             .cursor_text()
                             .rounded_md()
-                            .hover(|style| style.bg(cx.theme().list_active))
+                            .hover(|style| style.bg(cx.theme().primary.opacity(0.12)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.start_path_editing(window, cx);
                             }))
@@ -3630,7 +3634,7 @@ impl FileManagerPanel {
             .items_center()
             .gap_0p5()
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().list_active))
+            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _window, cx| {

@@ -2,9 +2,9 @@ use crate::new_connection::connection_kind::{NewConnectionCategory, NewConnectio
 use crate::new_connection::connection_window::{KEY_CONTEXT, NewConnectionWindow};
 use crate::new_connection::connection_window_layout::{
     BACK_BUTTON_INSET, CARD_BODY_GAP, CARD_GAP, CARD_HEIGHT, CARD_ICON_SIZE, CARD_ICON_TILE_SIZE,
-    CARD_PADDING_X, CARD_PADDING_Y, CARD_RADIUS, CARD_WIDTH, CONTENT_PADDING, FOOTER_PADDING,
-    NAV_ITEM_GAP, NAV_ITEM_HEIGHT, NAV_ITEM_ICON_SLOT, NAV_ITEM_PADDING_X, NAV_ITEM_RADIUS,
-    NAV_LIST_GAP, SIDEBAR_PADDING, SIDEBAR_WIDTH,
+    CARD_MIN_WIDTH, CARD_PADDING_X, CARD_PADDING_Y, CARD_RADIUS, CARD_WIDTH, CONTENT_PADDING,
+    FOOTER_PADDING, NAV_ITEM_GAP, NAV_ITEM_HEIGHT, NAV_ITEM_ICON_SLOT, NAV_ITEM_PADDING_X,
+    NAV_ITEM_RADIUS, NAV_LIST_GAP, SIDEBAR_PADDING, SIDEBAR_WIDTH,
 };
 use crate::new_connection::connection_window_parts::card_text;
 use gpui::prelude::FluentBuilder as _;
@@ -17,7 +17,7 @@ use gpui_component::{
     ActiveTheme, Disableable as _, Icon, InteractiveElementExt as _, Sizable as _, Size, TitleBar,
     button::{Button, ButtonVariants as _},
     chrome, h_flex,
-    scroll::ScrollableElement as _,
+    scroll::Scrollbar,
     v_flex,
 };
 use rust_i18n::t;
@@ -40,6 +40,7 @@ impl NewConnectionWindow {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w(px(SIDEBAR_WIDTH))
+            .flex_none()
             .h_full()
             .bg(cx.theme().sidebar)
             .border_r_1()
@@ -71,8 +72,8 @@ impl NewConnectionWindow {
             .text_color(cx.theme().muted_foreground)
             .cursor_pointer()
             .when(selected, |this| {
-                this.bg(cx.theme().sidebar_accent)
-                    .text_color(cx.theme().sidebar_accent_foreground)
+                this.bg(cx.theme().blue.opacity(0.1))
+                    .text_color(cx.theme().foreground)
             })
             .when(!selected, |this| {
                 this.hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.55)))
@@ -104,7 +105,11 @@ impl NewConnectionWindow {
     fn render_card_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .flex_1()
+            .flex_basis(px(0.0))
             .h_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
             .bg(cx.theme().muted)
             .child(
                 chrome::panel_header(cx)
@@ -114,23 +119,51 @@ impl NewConnectionWindow {
                         chrome::status_pill(cx).child(format!("{}", self.visible_items().len())),
                     ),
             )
+            .child(self.render_scrollable_card_grid(cx))
+    }
+
+    fn render_scrollable_card_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let scroll_handle = self.card_scroll_handle.clone();
+
+        div()
+            .flex_1()
+            .flex_basis(px(0.0))
+            .min_h_0()
+            .relative()
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .p(px(CONTENT_PADDING))
-                    .child(self.render_card_grid(cx)),
+                    .id("new-connection-card-scroll")
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll_handle)
+                    .child(
+                        div()
+                            .w_full()
+                            .p(px(CONTENT_PADDING))
+                            .pb(px(CONTENT_PADDING + FOOTER_PADDING))
+                            .child(self.render_card_grid(cx)),
+                    ),
             )
+            .child(Scrollbar::vertical(&scroll_handle))
     }
 
     fn render_card_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut grid = div().flex().flex_wrap().w_full().gap(px(CARD_GAP));
+        let mut grid = div()
+            .flex()
+            .flex_wrap()
+            .w_full()
+            .min_w_0()
+            .gap(px(CARD_GAP));
         for kind in self.visible_items() {
             grid = grid.child(
                 div()
-                    .w(px(CARD_WIDTH))
-                    .flex_shrink_0()
+                    .flex_basis(px(CARD_WIDTH))
+                    .min_w(px(CARD_MIN_WIDTH))
+                    .max_w(px(CARD_WIDTH))
+                    .flex_grow()
+                    .flex_shrink()
                     .child(self.render_connection_type_card(kind, cx)),
             );
         }
@@ -163,15 +196,16 @@ impl NewConnectionWindow {
             .shadow_sm()
             .cursor_pointer()
             .when(selected, |this| {
-                this.border_color(cx.theme().list_active_border)
-                    .bg(cx.theme().list_active)
+                this.border_color(cx.theme().blue.opacity(0.55))
+                    .bg(cx.theme().background)
                     .shadow_md()
+                    .child(selected_card_accent(cx))
             })
             .when(!selected, |this| this.border_color(cx.theme().border))
             .hover(|style| {
                 style
                     .shadow_md()
-                    .border_color(cx.theme().list_active_border)
+                    .border_color(cx.theme().blue.opacity(0.45))
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_kind = Some(click_kind.clone());
@@ -212,6 +246,7 @@ impl NewConnectionWindow {
 
     fn render_selection_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .flex_none()
             .justify_end()
             .gap_2()
             .p(px(FOOTER_PADDING))
@@ -239,22 +274,39 @@ impl NewConnectionWindow {
     }
 
     fn render_form_page(&self, form: AnyView, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().relative().child(form).child(
-            div()
-                .absolute()
-                .left(px(BACK_BUTTON_INSET))
-                .bottom(px(BACK_BUTTON_INSET))
-                .child(
-                    Button::new("back-to-new-connection-kind")
-                        .small()
-                        .outline()
-                        .label("上一步")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.go_back_to_selection(cx);
-                        })),
-                ),
-        )
+        div()
+            .size_full()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .child(form)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(BACK_BUTTON_INSET))
+                    .bottom(px(BACK_BUTTON_INSET))
+                    .child(
+                        Button::new("back-to-new-connection-kind")
+                            .small()
+                            .outline()
+                            .label("上一步")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.go_back_to_selection(cx);
+                            })),
+                    ),
+            )
     }
+}
+
+fn selected_card_accent(cx: &mut Context<NewConnectionWindow>) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .top(px(18.0))
+        .bottom(px(18.0))
+        .w(px(3.0))
+        .rounded_r(px(3.0))
+        .bg(cx.theme().blue)
 }
 
 impl Render for NewConnectionWindow {
@@ -275,6 +327,9 @@ impl Render for NewConnectionWindow {
             .child(
                 h_flex()
                     .flex_1()
+                    .flex_basis(px(0.0))
+                    .min_w_0()
+                    .min_h_0()
                     .w_full()
                     .overflow_hidden()
                     .child(self.render_sidebar(cx))

@@ -16,18 +16,16 @@ pub(super) fn card_text(
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(cx.theme().foreground)
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
+                .whitespace_normal()
+                .line_clamp(2)
                 .child(label),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
+                .whitespace_normal()
+                .line_clamp(2)
                 .child(description),
         )
 }

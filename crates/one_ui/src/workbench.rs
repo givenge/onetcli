@@ -109,7 +109,7 @@ pub fn side_toolbar_button(id: impl Into<ElementId>, is_active: bool, cx: &App) 
         .justify_center()
         .rounded_md()
         .cursor_pointer()
-        .when(is_active, |this| this.bg(cx.theme().accent))
+        .when(is_active, |this| this.bg(cx.theme().primary.opacity(0.15)))
         .when(!is_active, |this| {
             this.hover(|style| style.bg(cx.theme().muted))
         })

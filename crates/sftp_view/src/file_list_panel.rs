@@ -437,7 +437,7 @@ impl FileListPanel {
             .items_center()
             .gap_1()
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().list_active))
+            .hover(|s| s.bg(cx.theme().primary.opacity(0.12)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _window, cx| {

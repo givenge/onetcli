@@ -54,8 +54,9 @@ use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home::home_workspace_filter::WorkspaceFilterDelegate;
 use crate::license::{get_license_service, is_feature_enabled};
 use crate::new_connection::NewConnectionWindow;
-use crate::setting_tab::GlobalCurrentUser;
+use crate::setting_tab::{AppSettings, GlobalCurrentUser};
 use crate::user_avatar::render_user_avatar;
+use crate::webdav_backup;
 use remote_desktop_view::remote_desktop_form::{
     RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
 };
@@ -165,6 +166,10 @@ pub struct HomePage {
     /// 防止主密钥对话框被启动提示和用户点击重复打开。
     master_key_dialog_open: bool,
     port_forwarding_runtime: Arc<tokio::sync::Mutex<PortForwardingRuntime>>,
+    /// WebDAV 备份错误信息
+    pub(crate) backup_error: Option<String>,
+    /// 是否正在执行 WebDAV 备份
+    pub(crate) backing_up: bool,
 }
 
 fn external_driver_id_for_connection_form(
@@ -314,6 +319,8 @@ impl HomePage {
             port_forwarding_runtime: Arc::new(
                 tokio::sync::Mutex::new(PortForwardingRuntime::new()),
             ),
+            backup_error: None,
+            backing_up: false,
         };
 
         // 异步加载工作区
@@ -542,6 +549,51 @@ impl HomePage {
     pub(crate) fn refresh_local_home_data(&mut self, cx: &mut Context<Self>) {
         self.load_workspaces(cx);
         self.load_connections(cx);
+    }
+
+    /// 执行一次 WebDAV 备份。
+    pub(crate) fn backup_to_webdav(&mut self, cx: &mut Context<Self>) {
+        if self.backing_up {
+            return;
+        }
+
+        let settings = AppSettings::global(cx).webdav_backup.clone();
+        let http_client = cx.http_client();
+        let config_dir = match one_core::storage::manager::get_config_dir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.backup_error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        self.backing_up = true;
+        self.backup_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = webdav_backup::backup_to_webdav(settings, http_client, config_dir).await;
+            _ = this.update(cx, |this, cx| {
+                this.backing_up = false;
+                match result {
+                    Ok(result) => {
+                        tracing::info!(
+                            "WebDAV 备份完成：{} ({} bytes)",
+                            result.file_name,
+                            result.bytes
+                        );
+                        this.backup_error = None;
+                    }
+                    Err(err) => {
+                        tracing::error!("WebDAV 备份失败: {}", err);
+                        this.backup_error = Some(err);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 触发云端同步
@@ -2444,16 +2496,18 @@ impl Render for HomePage {
                 .child(
                     v_flex()
                         .flex_1()
+                        .min_w_0()
                         .h_full()
                         .bg(cx.theme().background)
                         .child(self.render_toolbar(window, cx))
                         .child(
                             div()
                                 .flex_1()
+                                .min_w_0()
                                 .w_full()
                                 .overflow_hidden()
                                 .bg(cx.theme().muted)
-                                .child(self.render_content_area(cx)),
+                                .child(self.render_content_area(window, cx)),
                         ),
                 ),
         )

@@ -1,17 +1,17 @@
 use crate::home::home_layout::SEARCH_WIDTH;
 use crate::home_tab::HomePage;
-use crate::license::{is_feature_enabled, show_upgrade_dialog};
+use crate::setting_tab::{AppSettings, show_webdav_backup_settings_window};
+use crate::webdav_backup_manager::show_webdav_backup_manager_window;
 use gpui::{
     Context, Entity, IntoElement, ParentElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme, Disableable as _, IconName, WindowExt,
+    button::{Button, ButtonVariant, ButtonVariants as _},
     chrome, h_flex,
     input::Input,
 };
-use one_core::{crypto, license::Feature};
 use rust_i18n::t;
 
 impl HomePage {
@@ -32,19 +32,23 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let view = cx.entity();
-        let has_master_key = crypto::has_master_key();
-        let has_conflicts = !self.pending_conflicts.is_empty();
-        let conflict_count = self.pending_conflicts.len();
 
         h_flex()
             .gap_2()
             .items_center()
             .child(new_connection_button(view, window))
-            .child(self.sync_button(cx))
-            .when(has_conflicts, |this| {
-                this.child(self.conflict_button(conflict_count, cx))
+            .child(self.backup_button(window, cx))
+            .child(self.restore_button(cx))
+            .when_some(self.backup_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .max_w(px(360.0))
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .truncate()
+                        .child(error),
+                )
             })
-            .child(encryption_key_button(has_master_key, cx))
     }
 
     fn render_secondary_toolbar_actions(
@@ -80,7 +84,8 @@ impl HomePage {
 fn new_connection_button(view: Entity<HomePage>, window: &mut Window) -> impl IntoElement {
     Button::new("new-connect-button")
         .icon(IconName::Plus)
-        .primary()
+        .with_variant(ButtonVariant::Secondary)
+        .outline()
         .label(t!("Home.new_connection"))
         .tooltip(t!("Home.new_connection"))
         .on_click(window.listener_for(&view, move |this, _, window, cx| {
@@ -89,82 +94,67 @@ fn new_connection_button(view: Entity<HomePage>, window: &mut Window) -> impl In
 }
 
 impl HomePage {
-    fn sync_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_syncing = self.syncing;
-        let is_logged_in = self.current_user.is_some();
-        let has_sync_license = is_feature_enabled(Feature::CloudSync, cx);
+    fn backup_button(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let backing_up = self.backing_up;
+        let backup_enabled = AppSettings::global(cx).webdav_backup.enabled;
+        let view = cx.entity().clone();
 
-        Button::new("sync-button")
-            .icon(if has_sync_license {
-                IconName::Refresh
+        Button::new("webdav-backup-button")
+            .icon(IconName::Upload)
+            .label(if backing_up {
+                t!("Home.backing_up").to_string()
             } else {
-                IconName::Key
+                t!("Home.backup").to_string()
             })
-            .label(sync_button_label(is_syncing, has_sync_license))
-            .ghost()
-            .disabled((!is_logged_in && has_sync_license) || is_syncing)
-            .tooltip(sync_button_tooltip(is_logged_in, has_sync_license))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if !has_sync_license {
-                    show_upgrade_dialog(window, cx);
+            .with_variant(ButtonVariant::Secondary)
+            .outline()
+            .disabled(backing_up)
+            .tooltip(if backup_enabled {
+                t!("Home.backup_tooltip")
+            } else {
+                t!("Settings.Backup.WebDav.open")
+            })
+            .on_click(window.listener_for(&view, move |_this, _, window, cx| {
+                if backup_enabled {
+                    let view = cx.entity().clone();
+                    window.open_dialog(cx, move |dialog, _window, _cx| {
+                        let view_for_ok = view.clone();
+                        dialog
+                            .title(t!("Home.backup_confirm_title").to_string())
+                            .child(t!("Home.backup_confirm_message").to_string())
+                            .confirm()
+                            .on_ok(move |_, _, cx| {
+                                let _ = view_for_ok.update(cx, |this, cx| {
+                                    this.backup_to_webdav(cx);
+                                });
+                                true
+                            })
+                    });
                 } else {
-                    this.trigger_sync(cx);
+                    show_webdav_backup_settings_window(cx);
                 }
             }))
     }
 
-    fn conflict_button(&self, conflict_count: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("conflict-button")
-            .icon(IconName::TriangleAlert)
-            .label(format!("{conflict_count}"))
-            .ghost()
-            .text_color(cx.theme().warning)
-            .tooltip(t!("Home.conflict_tooltip", count = conflict_count))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.show_conflict_dialog(window, cx);
+    fn restore_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let backup_enabled = AppSettings::global(cx).webdav_backup.enabled;
+
+        Button::new("webdav-restore-button")
+            .icon(IconName::HardDrive)
+            .label(t!("Home.restore").to_string())
+            .with_variant(ButtonVariant::Secondary)
+            .outline()
+            .tooltip(if backup_enabled {
+                t!("Home.restore_tooltip")
+            } else {
+                t!("Settings.Backup.WebDav.open")
+            })
+            .on_click(cx.listener(move |_, _, _, cx| {
+                if backup_enabled {
+                    show_webdav_backup_manager_window(cx);
+                } else {
+                    show_webdav_backup_settings_window(cx);
+                }
             }))
     }
-}
-
-fn sync_button_label(is_syncing: bool, has_sync_license: bool) -> String {
-    if is_syncing {
-        t!("Home.syncing").to_string()
-    } else if !has_sync_license {
-        t!("License.upgrade_to_pro").to_string()
-    } else {
-        t!("Home.sync").to_string()
-    }
-}
-
-fn sync_button_tooltip(is_logged_in: bool, has_sync_license: bool) -> String {
-    if !is_logged_in && has_sync_license {
-        t!("Home.cloud_need_login").to_string()
-    } else if !has_sync_license {
-        t!("License.pro_required").to_string()
-    } else {
-        t!("Home.sync_tooltip").to_string()
-    }
-}
-
-fn encryption_key_button(has_master_key: bool, cx: &mut Context<HomePage>) -> impl IntoElement {
-    Button::new("encryption-key-button")
-        .icon(IconName::Key)
-        .label(if has_master_key {
-            t!("Encryption.key_unlocked").to_string()
-        } else {
-            t!("Encryption.edit_repo_password").to_string()
-        })
-        .ghost()
-        .when(has_master_key, |btn| btn.text_color(cx.theme().success))
-        .when(!has_master_key, |btn| {
-            btn.text_color(cx.theme().muted_foreground)
-        })
-        .tooltip(if has_master_key {
-            t!("Encryption.key_unlocked_tooltip")
-        } else {
-            t!("Encryption.key_locked_tooltip")
-        })
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.show_encryption_key_dialog(window, cx);
-        }))
 }

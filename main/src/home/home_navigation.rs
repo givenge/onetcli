@@ -3,8 +3,6 @@ use crate::home::home_layout::{
     NAV_LIST_GAP, SIDEBAR_PADDING, SIDEBAR_WIDTH,
 };
 use crate::home_tab::HomePage;
-use crate::setting_tab::GlobalCurrentUser;
-use crate::user_avatar::render_user_avatar;
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
@@ -44,7 +42,7 @@ impl HomePage {
             )
             .child(
                 Button::new("rail-ai")
-                    .icon(IconName::ChatDB.color())
+                    .icon(IconName::ChatDB)
                     .ghost()
                     .tooltip("ChatDB")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -68,11 +66,6 @@ impl HomePage {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let global_user = GlobalCurrentUser::get_user(cx);
-        if global_user.is_none() && self.current_user.is_some() {
-            self.current_user = None;
-        }
-
         v_flex()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -83,7 +76,6 @@ impl HomePage {
             .bg(cx.theme().sidebar)
             .child(self.render_connection_type_buttons(cx))
             .child(div().flex_1())
-            .child(self.render_navigation_user(cx))
     }
 
     fn render_connection_type_buttons(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -115,8 +107,8 @@ impl HomePage {
             .text_color(cx.theme().muted_foreground)
             .cursor_pointer()
             .when(selected, |this| {
-                this.bg(cx.theme().sidebar_accent)
-                    .text_color(cx.theme().sidebar_accent_foreground)
+                this.bg(cx.theme().blue.opacity(0.1))
+                    .text_color(cx.theme().foreground)
             })
             .when(!selected, |this| {
                 this.hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.55)))
@@ -142,26 +134,5 @@ impl HomePage {
                 cx.notify();
             }))
             .into_any_element()
-    }
-
-    fn render_navigation_user(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let user = self.current_user.as_ref();
-        let view = cx.entity();
-
-        v_flex()
-            .w_full()
-            .pt_2()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .child(render_user_avatar(
-                user,
-                view,
-                |this: &mut HomePage, window, cx| {
-                    if this.current_user.is_none() {
-                        this.show_login_dialog(window, cx);
-                    }
-                },
-                cx,
-            ))
     }
 }

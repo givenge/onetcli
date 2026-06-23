@@ -1197,7 +1197,7 @@ fn render_process_column(
                 .p_2()
                 .gap_0p5()
                 .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().list_active))
+                .hover(|style| style.bg(cx.theme().primary.opacity(0.12)))
                 .tooltip(move |window, cx| Tooltip::new(tooltip_command.clone()).build(window, cx))
                 .child(
                     h_flex()

@@ -1,0 +1,171 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1777274988688,
+  "projectRoot": "/Users/mac/project/onetcli",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "examples"
+    ],
+    "gitBranches": {
+      "defaultBranch": "dev",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1777274988683,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 16,
+      "lastAccessed": 1777274988684,
+      "keyFiles": [
+        "README.md",
+        "bun.lock",
+        "changelog.md",
+        "contributors.md",
+        "contributors.vue"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 2,
+      "lastAccessed": 1777274988685,
+      "keyFiles": [
+        "README.md"
+      ]
+    },
+    "main": {
+      "path": "main",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1777274988686,
+      "keyFiles": [
+        "Cargo.toml",
+        "build.rs"
+      ]
+    },
+    "resources": {
+      "path": "resources",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1777274988686,
+      "keyFiles": []
+    },
+    "script": {
+      "path": "script",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1777274988686,
+      "keyFiles": [
+        "bootstrap",
+        "bump-version.sh",
+        "bundle-macos-dmg.sh",
+        "bundle-macos.sh",
+        "generate-macos-icon.sh"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1777274988686,
+      "keyFiles": [
+        "CACHEDIR.TAG",
+        "state.json"
+      ]
+    },
+    "themes": {
+      "path": "themes",
+      "purpose": null,
+      "fileCount": 21,
+      "lastAccessed": 1777274988687,
+      "keyFiles": [
+        "adventure.json",
+        "alduin.json",
+        "asciinema.json",
+        "ayu.json",
+        "catppuccin.json"
+      ]
+    },
+    "crates/assets": {
+      "path": "crates/assets",
+      "purpose": "Static assets",
+      "fileCount": 2,
+      "lastAccessed": 1777274988687,
+      "keyFiles": [
+        "Cargo.toml",
+        "README.md"
+      ]
+    },
+    "docs/data": {
+      "path": "docs/data",
+      "purpose": "Data files",
+      "fileCount": 3,
+      "lastAccessed": 1777274988687,
+      "keyFiles": [
+        "contributors.data.js",
+        "repo.data.js",
+        "skills.data.js"
+      ]
+    },
+    "main/assets": {
+      "path": "main/assets",
+      "purpose": "Static assets",
+      "fileCount": 0,
+      "lastAccessed": 1777274988687,
+      "keyFiles": []
+    },
+    "main/src": {
+      "path": "main/src",
+      "purpose": "Source code",
+      "fileCount": 8,
+      "lastAccessed": 1777274988687,
+      "keyFiles": [
+        "app_init.rs",
+        "auth.rs",
+        "home_tab.rs"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}

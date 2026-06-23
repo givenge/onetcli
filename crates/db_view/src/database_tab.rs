@@ -13,7 +13,7 @@ use db::{
 };
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Axis, Bounds, Context, Element, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, MouseMoveEvent,
+    FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString, Style, Styled, Task, Window,
     div, prelude::FluentBuilder, px,
 };
@@ -433,8 +433,8 @@ impl DatabaseTabView {
                                     .child("⟳")
                             })
                             .when(is_error, |this| {
-                                this.bg(Hsla::red())
-                                    .text_color(gpui::white())
+                                this.bg(cx.theme().danger)
+                                    .text_color(cx.theme().danger_foreground)
                                     .text_2xl()
                                     .child("✕")
                             }),
@@ -483,7 +483,7 @@ impl DatabaseTabView {
                 div()
                     .text_lg()
                     .when(!is_error, |this| this.text_color(cx.theme().accent))
-                    .when(is_error, |this| this.text_color(Hsla::red()))
+                    .when(is_error, |this| this.text_color(cx.theme().danger))
                     .child(status_text),
             )
             .into_any_element()

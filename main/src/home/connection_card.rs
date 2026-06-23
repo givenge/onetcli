@@ -8,11 +8,10 @@ use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home_tab::HomePage;
 use gpui::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, InteractiveElementExt as _, v_flex};
-use one_core::crypto;
 use one_core::storage::{ActiveConnections, StoredConnection, Workspace};
 
 pub(crate) struct ConnectionCardRenderData {
@@ -122,17 +121,29 @@ fn connection_card_shell(
         .shadow_sm()
         .group("")
         .when(is_selected, |this| {
-            this.border_color(cx.theme().list_active_border)
-                .bg(cx.theme().list_active)
+            this.border_color(cx.theme().blue.opacity(0.55))
+                .bg(cx.theme().background)
                 .shadow_md()
+                .child(selected_card_accent(cx))
         })
         .when(!is_selected, |this| this.border_color(cx.theme().border))
         .cursor_pointer()
         .hover(|style| {
             style
                 .shadow_md()
-                .border_color(cx.theme().list_active_border)
+                .border_color(cx.theme().blue.opacity(0.45))
         })
+}
+
+fn selected_card_accent(cx: &mut Context<HomePage>) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .top(px(18.0))
+        .bottom(px(18.0))
+        .w(px(3.0))
+        .rounded_r(px(3.0))
+        .bg(cx.theme().blue)
 }
 
 fn connection_card_interactions(
@@ -164,11 +175,6 @@ fn connection_card_interactions(
         this.move_connection_card(drag.connection_id, workspace_id, card_conn_id, cx);
     }))
     .on_double_click(cx.listener(move |this, _, w, cx| {
-        if !crypto::has_master_key() && crypto::has_repo_password_set() {
-            this.show_encryption_key_dialog(w, cx);
-            return;
-        }
-
         let strategy = build_connection_open_strategy(open_conn.clone(), workspace.clone());
         strategy.open(this, w, cx);
         cx.notify()

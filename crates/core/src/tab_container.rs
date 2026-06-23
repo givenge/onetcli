@@ -1,11 +1,12 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyView, App, AppContext as _, Context, Corner, Decorations, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    RenderOnce, SharedString, Styled, Task, Window, WindowControlArea, div, px,
+    AnyElement, AnyView, App, AppContext as _, Context, Corner, Decorations, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Render, RenderOnce, SharedString, Styled, Task, Window, WindowControlArea, div,
+    px,
 };
 use gpui::{ScrollHandle, StatefulInteractiveElement as _};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::list::{List, ListDelegate, ListState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::popover::Popover;
@@ -16,6 +17,7 @@ use gpui_component::{
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 // ============================================================================
@@ -701,6 +703,7 @@ pub struct TabContainer {
     tab_list: Option<Entity<ListState<TabListDelegate>>>,
     closing_tabs: HashSet<SharedString>,
     show_window_controls: bool,
+    trailing_controls: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     /// Pinned tab that stays fixed before the scrollable tab list
     pinned_tab: Option<TabItem>,
     /// Whether the pinned tab is currently active (showing its content)
@@ -732,6 +735,7 @@ impl TabContainer {
             tab_list: None,
             closing_tabs: HashSet::new(),
             show_window_controls: false,
+            trailing_controls: None,
             pinned_tab: None,
             pinned_tab_active: false,
         }
@@ -784,6 +788,14 @@ impl TabContainer {
 
     pub fn with_window_controls(mut self, show: bool) -> Self {
         self.show_window_controls = show;
+        self
+    }
+
+    pub fn with_trailing_controls(
+        mut self,
+        render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.trailing_controls = Some(Rc::new(render));
         self
     }
 
@@ -1529,6 +1541,7 @@ impl TabContainer {
         let close_btn_color = self
             .tab_close_button_color
             .unwrap_or(theme.muted_foreground);
+        let close_btn_hover_bg = theme.muted_foreground.opacity(0.2);
         let drag_border_color = theme.drag_border;
         let active_index = self.active_index;
         let left_padding = self.left_padding.unwrap_or(px(8.0));
@@ -1542,6 +1555,8 @@ impl TabContainer {
         let show_window_controls = self.show_window_controls;
         let enable_titlebar_interactions = show_window_controls || is_macos;
         let allow_tab_drag = !is_macos;
+        let trailing_controls = self.trailing_controls.clone();
+        let show_tab_dropdown = false;
 
         // 使用状态管理窗口拖动
         let drag_state = window.use_state(cx, |_, _| TabBarDragState { should_move: false });
@@ -1802,11 +1817,11 @@ impl TabContainer {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .rounded(px(2.0))
+                                        .rounded_full()
                                         .cursor_pointer()
                                         .text_color(close_btn_color)
-                                        .hover(|style| {
-                                            style.bg(gpui::rgb(0x5a5a5a)).text_color(text_color)
+                                        .hover(move |style| {
+                                            style.bg(close_btn_hover_bg).text_color(text_color)
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -1883,80 +1898,98 @@ impl TabContainer {
                             })
                     })),
             )
-            .child(
-                Popover::new("tab-list-popover")
-                    .anchor(Corner::TopRight)
-                    .p_0()
-                    .open(self.list_popover_open)
-                    .on_open_change(cx.listener(move |this, open, window, cx| {
-                        this.list_popover_open = *open;
-                        if *open {
-                            let tabs_data: Vec<(usize, SharedString, Option<Icon>, bool)> = this
-                                .tabs
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, tab)| {
-                                    (
-                                        idx,
-                                        tab.content().title(cx),
-                                        tab.content().icon(cx),
-                                        tab.content().closeable(cx),
-                                    )
-                                })
-                                .collect();
-                            let container = cx.entity();
+            .when(show_tab_dropdown, |el| {
+                el.child(
+                    Popover::new("tab-list-popover")
+                        .anchor(Corner::TopRight)
+                        .p_0()
+                        .open(self.list_popover_open)
+                        .on_open_change(cx.listener(move |this, open, window, cx| {
+                            this.list_popover_open = *open;
+                            if *open {
+                                let tabs_data: Vec<(usize, SharedString, Option<Icon>, bool)> =
+                                    this.tabs
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, tab)| {
+                                            (
+                                                idx,
+                                                tab.content().title(cx),
+                                                tab.content().icon(cx),
+                                                tab.content().closeable(cx),
+                                            )
+                                        })
+                                        .collect();
+                                let container = cx.entity();
 
-                            if let Some(tab_list) = &this.tab_list {
-                                tab_list.update(cx, |state, _| {
-                                    let delegate = state.delegate_mut();
-                                    delegate.tabs = tabs_data.clone();
-                                    delegate.filtered_tabs = tabs_data;
-                                });
-                            } else {
-                                this.tab_list = Some(cx.new(|cx| {
-                                    ListState::new(
-                                        TabListDelegate {
-                                            container,
-                                            tabs: tabs_data.clone(),
-                                            filtered_tabs: tabs_data,
-                                            selected_index: None,
-                                        },
-                                        window,
-                                        cx,
-                                    )
-                                    .searchable(true)
-                                }));
+                                if let Some(tab_list) = &this.tab_list {
+                                    tab_list.update(cx, |state, _| {
+                                        let delegate = state.delegate_mut();
+                                        delegate.tabs = tabs_data.clone();
+                                        delegate.filtered_tabs = tabs_data;
+                                    });
+                                } else {
+                                    this.tab_list = Some(cx.new(|cx| {
+                                        ListState::new(
+                                            TabListDelegate {
+                                                container,
+                                                tabs: tabs_data.clone(),
+                                                filtered_tabs: tabs_data,
+                                                selected_index: None,
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .searchable(true)
+                                    }));
+                                }
                             }
-                        }
-                        cx.notify();
-                    }))
-                    .when_some(tab_list.as_ref(), |popover, list| {
-                        popover.track_focus(&list.focus_handle(cx))
-                    })
-                    .trigger(
-                        Button::new("tab-dropdown-btn")
-                            .icon(IconName::ChevronDown)
-                            .ghost()
-                            .compact(),
-                    )
-                    .when_some(tab_list, |popover, list| {
-                        popover.child(
-                            List::new(&list)
-                                .w(px(280.0))
-                                .max_h(px(300.0))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius),
+                            cx.notify();
+                        }))
+                        .when_some(tab_list.as_ref(), |popover, list| {
+                            popover.track_focus(&list.focus_handle(cx))
+                        })
+                        .trigger(
+                            Button::new("tab-dropdown-btn")
+                                .icon(IconName::ChevronDown)
+                                .small()
+                                .custom(
+                                    ButtonCustomVariant::new(cx)
+                                        .color(gpui::rgba(0xffffff18).into())
+                                        .foreground(gpui::white())
+                                        .border(gpui::rgba(0xffffff4d).into())
+                                        .hover(gpui::rgba(0xffffff2a).into())
+                                        .active(gpui::rgba(0xffffff36).into()),
+                                ),
                         )
-                    }),
-            )
+                        .when_some(tab_list, |popover, list| {
+                            popover.child(
+                                List::new(&list)
+                                    .w(px(280.0))
+                                    .max_h(px(300.0))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .rounded(cx.theme().radius),
+                            )
+                        }),
+                )
+            })
+            .when_some(trailing_controls, |el, render_controls| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .pr_2()
+                        .when_some(self.top_padding, |div, padding| div.pt(padding))
+                        .child(render_controls(window, cx)),
+                )
+            })
             .when(
                 cfg!(not(target_os = "macos")) && self.show_window_controls,
-                |el| el.child(self.render_window_controls(window)),
+                |el| el.child(self.render_window_controls(window, cx)),
             )
     }
 
-    fn render_window_controls(&self, window: &mut Window) -> impl IntoElement {
+    fn render_window_controls(&self, window: &mut Window, cx: &App) -> impl IntoElement {
         let is_linux = cfg!(target_os = "linux");
         let is_windows = cfg!(target_os = "windows");
         let is_maximized = window.is_maximized();
@@ -1973,6 +2006,7 @@ impl TabContainer {
                 is_linux,
                 is_windows,
                 false,
+                cx,
             ))
             .child(self.render_control_button(
                 if is_maximized { "restore" } else { "maximize" },
@@ -1985,6 +2019,7 @@ impl TabContainer {
                 is_linux,
                 is_windows,
                 false,
+                cx,
             ))
             .child(self.render_control_button(
                 "close",
@@ -1993,6 +2028,7 @@ impl TabContainer {
                 is_linux,
                 is_windows,
                 true,
+                cx,
             ))
     }
 
@@ -2004,6 +2040,7 @@ impl TabContainer {
         is_linux: bool,
         is_windows: bool,
         is_close: bool,
+        cx: &App,
     ) -> impl IntoElement {
         div()
             .id(id)
@@ -2014,19 +2051,21 @@ impl TabContainer {
             .justify_center()
             .content_center()
             .items_center()
-            .text_color(gpui::white())
+            .text_color(cx.theme().foreground)
             .hover(move |style| {
                 if is_close {
                     style.bg(gpui::rgb(0xe81123)).text_color(gpui::white())
                 } else {
-                    style.bg(gpui::rgb(0x3a3a3a)).text_color(gpui::white())
+                    style.bg(cx.theme().muted).text_color(cx.theme().foreground)
                 }
             })
             .active(move |style| {
                 if is_close {
                     style.bg(gpui::rgb(0xc50f1f)).text_color(gpui::white())
                 } else {
-                    style.bg(gpui::rgb(0x2a2a2a)).text_color(gpui::white())
+                    style
+                        .bg(cx.theme().muted.opacity(0.8))
+                        .text_color(cx.theme().foreground)
                 }
             })
             .when(is_windows, move |this| {

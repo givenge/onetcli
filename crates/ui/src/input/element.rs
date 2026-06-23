@@ -542,6 +542,7 @@ impl TextElement {
         font_size: Pixels,
         style: &TextStyle,
         window: &mut Window,
+        cx: &App,
     ) -> (Pixels, usize) {
         let total_lines = text.lines_len();
         let line_number_len = match total_lines {
@@ -558,7 +559,7 @@ impl TextElement {
                 &[TextRun {
                     len: line_number_len,
                     font: style.font(),
-                    color: gpui::black(),
+                    color: cx.theme().muted_foreground,
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -1075,7 +1076,7 @@ impl Element for TextElement {
 
         // Calculate the width of the line numbers
         let (line_number_width, line_number_len) =
-            Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
+            Self::layout_line_numbers(&state, &text, text_size, &text_style, window, cx);
 
         let wrap_width = if multi_line && state.soft_wrap {
             Some(bounds.size.width - line_number_width - RIGHT_MARGIN)
@@ -1197,7 +1198,7 @@ impl Element for TextElement {
                     &[TextRun {
                         len: longest_line.len(),
                         font: style.font(),
-                        color: gpui::black(),
+                        color: cx.theme().muted_foreground,
                         background_color: None,
                         underline: None,
                         strikethrough: None,

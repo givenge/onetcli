@@ -576,19 +576,18 @@ impl SshBackend {
         pty_config: &PtyConfig,
         setup: Option<&ShellIntegrationSetup>,
     ) -> anyhow::Result<()> {
+        Self::set_utf8_locale_env(channel).await;
+
         let Some(setup) = setup else {
             // 降级路径：远端没有安装 integration，只请求基本 pty + shell。
             channel.request_pty(pty_config).await?;
             channel.request_shell().await?;
             return Ok(());
         };
-        let locale = preferred_utf8_locale(&[]);
         channel.set_env("ONETCLI_SHELL_INTEGRATION", "1").await?;
         channel
             .set_env("ONETCLI_ORIG_ZDOTDIR", &setup.home_dir)
             .await?;
-        channel.set_env("LANG", &locale).await?;
-        channel.set_env("LC_CTYPE", &locale).await?;
 
         match setup.login_shell.as_deref().map(shell_basename) {
             Some("zsh") => {
@@ -616,6 +615,21 @@ impl SshBackend {
         }
 
         Ok(())
+    }
+
+    async fn set_utf8_locale_env(channel: &mut dyn SshChannel) {
+        let locale = preferred_utf8_locale(&[]);
+        for key in ["LANG", "LC_CTYPE"] {
+            if let Err(err) = channel.set_env(key, &locale).await {
+                tracing::warn!(
+                    target: "terminal.ssh",
+                    key,
+                    locale,
+                    error = %err,
+                    "remote ssh server rejected UTF-8 locale env"
+                );
+            }
+        }
     }
 }
 
@@ -842,10 +856,10 @@ mod tests {
         assert_eq!(
             recorded_ops(&interactive_state),
             vec![
-                ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
-                ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
                 ChannelOp::SetEnv("LANG".into(), locale.clone()),
                 ChannelOp::SetEnv("LC_CTYPE".into(), locale),
+                ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
+                ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
                 ChannelOp::SetEnv(
                     "ZDOTDIR".into(),
                     "/tmp/home/.config/onetcli/sessions/42/zsh".into(),
@@ -891,10 +905,10 @@ mod tests {
         assert_eq!(
             interactive_ops[0..5],
             [
-                ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
-                ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
                 ChannelOp::SetEnv("LANG".into(), locale.clone()),
                 ChannelOp::SetEnv("LC_CTYPE".into(), locale),
+                ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
+                ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
                 ChannelOp::RequestPty,
             ]
         );
@@ -968,7 +982,9 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_ssh_channel_falls_back_to_plain_shell_when_setup_fails() {
-        // setup 通道返回 exit 1，应该被降级路径捕获：interactive 通道不 set_env、只 pty+shell。
+        // setup 通道返回 exit 1，应该被降级路径捕获：interactive 通道只设置 UTF-8 locale，
+        // 然后走 pty+shell，不走 integration wrapper。
+        let locale = preferred_utf8_locale(&[]);
         let (setup_channel, setup_state) = MockChannel::new(
             [
                 ChannelEvent::ExtendedData {
@@ -1005,14 +1021,20 @@ mod tests {
         );
         assert_eq!(
             recorded_ops(&interactive_state),
-            vec![ChannelOp::RequestPty, ChannelOp::RequestShell],
-            "降级路径绝对不能调 set_env，也不能走 bash wrapper exec"
+            vec![
+                ChannelOp::SetEnv("LANG".into(), locale.clone()),
+                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
+                ChannelOp::RequestPty,
+                ChannelOp::RequestShell,
+            ],
+            "降级路径只应设置 UTF-8 locale 后启动裸 shell，不能走 bash wrapper exec"
         );
     }
 
     #[tokio::test]
     async fn prepare_ssh_channel_skips_setup_when_cache_hit() {
         // 命中缓存：只应打开 1 个 channel（interactive）。mock client 只提供 1 个 channel。
+        let locale = preferred_utf8_locale(&[]);
         let (interactive_channel, interactive_state) = MockChannel::new([], false);
         let mut client = MockClient::new([interactive_channel]);
 
@@ -1039,6 +1061,8 @@ mod tests {
         assert_eq!(
             recorded_ops(&interactive_state),
             vec![
+                ChannelOp::SetEnv("LANG".into(), locale.clone()),
+                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
                 ChannelOp::SetEnv("ONETCLI_SHELL_INTEGRATION".into(), "1".into()),
                 ChannelOp::SetEnv("ONETCLI_ORIG_ZDOTDIR".into(), "/tmp/home".into()),
                 ChannelOp::SetEnv(
@@ -1054,7 +1078,8 @@ mod tests {
     #[tokio::test]
     async fn prepare_ssh_channel_skips_setup_when_disabled() {
         // 用户在连接配置里显式关闭 shell integration:不开 setup channel,只开 1 个 interactive
-        // channel 走裸 PTY + shell;且不向 manager 写入任何缓存。
+        // channel 设置 UTF-8 locale 后走裸 PTY + shell;且不向 manager 写入任何缓存。
+        let locale = preferred_utf8_locale(&[]);
         let (interactive_channel, interactive_state) = MockChannel::new([], false);
         let mut client = MockClient::new([interactive_channel]);
 
@@ -1074,8 +1099,13 @@ mod tests {
         );
         assert_eq!(
             recorded_ops(&interactive_state),
-            vec![ChannelOp::RequestPty, ChannelOp::RequestShell],
-            "禁用路径只跑 pty + shell,不调 set_env / exec wrapper"
+            vec![
+                ChannelOp::SetEnv("LANG".into(), locale.clone()),
+                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
+                ChannelOp::RequestPty,
+                ChannelOp::RequestShell,
+            ],
+            "禁用路径只设置 UTF-8 locale 后启动 pty + shell，不跑 exec wrapper"
         );
     }
 

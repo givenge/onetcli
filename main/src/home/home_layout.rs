@@ -10,6 +10,7 @@ pub(crate) const CARD_GAP: f32 = 16.0;
 pub(crate) const CARD_HEIGHT: f32 = 96.0;
 pub(crate) const CARD_ICON_SIZE: f32 = 32.0;
 pub(crate) const CARD_ICON_TILE_SIZE: f32 = 44.0;
+pub(crate) const CARD_MIN_WIDTH: f32 = 280.0;
 pub(crate) const CARD_PADDING_X: f32 = 14.0;
 pub(crate) const CARD_PADDING_Y: f32 = 12.0;
 pub(crate) const CARD_RADIUS: f32 = 8.0;

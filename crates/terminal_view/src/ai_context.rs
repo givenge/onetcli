@@ -77,8 +77,10 @@ mod tests {
                 keepalive_max: None,
                 jump_server: None,
                 proxy: None,
+                keyboard_interactive_responder: None,
             },
             pty_config: PtyConfig::default(),
+            disable_shell_integration: false,
         }
     }
 

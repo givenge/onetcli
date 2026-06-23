@@ -279,6 +279,7 @@ pub struct CachedTextRun {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// 该文本 run 占用的终端 cell 数量，CJK/emoji 宽字符按 2 个 cell 计算。
     pub char_count: usize,
 }
 
@@ -696,37 +697,6 @@ impl RenderCache {
         self.last_selection = content.selection.clone();
     }
 
-    /// 计算并同步左边缘列指纹，返回发生变化的行。
-    ///
-    /// 目的：在某些复杂 ANSI 序列下，`TermDamage::Partial` 可能未覆盖到首列擦除场景，
-    /// 该指纹用于兜底发现“首几列变化但未标脏”的行，避免残字。
-    fn detect_left_edge_changed_lines(
-        &mut self,
-        term: &Term<GpuiEventProxy>,
-        probe_cols: usize,
-    ) -> Vec<usize> {
-        let current = self.compute_left_edge_fingerprint(term, probe_cols);
-
-        if self.left_edge_fingerprint.len() != self.num_lines {
-            self.left_edge_fingerprint.resize(self.num_lines, 0);
-        }
-
-        let mut changed = Vec::new();
-        for (line_idx, (old, new)) in self
-            .left_edge_fingerprint
-            .iter()
-            .zip(current.iter())
-            .enumerate()
-        {
-            if old != new {
-                changed.push(line_idx);
-            }
-        }
-
-        self.left_edge_fingerprint = current;
-        changed
-    }
-
     fn sync_left_edge_fingerprint(&mut self, term: &Term<GpuiEventProxy>, probe_cols: usize) {
         self.left_edge_fingerprint = self.compute_left_edge_fingerprint(term, probe_cols);
     }
@@ -928,6 +898,26 @@ impl RenderCache {
 
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
+            let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            if cell_width > 1 {
+                if let Some(run) = text_run.take() {
+                    line.text_runs.push(run);
+                }
+                line.text_runs.push(CachedTextRun {
+                    start_col: cell.column,
+                    text: cell.c.to_string(),
+                    color: fg,
+                    bold,
+                    italic,
+                    underline,
+                    char_count: cell_width,
+                });
+                continue;
+            }
 
             // Check if we can merge with existing run
             let can_merge = if let Some(ref run) = text_run {
@@ -944,7 +934,7 @@ impl RenderCache {
             if can_merge {
                 let run = text_run.as_mut().unwrap();
                 run.text.push(cell.c);
-                run.char_count += 1;
+                run.char_count += cell_width;
             } else {
                 if let Some(run) = text_run.take() {
                     line.text_runs.push(run);
@@ -956,7 +946,7 @@ impl RenderCache {
                     bold,
                     italic,
                     underline,
-                    char_count: 1,
+                    char_count: cell_width,
                 });
             }
         }
@@ -1572,7 +1562,9 @@ fn indexed_color_to_hsla(idx: u8) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockRect, block_element_geometry};
+    use super::{BlockRect, RenderCache, block_element_geometry};
+    use crate::TerminalTheme;
+    use crate::addon::AddonManager;
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::{Config as TermConfig, Term};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
@@ -1731,5 +1723,53 @@ mod tests {
         cache.update(&mut term, &addon_manager, &theme);
 
         assert_eq!(line_text(&cache, 0), "abcd2222");
+    }
+
+    #[test]
+    fn utf8_chinese_text_round_trips_through_render_cache() {
+        let (event_tx, _event_rx) = unbounded_channel::<TerminalEvent>();
+        let event_proxy = GpuiEventProxy::new(event_tx);
+        let mut term = Term::new(TermConfig::default(), &TestDimensions, event_proxy);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        let addon_manager = AddonManager::new();
+        let theme = TerminalTheme::midnight();
+        let mut cache =
+            RenderCache::new(term.screen_lines(), term.columns(), term.colors().clone());
+
+        processor.advance(&mut term, "中文日志正常".as_bytes());
+        cache.update(&mut term, &addon_manager, &theme);
+
+        assert_eq!(line_text(&cache, 0), "中文日志正常");
+        assert_eq!(cache.lines[0].text_runs.len(), 6);
+        assert_eq!(
+            cache.lines[0]
+                .text_runs
+                .iter()
+                .map(|run| run.char_count)
+                .sum::<usize>(),
+            12
+        );
+    }
+
+    #[test]
+    fn ascii_text_stays_in_single_cell_width_run() {
+        let (event_tx, _event_rx) = unbounded_channel::<TerminalEvent>();
+        let event_proxy = GpuiEventProxy::new(event_tx);
+        let mut term = Term::new(TermConfig::default(), &TestDimensions, event_proxy);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        let addon_manager = AddonManager::new();
+        let theme = TerminalTheme::midnight();
+        let mut cache =
+            RenderCache::new(term.screen_lines(), term.columns(), term.colors().clone());
+
+        processor.advance(&mut term, b"ubuntu:~$ sudo");
+        cache.update(&mut term, &addon_manager, &theme);
+
+        assert_eq!(line_text(&cache, 0), "ubuntu:~$sudo");
+        assert_eq!(cache.lines[0].text_runs.len(), 2);
+        assert_eq!(cache.lines[0].text_runs[0].start_col, 0);
+        assert_eq!(cache.lines[0].text_runs[0].char_count, 9);
+        assert_eq!(cache.lines[0].text_runs[1].start_col, 10);
+        assert_eq!(cache.lines[0].text_runs[1].char_count, 4);
     }
 }

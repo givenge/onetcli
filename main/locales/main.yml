@@ -133,6 +133,34 @@ Home:
     en: Sync data with cloud
     zh-CN: 与云端同步数据
     zh-HK: 與雲端同步數據
+  backup:
+    en: Backup
+    zh-CN: 备份
+    zh-HK: 備份
+  backing_up:
+    en: Backing up...
+    zh-CN: 备份中...
+    zh-HK: 備份中...
+  backup_tooltip:
+    en: Backup local data to WebDAV
+    zh-CN: 备份本地数据到 WebDAV
+    zh-HK: 備份本地資料到 WebDAV
+  backup_confirm_title:
+    en: Confirm Backup
+    zh-CN: 确认备份
+    zh-HK: 確認備份
+  backup_confirm_message:
+    en: Start backing up the current local data to WebDAV now?
+    zh-CN: 现在开始将当前本地数据备份到 WebDAV 吗？
+    zh-HK: 現在開始將目前本地資料備份到 WebDAV 嗎？
+  restore:
+    en: Restore
+    zh-CN: 恢复
+    zh-HK: 恢復
+  restore_tooltip:
+    en: Browse WebDAV backups and restore one on next launch
+    zh-CN: 浏览 WebDAV 备份，并在下次启动时恢复
+    zh-HK: 瀏覽 WebDAV 備份，並在下次啟動時恢復
   conflict_tooltip:
     en: "%{count} sync conflicts need to be resolved"
     zh-CN: "%{count} 个同步冲突需要解决"
@@ -876,9 +904,9 @@ Settings:
         zh-CN: 全局代理设置
         zh-HK: 全局代理設置
       dialog_desc:
-        en: Set one shared proxy endpoint for update checks, authentication, cloud sync, and other HTTP requests.
-        zh-CN: 为更新检查、认证、云同步及其他 HTTP 请求统一配置代理出口。
-        zh-HK: 為更新檢查、認證、雲同步及其他 HTTP 請求統一配置代理出口。
+        en: Set one shared proxy endpoint for update checks, WebDAV backup, and other HTTP requests.
+        zh-CN: 为更新检查、WebDAV 备份及其他 HTTP 请求统一配置代理出口。
+        zh-HK: 為更新檢查、WebDAV 備份及其他 HTTP 請求統一配置代理出口。
       enable:
         en: Enable Global Proxy
         zh-CN: 启用全局代理
@@ -927,6 +955,121 @@ Settings:
         en: Global proxy settings applied
         zh-CN: 全局代理设置已生效
         zh-HK: 全局代理設置已生效
+
+  Backup:
+    title:
+      en: Backup
+      zh-CN: 备份
+      zh-HK: 備份
+    WebDav:
+      title:
+        en: WebDAV Backup
+        zh-CN: WebDAV 备份
+        zh-HK: WebDAV 備份
+      description:
+        en: Upload local app data snapshots to your own WebDAV storage.
+        zh-CN: 将本地应用数据快照上传到你自己的 WebDAV 存储。
+        zh-HK: 將本地應用資料快照上傳到你自己的 WebDAV 存儲。
+      open:
+        en: Configure
+        zh-CN: 配置
+        zh-HK: 配置
+      dialog_title:
+        en: WebDAV Backup Settings
+        zh-CN: WebDAV 备份设置
+        zh-HK: WebDAV 備份設置
+      dialog_desc:
+        en: Backups include the local database, settings, and saved query files. Logs are excluded.
+        zh-CN: 备份包含本地数据库、设置和已保存的查询文件，不包含日志。
+        zh-HK: 備份包含本地資料庫、設定和已保存的查詢文件，不包含日誌。
+      enable:
+        en: Enable WebDAV Backup
+        zh-CN: 启用 WebDAV 备份
+        zh-HK: 啟用 WebDAV 備份
+      endpoint:
+        en: WebDAV URL
+        zh-CN: WebDAV 地址
+        zh-HK: WebDAV 地址
+      remote_dir:
+        en: Remote Folder
+        zh-CN: 远程目录
+        zh-HK: 遠端目錄
+      username:
+        en: Username
+        zh-CN: 用户名（可选）
+        zh-HK: 用戶名（可選）
+      password:
+        en: Password
+        zh-CN: 密码（可选）
+        zh-HK: 密碼（可選）
+      username_placeholder:
+        en: webdav-user
+        zh-CN: webdav-user
+        zh-HK: webdav-user
+      password_placeholder:
+        en: app-password
+        zh-CN: app-password
+        zh-HK: app-password
+      test:
+        en: Test Connection
+        zh-CN: 测试连接
+        zh-HK: 測試連接
+      testing:
+        en: Testing...
+        zh-CN: 测试中...
+        zh-HK: 測試中...
+      test_success:
+        en: WebDAV connection test passed
+        zh-CN: WebDAV 连接测试成功
+        zh-HK: WebDAV 連接測試成功
+      save_success:
+        en: WebDAV backup settings saved
+        zh-CN: WebDAV 备份设置已保存
+        zh-HK: WebDAV 備份設置已保存
+      manage_title:
+        en: Backup Data Management
+        zh-CN: 备份数据管理
+        zh-HK: 備份資料管理
+      manage_desc:
+        en: Restores are staged first and applied automatically the next time the app starts.
+        zh-CN: 恢复会先暂存到本地，并在下次启动应用时自动应用。
+        zh-HK: 恢復會先暫存到本地，並在下次啟動應用時自動套用。
+      loading:
+        en: Loading backups...
+        zh-CN: 正在加载备份...
+        zh-HK: 正在加載備份...
+      empty:
+        en: No WebDAV backups yet
+        zh-CN: 暂无 WebDAV 备份
+        zh-HK: 暫無 WebDAV 備份
+      file_name:
+        en: File Name
+        zh-CN: 文件名
+        zh-HK: 文件名
+      modified_at:
+        en: Modified Time
+        zh-CN: 修改时间
+        zh-HK: 修改時間
+      size:
+        en: Size
+        zh-CN: 大小
+        zh-HK: 大小
+      actions:
+        en: Actions
+        zh-CN: 操作
+        zh-HK: 操作
+      restore_staged:
+        en: Restore package is ready. Restart the app to apply it.
+        zh-CN: 恢复包已准备好，重启应用后会自动应用。
+        zh-HK: 恢復包已準備好，重新啟動應用後會自動套用。
+      delete_selected:
+        en: Delete Selected (%{count})
+        zh-CN: 删除选中 (%{count})
+        zh-HK: 刪除選中 (%{count})
+      delete_success:
+        en: Deleted %{count} backup(s)
+        zh-CN: 已删除 %{count} 个备份
+        zh-HK: 已刪除 %{count} 個備份
 
   # 快捷键
   Shortcuts:
