@@ -97,6 +97,8 @@ pub enum AgentEvent {
     ThinkingDelta(String),
     /// Incremental text content.
     TextDelta(String),
+    /// Incremental reasoning/thinking content.
+    ReasoningDelta(String),
     /// Agent finished successfully.
     Completed(AgentResult),
     /// An error occurred.

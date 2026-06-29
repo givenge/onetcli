@@ -328,6 +328,19 @@ impl ConnectionRepository {
         })
     }
 
+    /// 批量更新连接的 sort_order（拖拽排序后持久化）
+    pub fn update_sort_orders(&self, orders: &[(i64, i32)]) -> Result<()> {
+        self.conn.with_connection(|conn| {
+            for (id, sort_order) in orders {
+                conn.execute(
+                    "UPDATE connections SET sort_order = ?1 WHERE id = ?2",
+                    params![sort_order, id],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     /// 查询需要同步的连接（sync_enabled=true 且 cloud_id 为空或 updated_at > last_synced_at）
     pub fn list_pending_sync(&self) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {

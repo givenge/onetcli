@@ -887,6 +887,7 @@ impl ChatPanel {
             let mut full_content = String::new();
             let mut full_thinking = String::new();
             let thinking_msg_id = format!("{assistant_msg_id}-thinking");
+            let mut full_reasoning = String::new();
             while let Some(event) = rx.recv().await {
                 match event {
                     AgentEvent::Progress(stage) => {
@@ -952,6 +953,28 @@ impl ChatPanel {
                                                 .with_id(msg_id)
                                                 .with_content(content_clone),
                                         );
+                                    }
+                                    panel.scroll_to_bottom_and_mark();
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    }
+                    AgentEvent::ReasoningDelta(delta) => {
+                        full_reasoning.push_str(&delta);
+                        if let Some(entity) = this.upgrade() {
+                            let reasoning_clone = full_reasoning.clone();
+                            let msg_id = assistant_msg_id.clone();
+                            let _ = cx.update(|cx| {
+                                entity.update(cx, |panel, cx| {
+                                    if let Some(msg) =
+                                        panel.messages.iter_mut().find(|m| m.id == msg_id)
+                                    {
+                                        if matches!(msg.variant, MessageVariant::Status { .. }) {
+                                            msg.variant = MessageVariant::Text;
+                                            msg.is_streaming = true;
+                                        }
+                                        msg.reasoning_content = reasoning_clone;
                                     }
                                     panel.scroll_to_bottom_and_mark();
                                     cx.notify();
@@ -1477,7 +1500,7 @@ impl ChatPanel {
     // 渲染
     // ========================================================================
 
-    fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_messages(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = cx.entity().clone();
         let total = self.messages.len();
         let hidden_count = total.saturating_sub(self.render_limit);
@@ -1558,7 +1581,7 @@ impl ChatPanel {
                                 self.messages
                                     .iter()
                                     .skip(hidden_count)
-                                    .map(|msg| self.render_message(msg, &panel, cx)),
+                                    .map(|msg| self.render_message(msg, &panel, window, cx)),
                             ),
                     ),
             )
@@ -1708,6 +1731,7 @@ impl ChatPanel {
         &self,
         msg: &ChatMessageUI,
         panel: &Entity<Self>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match msg.role {
@@ -1722,7 +1746,7 @@ impl ChatPanel {
                 MessageVariant::ToolHistory { title } => {
                     one_core::ChatMessageRenderer::render_tool_history_message(msg, title, cx)
                 }
-                MessageVariant::Text => self.render_assistant_message(msg, panel, cx),
+                MessageVariant::Text => self.render_assistant_message(msg, panel, window, cx),
                 MessageVariant::SqlResult => self.render_sql_result(&msg.id, cx),
             },
             ChatRole::System => one_core::ChatMessageRenderer::render_system_message(msg, cx),
@@ -1827,120 +1851,118 @@ impl ChatPanel {
         &self,
         msg: &ChatMessageUI,
         panel: &Entity<Self>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if msg.is_streaming && msg.content.is_empty() {
-            return one_core::ChatMessageRenderer::render_thinking(cx);
+        if msg.is_streaming && msg.content.is_empty() && msg.reasoning_content.is_empty() {
+            return div()
+                .w_full()
+                .py_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("ChatPanel.thinking")),
+                )
+                .into_any_element();
         }
 
         let panel_for_actions = panel.clone();
         let panel_for_render = panel.clone();
         let message_id = msg.id.clone();
+        let reasoning_block = (!msg.reasoning_content.is_empty())
+            .then(|| one_core::ChatMessageRenderer::render_reasoning_block(msg, window, cx));
 
-        h_flex()
+        v_flex()
             .w_full()
-            .items_start()
             .gap_2()
-            .child(
-                Avatar::new()
-                    .placeholder(Icon::new(IconName::ChatDB))
-                    .with_size(Size::Small)
-                    .bg(cx.theme().primary.opacity(0.1))
-                    .text_color(cx.theme().primary),
-            )
-            .child(
-                div().flex_1().min_w_0().child(
-                    div()
-                        .max_w(px(980.0))
-                        .bg(cx.theme().muted.opacity(0.3))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.5))
-                        .rounded_lg()
-                        .child(
-                            TextView::markdown(
-                                SharedString::from(format!("ai-sql-msg-{}", msg.id)),
-                                msg.content.clone(),
-                            )
-                            .p_3()
-                            .selectable(true)
-                            .code_block_actions({
-                                let message_id = message_id.clone();
-                                move |code_block, _window, _cx| {
-                                    let block = SqlCodeBlock::from_code_block(code_block, 0);
-                                    let is_sql = block.is_sql;
-                                    let code = code_block.code();
+            .when_some(reasoning_block, |this, block| this.child(block))
+            .when(!msg.content.is_empty(), |this| {
+                this.child(
+                    div().w_full().p_3().child(
+                        TextView::markdown(
+                            SharedString::from(format!("ai-sql-msg-{}", msg.id)),
+                            msg.content.clone(),
+                        )
+                        .selectable(true)
+                        .code_block_actions({
+                            let message_id = message_id.clone();
+                            move |code_block, _window, _cx| {
+                                let block = SqlCodeBlock::from_code_block(code_block, 0);
+                                let is_sql = block.is_sql;
+                                let code = code_block.code();
 
-                                    h_flex()
-                                        .gap_1()
-                                        .child(Clipboard::new("copy").value(code.clone()))
-                                        .when(is_sql, {
-                                            let panel = panel_for_actions.clone();
-                                            let message_id = message_id.clone();
-                                            let block_for_action = block.clone();
-                                            move |this| {
-                                                this.child(
-                                                    Button::new("run-sql")
-                                                        .icon(IconName::SquareTerminal)
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .tooltip(t!("ChatSqlBlock.run").to_string())
-                                                        .on_click({
-                                                            let panel = panel.clone();
-                                                            let message_id = message_id.clone();
-                                                            let block_for_action =
-                                                                block_for_action.clone();
-                                                            move |_, window, cx| {
-                                                                panel.update(cx, |p, cx| {
-                                                                    p.run_sql_block_with_guard(
-                                                                        &message_id,
-                                                                        &block_for_action,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                });
-                                                            }
-                                                        }),
-                                                )
-                                            }
-                                        })
-                                        .into_any_element()
-                                }
-                            })
-                            .code_block_renderer({
-                                let message_id = message_id.clone();
-                                let panel_for_collapse = panel_for_render.clone();
-                                move |code_block, options, default_element, _window, cx| {
-                                    if let Some(chart_block) = parse_chart_json_block(
-                                        &code_block.code(),
-                                        code_block.lang().as_deref().map(|v| &**v),
-                                    ) {
-                                        let content = panel_for_collapse.read(cx);
-                                        return content.render_chart_block_container(
-                                            &chart_block,
-                                            default_element,
-                                            cx,
-                                        );
-                                    }
-
-                                    let block =
-                                        SqlCodeBlock::from_code_block(code_block, options.index);
-                                    if !block.is_sql {
-                                        return default_element;
-                                    }
-
+                                h_flex()
+                                    .gap_1()
+                                    .child(Clipboard::new("copy").value(code.clone()))
+                                    .when(is_sql, {
+                                        let panel = panel_for_actions.clone();
+                                        let message_id = message_id.clone();
+                                        let block_for_action = block.clone();
+                                        move |this| {
+                                            this.child(
+                                                Button::new("run-sql")
+                                                    .icon(IconName::SquareTerminal)
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .tooltip(t!("ChatSqlBlock.run").to_string())
+                                                    .on_click({
+                                                        let panel = panel.clone();
+                                                        let message_id = message_id.clone();
+                                                        let block_for_action =
+                                                            block_for_action.clone();
+                                                        move |_, window, cx| {
+                                                            panel.update(cx, |p, cx| {
+                                                                p.run_sql_block_with_guard(
+                                                                    &message_id,
+                                                                    &block_for_action,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                        }
+                                    })
+                                    .into_any_element()
+                            }
+                        })
+                        .code_block_renderer({
+                            let message_id = message_id.clone();
+                            let panel_for_collapse = panel_for_render.clone();
+                            move |code_block, options, default_element, _window, cx| {
+                                if let Some(chart_block) = parse_chart_json_block(
+                                    &code_block.code(),
+                                    code_block.lang().as_deref().map(|v| &**v),
+                                ) {
                                     let content = panel_for_collapse.read(cx);
-                                    content.render_sql_block_container(
-                                        &message_id,
-                                        &block,
+                                    return content.render_chart_block_container(
+                                        &chart_block,
                                         default_element,
-                                        &panel_for_collapse,
                                         cx,
-                                    )
+                                    );
                                 }
-                            }),
-                        ),
-                ),
-            )
+
+                                let block =
+                                    SqlCodeBlock::from_code_block(code_block, options.index);
+                                if !block.is_sql {
+                                    return default_element;
+                                }
+
+                                let content = panel_for_collapse.read(cx);
+                                content.render_sql_block_container(
+                                    &message_id,
+                                    &block,
+                                    default_element,
+                                    &panel_for_collapse,
+                                    cx,
+                                )
+                            }
+                        }),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
@@ -2239,7 +2261,7 @@ impl Render for ChatPanel {
                         div().flex_1().h_full().min_w_0().child(
                             v_flex()
                                 .size_full()
-                                .child(self.render_messages(cx))
+                                .child(self.render_messages(window, cx))
                                 .child(self.render_input(cx)),
                         ),
                     ),
@@ -2249,7 +2271,7 @@ impl Render for ChatPanel {
                 v_flex()
                     .size_full()
                     .child(self.render_sidebar_mode_header(window, cx))
-                    .child(self.render_messages(cx))
+                    .child(self.render_messages(window, cx))
                     .child(self.render_input(cx)),
             )
         }

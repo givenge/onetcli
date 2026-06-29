@@ -55,7 +55,6 @@ use crate::home::home_workspace_filter::WorkspaceFilterDelegate;
 use crate::license::{get_license_service, is_feature_enabled};
 use crate::new_connection::NewConnectionWindow;
 use crate::setting_tab::{AppSettings, GlobalCurrentUser};
-use crate::user_avatar::render_user_avatar;
 use crate::webdav_backup;
 use remote_desktop_view::remote_desktop_form::{
     RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
@@ -404,6 +403,9 @@ impl HomePage {
                     }
                     ConnectionDataEvent::SchemaChanged { .. } => {
                         // SchemaChanged 由 db_tree_view 处理，此处无需操作
+                    }
+                    ConnectionDataEvent::CloudSyncRequested => {
+                        this.trigger_sync(cx);
                     }
                 },
             )
@@ -1717,6 +1719,12 @@ impl HomePage {
             editing_connection: editing_conn,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
+            ssh_connections: self
+                .connections
+                .iter()
+                .filter(|connection| connection.connection_type == ConnectionType::SshSftp)
+                .cloned()
+                .collect(),
         };
 
         self.editing_connection_id = None;

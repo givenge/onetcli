@@ -4,10 +4,12 @@
 //! SQL 面板可以在此基础上覆盖特定渲染（如 SQL 代码块）。
 
 use crate::ai_chat::panel::CodeBlockActionRegistry;
+use crate::ai_chat::reasoning;
 use crate::ai_chat::types::{ChatMessageUIGeneric, ChatRole, MessageExtension, MessageVariant};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div,
+    AnyElement, App, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window,
+    div,
 };
 use gpui_component::avatar::Avatar;
 use gpui_component::button::Button;
@@ -52,34 +54,19 @@ impl ChatMessageRenderer {
         msg: &ChatMessageUIGeneric<E>,
         cx: &App,
     ) -> AnyElement {
-        h_flex()
+        div()
             .w_full()
-            .items_start()
-            .justify_end()
-            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(cx.theme().accent)
+            .text_color(cx.theme().accent_foreground)
+            .rounded_lg()
             .child(
-                div()
-                    .min_w_0()
-                    .max_w(gpui::px(480.0))
-                    .px_3()
-                    .py_2()
-                    .bg(cx.theme().accent)
-                    .text_color(cx.theme().accent_foreground)
-                    .rounded_lg()
-                    .child(
-                        TextView::markdown(
-                            SharedString::from(format!("user-msg-{}", msg.id)),
-                            msg.content.clone(),
-                        )
-                        .selectable(true),
-                    ),
-            )
-            .child(
-                Avatar::new()
-                    .placeholder(Icon::new(IconName::CircleUser))
-                    .with_size(Size::Small)
-                    .bg(cx.theme().accent.opacity(0.1))
-                    .text_color(cx.theme().accent),
+                TextView::markdown(
+                    SharedString::from(format!("user-msg-{}", msg.id)),
+                    msg.content.clone(),
+                )
+                .selectable(true),
             )
             .into_any_element()
     }
@@ -92,14 +79,9 @@ impl ChatMessageRenderer {
         h_flex()
             .w_full()
             .justify_center()
-            .py_2()
             .child(
                 div()
-                    .px_3()
-                    .py_1()
-                    .rounded_full()
-                    .bg(cx.theme().muted.opacity(0.4))
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(msg.content.clone()),
             )
@@ -120,7 +102,6 @@ impl ChatMessageRenderer {
             .items_center()
             .gap_2()
             .py_1()
-            .px_10() // 为助手头像留出空间
             .child(
                 Icon::new(icon)
                     .with_size(Size::Small)
@@ -132,7 +113,7 @@ impl ChatMessageRenderer {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(title.to_string()),
             )
@@ -141,22 +122,16 @@ impl ChatMessageRenderer {
 
     /// 渲染 "思考中..." 占位符
     pub fn render_thinking(cx: &App) -> AnyElement {
-        Self::render_assistant_shell(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .child(Icon::new(IconName::LoaderCircle).with_size(Size::Small))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t!("AiChat.thinking").to_string()),
-                )
-                .into_any_element(),
-            cx,
-        )
+        div()
+            .w_full()
+            .py_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("AiChat.thinking").to_string()),
+            )
+            .into_any_element()
     }
 
     /// 渲染独立的思考消息
@@ -167,7 +142,7 @@ impl ChatMessageRenderer {
         let view_id = SharedString::from(format!("ai-thinking-{}", msg.id));
         v_flex()
             .w_full()
-            .px_10() // 助手头像偏移
+            .px_10()
             .child(
                 div()
                     .w_full()
@@ -196,28 +171,14 @@ impl ChatMessageRenderer {
                                     ),
                             )
                             .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if msg.is_streaming {
-                                                "进行中".to_string()
-                                            } else {
-                                                "详情".to_string()
-                                            }),
-                                    )
-                                    .child(
-                                        Icon::new(if msg.is_expanded {
-                                            IconName::ChevronUp
-                                        } else {
-                                            IconName::ChevronDown
-                                        })
-                                        .xsmall()
-                                        .text_color(cx.theme().muted_foreground),
-                                    ),
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if msg.is_streaming {
+                                        "进行中".to_string()
+                                    } else {
+                                        "详情".to_string()
+                                    }),
                             ),
                     )
                     .when(msg.is_expanded, |this| {
@@ -277,28 +238,14 @@ impl ChatMessageRenderer {
                                     ),
                             )
                             .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if msg.is_streaming {
-                                                "进行中".to_string()
-                                            } else {
-                                                "详情".to_string()
-                                            }),
-                                    )
-                                    .child(
-                                        Icon::new(if msg.is_expanded {
-                                            IconName::ChevronUp
-                                        } else {
-                                            IconName::ChevronDown
-                                        })
-                                        .xsmall()
-                                        .text_color(cx.theme().muted_foreground),
-                                    ),
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if msg.is_streaming {
+                                        "进行中".to_string()
+                                    } else {
+                                        "详情".to_string()
+                                    }),
                             ),
                     )
                     .when(msg.is_expanded, |this| {
@@ -321,29 +268,61 @@ impl ChatMessageRenderer {
             .into_any_element()
     }
 
+    /// 渲染可折叠的思考内容
+    pub fn render_reasoning_block<E: MessageExtension>(
+        msg: &ChatMessageUIGeneric<E>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        reasoning::render_reasoning_block(msg, window, cx)
+    }
+
     /// 渲染助手文本消息（带代码块操作按钮）
     pub fn render_assistant_text<E: MessageExtension>(
         msg: &ChatMessageUIGeneric<E>,
         code_block_actions: &CodeBlockActionRegistry,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> AnyElement {
-        if msg.is_streaming && msg.content.is_empty() {
+        if msg.is_streaming && msg.content.is_empty() && msg.reasoning_content.is_empty() {
             return Self::render_thinking(cx);
         }
 
+        v_flex()
+            .w_full()
+            .gap_2()
+            .when(!msg.reasoning_content.is_empty(), |this| {
+                this.child(Self::render_reasoning_block(msg, window, cx))
+            })
+            .when(!msg.content.is_empty(), |this| {
+                this.child(Self::render_assistant_content(msg, code_block_actions))
+            })
+            .into_any_element()
+    }
+
+    fn render_assistant_content<E: MessageExtension>(
+        msg: &ChatMessageUIGeneric<E>,
+        code_block_actions: &CodeBlockActionRegistry,
+    ) -> AnyElement {
         let view_id = SharedString::from(format!("ai-msg-{}", msg.id));
 
-        Self::render_assistant_shell(
-            {
-                let text_view = TextView::markdown(view_id, msg.content.clone())
-                    .p_3()
-                    .selectable(true);
-
-                if code_block_actions.is_empty() {
-                    text_view.into_any_element()
-                } else {
-                    let registry = code_block_actions.clone();
-                    text_view
+        if code_block_actions.is_empty() {
+            // 无代码块操作，简单渲染
+            div()
+                .w_full()
+                .child(
+                    TextView::markdown(view_id, msg.content.clone())
+                        .p_3()
+                        .selectable(true),
+                )
+                .into_any_element()
+        } else {
+            // 有代码块操作，使用 code_block_actions
+            let registry = code_block_actions.clone();
+            div()
+                .w_full()
+                .child(
+                    TextView::markdown(view_id, msg.content.clone())
                         .code_block_actions(move |code_block, _window, _cx| {
                             let code = code_block.code();
                             let lang = code_block.lang();
@@ -379,18 +358,19 @@ impl ChatMessageRenderer {
 
                             row
                         })
-                        .into_any_element()
-                }
-            },
-            cx,
-        )
+                        .p_3()
+                        .selectable(true),
+                )
+                .into_any_element()
+        }
     }
 
     /// 渲染单条消息（通用路由）
     pub fn render_message<E: MessageExtension>(
         msg: &ChatMessageUIGeneric<E>,
         code_block_actions: &CodeBlockActionRegistry,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> AnyElement {
         match msg.role {
             ChatRole::User => Self::render_user_message(msg, cx),
@@ -398,21 +378,26 @@ impl ChatMessageRenderer {
                 MessageVariant::Status { title, is_done } => {
                     Self::render_status_message(&msg.id, title, *is_done, cx)
                 }
+                MessageVariant::Text => {
+                    Self::render_assistant_text(msg, code_block_actions, window, cx)
+                }
                 MessageVariant::Thinking => Self::render_thinking_message(msg, cx),
                 MessageVariant::ToolHistory { title } => {
                     Self::render_tool_history_message(msg, title, cx)
                 }
-                MessageVariant::Text => Self::render_assistant_text(msg, code_block_actions, cx),
-                MessageVariant::SqlResult => Self::render_assistant_shell(
+                MessageVariant::SqlResult => {
+                    // SqlResult 需要特殊渲染，默认只显示占位符
                     div()
-                        .px_3()
+                        .w_full()
                         .py_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t!("AiChat.sql_result").to_string())
-                        .into_any_element(),
-                    cx,
-                ),
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t!("AiChat.sql_result").to_string()),
+                        )
+                        .into_any_element()
+                }
             },
             ChatRole::System => Self::render_system_message(msg, cx),
         }

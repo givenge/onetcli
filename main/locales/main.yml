@@ -55,6 +55,25 @@ Common:
     zh-CN: 无
     zh-HK: 無
 
+# MCP 审批
+McpApproval:
+  dialog_title:
+    en: MCP Approval
+    zh-CN: MCP 审批
+    zh-HK: MCP 審批
+  approve:
+    en: Approve
+    zh-CN: 允许
+    zh-HK: 允許
+  deny:
+    en: Deny
+    zh-CN: 拒绝
+    zh-HK: 拒絕
+  pending_count:
+    en: "%{count} more requests waiting"
+    zh-CN: "还有 %{count} 个请求等待审批"
+    zh-HK: "還有 %{count} 個請求等待審批"
+
 # 首页
 Home:
   title:
@@ -97,6 +116,14 @@ Home:
     en: Import
     zh-CN: 导入
     zh-HK: 導入
+  card_view:
+    en: Card View
+    zh-CN: 卡片视图
+    zh-HK: 卡片視圖
+  list_view:
+    en: List View
+    zh-CN: 列表视图
+    zh-HK: 列表視圖
   refresh:
     en: Refresh
     zh-CN: 刷新
@@ -161,6 +188,30 @@ Home:
     en: Browse WebDAV backups and restore one on next launch
     zh-CN: 浏览 WebDAV 备份，并在下次启动时恢复
     zh-HK: 瀏覽 WebDAV 備份，並在下次啟動時恢復
+  mcp_enable:
+    en: MCP
+    zh-CN: MCP
+    zh-HK: MCP
+  mcp_disable:
+    en: MCP
+    zh-CN: MCP
+    zh-HK: MCP
+  mcp_enable_tooltip:
+    en: Enable MCP server
+    zh-CN: 启用 MCP Server
+    zh-HK: 啟用 MCP Server
+  mcp_disable_tooltip:
+    en: Disable MCP server
+    zh-CN: 关闭 MCP Server
+    zh-HK: 關閉 MCP Server
+  mcp_enabled_notification:
+    en: MCP server enabled
+    zh-CN: MCP Server 已启用
+    zh-HK: MCP Server 已啟用
+  mcp_disabled_notification:
+    en: MCP server disabled
+    zh-CN: MCP Server 已关闭
+    zh-HK: MCP Server 已關閉
   conflict_tooltip:
     en: "%{count} sync conflicts need to be resolved"
     zh-CN: "%{count} 个同步冲突需要解决"
@@ -685,6 +736,10 @@ Settings:
         en: Switch the interface display language, some content requires restarting the application to take effect
         zh-CN: 切换界面显示语言，部分内容需要重启应用后生效
         zh-HK: 切換介面顯示語言，部分內容需要重啟應用後生效
+      system:
+        en: Follow System
+        zh-CN: 跟随系统
+        zh-HK: 跟隨系統
       zh_cn:
         en: Simplified Chinese
         zh-CN: 简体中文
@@ -735,6 +790,62 @@ Settings:
         en: Select the application font family
         zh-CN: 选择应用的字体系列
         zh-HK: 選擇應用的字型系列
+      sql_editor_font_family:
+        en: SQL Editor Font
+        zh-CN: SQL 编辑器字体
+        zh-HK: SQL 編輯器字型
+      sql_editor_font_family_desc:
+        en: Select the monospace font used by the SQL editor
+        zh-CN: 选择 SQL 编辑器使用的等宽字体
+        zh-HK: 選擇 SQL 編輯器使用的等寬字型
+      table_preview_font_family:
+        en: Table Preview Font
+        zh-CN: 表预览字体
+        zh-HK: 表預覽字型
+      table_preview_font_family_desc:
+        en: Select the monospace font used by table previews
+        zh-CN: 选择表预览使用的等宽字体
+        zh-HK: 選擇表預覽使用的等寬字型
+      terminal_font_family:
+        en: Terminal Font
+        zh-CN: 终端字体
+        zh-HK: 終端字型
+      terminal_font_family_desc:
+        en: Select the monospace font used by terminals
+        zh-CN: 选择终端使用的等宽字体
+        zh-HK: 選擇終端使用的等寬字型
+      custom_fonts:
+        en: Custom Fonts
+        zh-CN: 自定义字体
+        zh-HK: 自訂字型
+      custom_fonts_desc:
+        en: Import local .ttf, .otf, .ttc, or .otc font files for the application text renderer. Select the font family above after importing.
+        zh-CN: 导入本地 .ttf、.otf、.ttc 或 .otc 字体文件供应用文本渲染使用。导入后在上方选择对应字体系列。
+        zh-HK: 匯入本機 .ttf、.otf、.ttc 或 .otc 字型檔供應用程式文字渲染使用。匯入後在上方選擇對應字型系列。
+      import_custom_fonts:
+        en: Import Fonts
+        zh-CN: 导入字体
+        zh-HK: 匯入字型
+      select_font_files:
+        en: Select font files
+        zh-CN: 选择字体文件
+        zh-HK: 選擇字型檔
+      unsupported_font_file:
+        en: Unsupported font file
+        zh-CN: 不支持的字体文件
+        zh-HK: 不支援的字型檔
+      custom_fonts_import_success:
+        en: "Imported %{count} font file(s)"
+        zh-CN: "已导入 %{count} 个字体文件"
+        zh-HK: "已匯入 %{count} 個字型檔"
+      custom_fonts_import_success_with_monospace:
+        en: "Imported %{count} font file(s). %{monospace_count} monospace font family name(s) are available for terminal."
+        zh-CN: "已导入 %{count} 个字体文件，其中 %{monospace_count} 个等宽字体名称可用于终端。"
+        zh-HK: "已匯入 %{count} 個字型檔，其中 %{monospace_count} 個等寬字型名稱可用於終端。"
+      custom_fonts_import_empty:
+        en: No supported font files were imported
+        zh-CN: 未导入支持的字体文件
+        zh-HK: 未匯入支援的字型檔
       font_size:
         en: Font Size
         zh-CN: 字体大小
@@ -837,6 +948,14 @@ Settings:
         en: Set the interval for automatic saving (1-60 seconds)
         zh-CN: 设置自动保存的时间间隔（1-60秒）
         zh-HK: 設置自動保存的時間間隔（1-60秒）
+      sql_query_max_rows:
+        en: SQL Query Max Rows
+        zh-CN: SQL 查询最大行数
+        zh-HK: SQL 查詢最大行數
+      sql_query_max_rows_desc:
+        en: Default maximum rows returned by SQL editor queries. Set 0 for unlimited.
+        zh-CN: SQL 编辑器查询默认返回的最大行数，设为 0 表示不限制。
+        zh-HK: SQL 編輯器查詢預設返回的最大行數，設為 0 表示不限制。
       table_row_height:
         en: Table Row Height (px)
         zh-CN: 表格行高（像素）
@@ -845,6 +964,280 @@ Settings:
         en: Set the height of database table and editable grid rows (24-100 pixels)
         zh-CN: 设置数据库表和可编辑表格的行高（24-100像素）
         zh-HK: 設置資料庫表和可編輯表格的行高（24-100像素）
+
+    Mcp:
+      group_title:
+        en: MCP
+        zh-CN: MCP
+        zh-HK: MCP
+      server_enabled:
+        en: Enable MCP Server
+        zh-CN: 启用 MCP Server
+        zh-HK: 啟用 MCP Server
+      server_enabled_desc:
+        en: Start the shared MCP endpoint for external clients and internal tool callers
+        zh-CN: 为外部客户端和内部工具调用启动统一 MCP 端点
+        zh-HK: 為外部客戶端和內部工具調用啟動統一 MCP 端點
+      server_mode:
+        en: Server Mode
+        zh-CN: Server 模式
+        zh-HK: Server 模式
+      server_mode_desc:
+        en: Choose whether discovery is temporary for the current app session or persistent across launches
+        zh-CN: 选择 discovery 配置仅用于当前应用会话，还是跨启动保持
+        zh-HK: 選擇 discovery 配置僅用於當前應用會話，還是跨啟動保持
+      server_mode_temporary:
+        en: Temporary
+        zh-CN: 临时
+        zh-HK: 臨時
+      server_mode_persistent:
+        en: Persistent
+        zh-CN: 持久
+        zh-HK: 持久
+      permission_mode:
+        en: Permission Mode
+        zh-CN: 权限模式
+        zh-HK: 權限模式
+      permission_mode_desc:
+        en: Control how sensitive MCP tool calls are handled by default
+        zh-CN: 控制敏感 MCP 工具调用的默认处理方式
+        zh-HK: 控制敏感 MCP 工具調用的默認處理方式
+      permission_mode_deny:
+        en: Deny
+        zh-CN: 拒绝
+        zh-HK: 拒絕
+      permission_mode_ask:
+        en: Ask
+        zh-CN: 询问
+        zh-HK: 詢問
+      permission_mode_allow:
+        en: Allow
+        zh-CN: 允许
+        zh-HK: 允許
+      status:
+        en: Runtime Status
+        zh-CN: 运行状态
+        zh-HK: 運行狀態
+      status_desc:
+        en: Current MCP server lifecycle state, bind address, and discovery file
+        zh-CN: 当前 MCP Server 生命周期状态、监听地址和 discovery 文件
+        zh-HK: 當前 MCP Server 生命週期狀態、監聽地址和 discovery 檔案
+      status_disabled:
+        en: Disabled
+        zh-CN: 已关闭
+        zh-HK: 已關閉
+      status_starting:
+        en: Starting
+        zh-CN: 启动中
+        zh-HK: 啟動中
+      status_running:
+        en: Running
+        zh-CN: 运行中
+        zh-HK: 運行中
+      status_failed:
+        en: Failed
+        zh-CN: 启动失败
+        zh-HK: 啟動失敗
+      install_client_config:
+        en: Install
+        zh-CN: 安装
+        zh-HK: 安裝
+      install_helper:
+        en: Install MCP Helper
+        zh-CN: 安装 MCP Helper
+        zh-HK: 安裝 MCP Helper
+      install_helper_desc:
+        en: Download the public MCP helper from the extension marketplace before writing client configs
+        zh-CN: 从扩展市场下载 Public MCP helper，然后再写入客户端配置
+        zh-HK: 從擴展市場下載 Public MCP helper，然後再寫入客戶端配置
+      install_helper_button:
+        en: Download
+        zh-CN: 下载
+        zh-HK: 下載
+      install_helper_started:
+        en: Installing MCP helper from extension marketplace...
+        zh-CN: 正在从扩展市场安装 MCP helper...
+        zh-HK: 正在從擴展市場安裝 MCP helper...
+      install_helper_already_running:
+        en: MCP helper installation is already running
+        zh-CN: MCP helper 正在安装中
+        zh-HK: MCP helper 正在安裝中
+      install_helper_success:
+        en: "MCP helper installed: %{path}"
+        zh-CN: "MCP helper 已安装：%{path}"
+        zh-HK: "MCP helper 已安裝：%{path}"
+      install_helper_failed:
+        en: "Failed to install MCP helper: %{error}"
+        zh-CN: "MCP helper 安装失败：%{error}"
+        zh-HK: "MCP helper 安裝失敗：%{error}"
+      helper_status_installed:
+        en: "Installed at %{path}"
+        zh-CN: "已安装：%{path}"
+        zh-HK: "已安裝：%{path}"
+      helper_status_missing:
+        en: "Expected at %{path}"
+        zh-CN: "预期路径：%{path}"
+        zh-HK: "預期路徑：%{path}"
+      helper_status_unusable:
+        en: "MCP helper is not executable: %{path}"
+        zh-CN: "MCP helper 不可执行：%{path}"
+        zh-HK: "MCP helper 不可執行：%{path}"
+      helper_status_installing:
+        en: Installing from extension marketplace...
+        zh-CN: 正在从扩展市场安装...
+        zh-HK: 正在從擴展市場安裝...
+      helper_status_connecting:
+        en: Connecting to download source...
+        zh-CN: 正在连接下载源...
+        zh-HK: 正在連接下載源...
+      helper_status_downloading:
+        en: "Downloading MCP helper %{percent}%"
+        zh-CN: "正在下载 MCP helper %{percent}%"
+        zh-HK: "正在下載 MCP helper %{percent}%"
+      helper_status_downloading_unknown:
+        en: Downloading MCP helper...
+        zh-CN: 正在下载 MCP helper...
+        zh-HK: 正在下載 MCP helper...
+      helper_status_retrying:
+        en: Download source failed, retrying...
+        zh-CN: 下载源失败，正在重试...
+        zh-HK: 下載源失敗，正在重試...
+      helper_status_installing_package:
+        en: Installing MCP helper...
+        zh-CN: 正在安装 MCP helper...
+        zh-HK: 正在安裝 MCP helper...
+      install_codex_config:
+        en: Install Codex MCP Config
+        zh-CN: 安装 Codex MCP 配置
+        zh-HK: 安裝 Codex MCP 配置
+      install_codex_config_desc:
+        en: Write or update the managed OnetCli MCP server entry in ~/.codex/config.toml
+        zh-CN: 在 ~/.codex/config.toml 中写入或更新 OnetCli MCP Server 托管配置
+        zh-HK: 在 ~/.codex/config.toml 中寫入或更新 OnetCli MCP Server 託管配置
+      install_claude_config:
+        en: Install Claude MCP Config
+        zh-CN: 安装 Claude MCP 配置
+        zh-HK: 安裝 Claude MCP 配置
+      install_claude_config_desc:
+        en: Write or update the OnetCli MCP server entry in Claude Desktop config
+        zh-CN: 在 Claude Desktop 配置中写入或更新 OnetCli MCP Server
+        zh-HK: 在 Claude Desktop 配置中寫入或更新 OnetCli MCP Server
+      install_claude_code_config:
+        en: Install Claude Code MCP Config
+        zh-CN: 安装 Claude Code MCP 配置
+        zh-HK: 安裝 Claude Code MCP 配置
+      install_claude_code_config_desc:
+        en: Write or update the OnetCli MCP server entry in ~/.claude.json
+        zh-CN: 在 ~/.claude.json 中写入或更新 OnetCli MCP Server
+        zh-HK: 在 ~/.claude.json 中寫入或更新 OnetCli MCP Server
+      copy_agent_config:
+        en: Copy MCP Config
+        zh-CN: 复制 MCP 配置
+        zh-HK: 複製 MCP 配置
+      copy_agent_config_desc:
+        en: Copy a generic mcpServers JSON block for other agents
+        zh-CN: 复制通用 mcpServers JSON 配置，供其他 agent 使用
+        zh-HK: 複製通用 mcpServers JSON 配置，供其他 agent 使用
+      copy_agent_config_button:
+        en: Copy Config
+        zh-CN: 复制配置
+        zh-HK: 複製配置
+      copy_agent_config_success:
+        en: MCP config copied
+        zh-CN: MCP 配置已复制
+        zh-HK: MCP 配置已複製
+      copy_agent_config_failed:
+        en: "Failed to copy MCP config: %{error}"
+        zh-CN: "MCP 配置复制失败：%{error}"
+        zh-HK: "MCP 配置複製失敗：%{error}"
+      install_client_config_success:
+        en: "MCP client config installed: %{path}"
+        zh-CN: "MCP 客户端配置已安装：%{path}"
+        zh-HK: "MCP 客戶端配置已安裝：%{path}"
+      install_client_config_failed:
+        en: "Failed to install MCP client config: %{error}"
+        zh-CN: "MCP 客户端配置安装失败：%{error}"
+        zh-HK: "MCP 客戶端配置安裝失敗：%{error}"
+      uninstall_client_config:
+        en: Uninstall
+        zh-CN: 卸载
+        zh-HK: 卸載
+      uninstall_client_config_success:
+        en: "MCP client config uninstalled: %{path}"
+        zh-CN: "MCP 客户端配置已卸载：%{path}"
+        zh-HK: "MCP 客戶端配置已卸載：%{path}"
+      uninstall_client_config_failed:
+        en: "Failed to uninstall MCP client config: %{error}"
+        zh-CN: "MCP 客户端配置卸载失败：%{error}"
+        zh-HK: "MCP 客戶端配置卸載失敗：%{error}"
+      client_config_status_up_to_date:
+        en: Up to date
+        zh-CN: 已是最新
+        zh-HK: 已是最新
+      client_config_status_not_installed:
+        en: Not installed
+        zh-CN: 未安装
+        zh-HK: 未安裝
+      client_config_status_needs_repair:
+        en: Needs repair
+        zh-CN: 需要修复
+        zh-HK: 需要修復
+      client_config_status_missing_helper:
+        en: MCP helper not installed
+        zh-CN: MCP helper 未安装
+        zh-HK: MCP helper 未安裝
+      client_config_status_unusable_helper:
+        en: MCP helper is not executable
+        zh-CN: MCP helper 不可执行
+        zh-HK: MCP helper 不可執行
+      toolset_terminal:
+        en: Terminal Tools
+        zh-CN: 终端工具
+        zh-HK: 終端工具
+      toolset_terminal_desc:
+        en: Expose active terminal sessions through MCP
+        zh-CN: 通过 MCP 暴露当前终端会话
+        zh-HK: 通過 MCP 暴露當前終端會話
+      toolset_connections:
+        en: Connection Tools
+        zh-CN: 连接工具
+        zh-HK: 連線工具
+      toolset_connections_desc:
+        en: Expose saved connection inspection and creation tools through MCP
+        zh-CN: 通过 MCP 暴露已保存连接的查看和创建工具
+        zh-HK: 通過 MCP 暴露已儲存連線的查看和建立工具
+      toolset_sftp:
+        en: SFTP Tools
+        zh-CN: SFTP 工具
+        zh-HK: SFTP 工具
+      toolset_sftp_desc:
+        en: Expose remote file operations through MCP
+        zh-CN: 通过 MCP 暴露远程文件操作
+        zh-HK: 通過 MCP 暴露遠程檔案操作
+      toolset_database:
+        en: Database Tools
+        zh-CN: 数据库工具
+        zh-HK: 資料庫工具
+      toolset_database_desc:
+        en: Expose database connection creation, inspection, and query tools through MCP
+        zh-CN: 通过 MCP 暴露数据库连接创建、查看和查询工具
+        zh-HK: 通過 MCP 暴露資料庫連線建立、查看和查詢工具
+      toolset_redis:
+        en: Redis Tools
+        zh-CN: Redis 工具
+        zh-HK: Redis 工具
+      toolset_redis_desc:
+        en: Expose Redis command and inspection tools through MCP
+        zh-CN: 通过 MCP 暴露 Redis 命令和查看工具
+        zh-HK: 通過 MCP 暴露 Redis 命令和查看工具
+      toolset_internal_functions:
+        en: Internal Function Tools
+        zh-CN: 内部函数工具
+        zh-HK: 內部函數工具
+      toolset_internal_functions_desc:
+        en: Expose selected internal application functions through MCP
+        zh-CN: 通过 MCP 暴露选定的应用内部函数
+        zh-HK: 通過 MCP 暴露選定的應用內部函數
 
     Log:
       group_title:
@@ -1141,6 +1534,10 @@ Settings:
       en: Toggle Fullscreen
       zh-CN: 切换全屏
       zh-HK: 切換全螢幕
+    toggle_always_on_top:
+      en: Toggle Always On Top
+      zh-CN: 切换窗口置顶
+      zh-HK: 切換視窗置頂
     toggle_zoom:
       en: Toggle Panel Zoom
       zh-CN: 切换面板缩放
@@ -1238,9 +1635,13 @@ Settings:
       zh-CN: 查询选中表
       zh-HK: 查詢選中表
     sql_run_query:
-      en: Run Query
-      zh-CN: 执行查询
-      zh-HK: 執行查詢
+      en: Run Current Query
+      zh-CN: 执行当前查询
+      zh-HK: 執行當前查詢
+    sql_run_all_query:
+      en: Run All Queries
+      zh-CN: 执行全部查询
+      zh-HK: 執行全部查詢
     table_move_selection:
       en: Move Selection
       zh-CN: 移动选区

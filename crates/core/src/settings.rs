@@ -4,11 +4,17 @@ use crate::utils::auto_save_config::AutoSaveConfig;
 use gpui::http_client::Url;
 use gpui::{App, Global};
 use gpui_component::{Theme, ThemeMode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
+
+mod locale;
+
+pub use locale::{
+    LOCALE_EN, LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK, effective_locale_for_setting,
+};
 
 // ============================================================================
 // 全局用户状态
@@ -204,6 +210,143 @@ impl GlobalProxySettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerMode {
+    #[default]
+    Temporary,
+    Persistent,
+}
+
+impl McpServerMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            McpServerMode::Temporary => "temporary",
+            McpServerMode::Persistent => "persistent",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "persistent" => McpServerMode::Persistent,
+            _ => McpServerMode::Temporary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPermissionMode {
+    #[default]
+    Deny,
+    Ask,
+    Allow,
+}
+
+impl McpPermissionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            McpPermissionMode::Deny => "deny",
+            McpPermissionMode::Ask => "ask",
+            McpPermissionMode::Allow => "allow",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "allow" => McpPermissionMode::Allow,
+            "ask" => McpPermissionMode::Ask,
+            _ => McpPermissionMode::Deny,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolsetSettings {
+    #[serde(default = "default_true")]
+    pub terminal: bool,
+    #[serde(default = "default_true")]
+    pub connections: bool,
+    #[serde(default)]
+    pub sftp: bool,
+    #[serde(default)]
+    pub database: bool,
+    #[serde(default)]
+    pub redis: bool,
+    #[serde(default)]
+    pub internal_functions: bool,
+}
+
+impl Default for McpToolsetSettings {
+    fn default() -> Self {
+        Self {
+            terminal: true,
+            connections: true,
+            sftp: false,
+            database: false,
+            redis: false,
+            internal_functions: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpSettings {
+    #[serde(default)]
+    pub server_enabled: bool,
+    #[serde(default)]
+    pub server_mode: McpServerMode,
+    #[serde(default)]
+    pub permission_mode: McpPermissionMode,
+    #[serde(default)]
+    pub toolsets: McpToolsetSettings,
+}
+
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            server_enabled: false,
+            server_mode: McpServerMode::Temporary,
+            permission_mode: McpPermissionMode::Deny,
+            toolsets: McpToolsetSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomFont {
+    pub path: String,
+    #[serde(default)]
+    pub families: Vec<String>,
+    #[serde(default)]
+    pub monospace_families: Vec<String>,
+}
+
+fn deserialize_custom_fonts<'de, D>(deserializer: D) -> Result<Vec<CustomFont>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CustomFontEntry {
+        Path(String),
+        Font(CustomFont),
+    }
+
+    let entries = Vec::<CustomFontEntry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| match entry {
+            CustomFontEntry::Path(path) => CustomFont {
+                path,
+                families: Vec::new(),
+                monospace_families: Vec::new(),
+            },
+            CustomFontEntry::Font(font) => font,
+        })
+        .collect())
+}
+
 const DEFAULT_WEBDAV_BACKUP_REMOTE_DIR: &str = "onetcli-backup";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +404,7 @@ impl WebDavBackupSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    #[serde(default)]
+    #[serde(default = "default_locale")]
     pub locale: String,
     #[serde(default)]
     pub theme_mode: String,
@@ -271,6 +414,18 @@ pub struct AppSettings {
     pub font_family: String,
     #[serde(default = "default_font_size")]
     pub font_size: f64,
+    #[serde(default = "default_monospace_font_family")]
+    pub sql_editor_font_family: String,
+    #[serde(default = "default_monospace_font_family")]
+    pub table_preview_font_family: String,
+    #[serde(default = "default_monospace_font_family")]
+    pub terminal_font_family: String,
+    #[serde(
+        default,
+        alias = "custom_font_paths",
+        deserialize_with = "deserialize_custom_fonts"
+    )]
+    pub custom_fonts: Vec<CustomFont>,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f64,
     #[serde(default = "default_true")]
@@ -296,6 +451,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub global_proxy: GlobalProxySettings,
     #[serde(default)]
+    pub mcp: McpSettings,
+    #[serde(default)]
+    pub webdav_backup: WebDavBackupSettings,
+    #[serde(default)]
     pub database_open_mode: DatabaseOpenMode,
     #[serde(default)]
     pub large_text_cell_editor_open_mode: LargeTextCellEditorOpenMode,
@@ -312,21 +471,38 @@ pub struct AppSettings {
     /// 表格行高（像素），默认44
     #[serde(default = "default_table_row_height")]
     pub table_row_height: u32,
+    /// SQL 查询默认最大返回行数，0 表示不限制
+    #[serde(default = "default_sql_query_max_rows")]
+    pub sql_query_max_rows: u32,
     #[serde(default)]
     pub custom_keybindings: HashMap<String, Vec<String>>,
-    #[serde(default)]
-    pub webdav_backup: WebDavBackupSettings,
 }
 
 pub(crate) const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
-pub(crate) const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-space";
+pub(crate) const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
+pub const DEFAULT_SQL_QUERY_MAX_ROWS: u32 = 1000;
 
 fn default_font_family() -> String {
     "Arial".to_string()
 }
 
+fn default_locale() -> String {
+    LOCALE_SYSTEM.to_string()
+}
+
 fn default_font_size() -> f64 {
     14.0
+}
+
+fn default_monospace_font_family() -> String {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else if cfg!(target_os = "windows") {
+        "Consolas"
+    } else {
+        "DejaVu Sans Mono"
+    }
+    .to_string()
 }
 
 fn default_terminal_font_size() -> f64 {
@@ -357,14 +533,22 @@ fn default_table_row_height() -> u32 {
     44
 }
 
+fn default_sql_query_max_rows() -> u32 {
+    DEFAULT_SQL_QUERY_MAX_ROWS
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            locale: "zh-CN".to_string(),
+            locale: default_locale(),
             theme_mode: "light".to_string(),
             auto_switch_theme: false,
             font_family: default_font_family(),
             font_size: default_font_size(),
+            sql_editor_font_family: default_monospace_font_family(),
+            table_preview_font_family: default_monospace_font_family(),
+            terminal_font_family: default_monospace_font_family(),
+            custom_fonts: Vec::new(),
             terminal_font_size: default_terminal_font_size(),
             terminal_auto_copy: default_true(),
             terminal_enable_autocomplete: default_true(),
@@ -377,6 +561,8 @@ impl Default for AppSettings {
             log_file_path: String::new(),
             auto_update: true,
             global_proxy: GlobalProxySettings::default(),
+            mcp: McpSettings::default(),
+            webdav_backup: WebDavBackupSettings::default(),
             database_open_mode: DatabaseOpenMode::default(),
             large_text_cell_editor_open_mode: LargeTextCellEditorOpenMode::default(),
             enable_sql_auto_save: true,
@@ -384,8 +570,8 @@ impl Default for AppSettings {
             system_hotkey_macos: default_system_hotkey_macos(),
             system_hotkey_other: default_system_hotkey_other(),
             table_row_height: default_table_row_height(),
+            sql_query_max_rows: default_sql_query_max_rows(),
             custom_keybindings: HashMap::new(),
-            webdav_backup: WebDavBackupSettings::default(),
         }
     }
 }
@@ -489,7 +675,7 @@ impl AppSettings {
     }
 
     pub fn apply(&self, cx: &mut App) {
-        gpui_component::set_locale(&self.locale);
+        gpui_component::set_locale(effective_locale_for_setting(&self.locale));
 
         let mode = if self.theme_mode == "dark" {
             ThemeMode::Dark
@@ -519,7 +705,10 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::LargeTextCellEditorOpenMode;
+    use super::{
+        AppSettings, CustomFont, LOCALE_SYSTEM, LargeTextCellEditorOpenMode, McpPermissionMode,
+        McpServerMode,
+    };
 
     #[test]
     fn large_text_editor_open_mode_defaults_to_sidebar_preview() {
@@ -535,5 +724,157 @@ mod tests {
             LargeTextCellEditorOpenMode::from_str("dialog"),
             LargeTextCellEditorOpenMode::Dialog
         );
+    }
+
+    #[test]
+    fn app_settings_default_keeps_mcp_server_disabled() {
+        let settings = AppSettings::default();
+
+        assert!(!settings.mcp.server_enabled);
+        assert_eq!(settings.mcp.server_mode, McpServerMode::Temporary);
+        assert_eq!(settings.mcp.permission_mode, McpPermissionMode::Deny);
+        assert!(settings.mcp.toolsets.terminal);
+        assert!(settings.mcp.toolsets.connections);
+        assert!(!settings.mcp.toolsets.database);
+        assert!(!settings.mcp.toolsets.redis);
+        assert!(!settings.mcp.toolsets.sftp);
+    }
+
+    #[test]
+    fn app_settings_default_sets_sql_query_max_rows() {
+        let settings = AppSettings::default();
+
+        assert_eq!(1000, settings.sql_query_max_rows);
+    }
+
+    #[test]
+    fn app_settings_default_follows_system_locale() {
+        let settings = AppSettings::default();
+
+        assert_eq!(LOCALE_SYSTEM, settings.locale);
+    }
+
+    #[test]
+    fn app_settings_deserializes_sql_query_max_rows_from_legacy_json() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert_eq!(1000, settings.sql_query_max_rows);
+    }
+
+    #[test]
+    fn app_settings_deserializes_missing_locale_as_system_mode() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "theme_mode": "dark"
+        }))
+        .expect("缺少 locale 的旧版 settings.json 应能读取");
+
+        assert_eq!(LOCALE_SYSTEM, settings.locale);
+    }
+
+    #[test]
+    fn app_settings_deserializes_mcp_defaults_from_legacy_json() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert_eq!("en", settings.locale);
+        assert!(!settings.mcp.server_enabled);
+        assert_eq!(settings.mcp.permission_mode, McpPermissionMode::Deny);
+        assert!(settings.mcp.toolsets.terminal);
+        assert!(settings.mcp.toolsets.connections);
+    }
+
+    #[test]
+    fn app_settings_default_system_hotkey_other_avoids_input_method_shortcut() {
+        let settings = AppSettings::default();
+
+        assert_eq!("ctrl-alt-m", settings.system_hotkey_other);
+    }
+
+    #[test]
+    fn app_settings_deserializes_font_defaults_from_legacy_json() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert!(!settings.sql_editor_font_family.is_empty());
+        assert_eq!(
+            settings.sql_editor_font_family,
+            settings.table_preview_font_family
+        );
+        assert_eq!(
+            settings.sql_editor_font_family,
+            settings.terminal_font_family
+        );
+        assert!(settings.custom_fonts.is_empty());
+    }
+
+    #[test]
+    fn app_settings_round_trip_preserves_custom_fonts() {
+        let mut settings = AppSettings::default();
+        settings.custom_fonts = vec![CustomFont {
+            path: "/tmp/NotoSansCJK-Regular.ttc".to_string(),
+            families: vec!["Noto Sans Mono CJK SC".to_string()],
+            monospace_families: vec!["Noto Sans Mono CJK SC".to_string()],
+        }];
+
+        let json = serde_json::to_string(&settings).expect("应序列化 AppSettings");
+        let restored: AppSettings = serde_json::from_str(&json).expect("应反序列化 AppSettings");
+
+        assert_eq!(
+            vec![CustomFont {
+                path: "/tmp/NotoSansCJK-Regular.ttc".to_string(),
+                families: vec!["Noto Sans Mono CJK SC".to_string()],
+                monospace_families: vec!["Noto Sans Mono CJK SC".to_string()],
+            }],
+            restored.custom_fonts
+        );
+    }
+
+    #[test]
+    fn app_settings_reads_legacy_custom_font_paths() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "custom_font_paths": ["/tmp/NotoSansCJK-Regular.ttc"]
+        }))
+        .expect("旧版自定义字体路径应能读取");
+
+        assert_eq!(
+            vec![CustomFont {
+                path: "/tmp/NotoSansCJK-Regular.ttc".to_string(),
+                families: Vec::new(),
+                monospace_families: Vec::new(),
+            }],
+            settings.custom_fonts
+        );
+    }
+
+    #[test]
+    fn app_settings_round_trip_preserves_mcp_settings() {
+        let mut settings = AppSettings::default();
+        settings.mcp.server_enabled = true;
+        settings.mcp.server_mode = McpServerMode::Persistent;
+        settings.mcp.permission_mode = McpPermissionMode::Ask;
+        settings.mcp.toolsets.connections = false;
+        settings.mcp.toolsets.database = true;
+        settings.mcp.toolsets.redis = true;
+
+        let json = serde_json::to_string(&settings).expect("应序列化 AppSettings");
+        let loaded: AppSettings = serde_json::from_str(&json).expect("应反序列化 AppSettings");
+
+        assert!(loaded.mcp.server_enabled);
+        assert_eq!(loaded.mcp.server_mode, McpServerMode::Persistent);
+        assert_eq!(loaded.mcp.permission_mode, McpPermissionMode::Ask);
+        assert!(loaded.mcp.toolsets.terminal);
+        assert!(!loaded.mcp.toolsets.connections);
+        assert!(loaded.mcp.toolsets.database);
+        assert!(loaded.mcp.toolsets.redis);
     }
 }

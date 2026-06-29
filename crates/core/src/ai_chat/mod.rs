@@ -56,6 +56,7 @@ pub mod components;
 pub mod context_window;
 pub mod engine;
 mod panel;
+mod reasoning;
 pub mod rendering;
 pub mod services;
 pub mod stream;

@@ -25,7 +25,11 @@ members = [
     "crates/extension-api",
     "crates/extension-component",
     "crates/extension-wasm",
+    "crates/tool_runtime",
+    "crates/onetcli_runtime",
     "crates/er_flow",
+    "crates/onetcli_cli",
+    "crates/public_mcp",
     "crates/terminal",
     "crates/terminal_view",
     "crates/port_forwarding",
@@ -63,6 +67,7 @@ reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662
 ], package = "zed-reqwest", version = "0.12.15-zed" }
 
 anyhow = "1.0.102"
+clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
 lsp-types = { version = "0.97.0", features = ["proposed"] }
 notify = "7.0.0"
@@ -79,10 +84,13 @@ serde_yaml = "0.9"
 serde_repr = "0.1"
 smallvec = "1"
 smol = "2"
+sys-locale = "0.3.2"
 tracing = "0.1.41"
 
 
 reqwest_client = { path = "crates/reqwest_client" }
+public_mcp = { path = "crates/public_mcp" }
+tool_runtime = { path = "crates/tool_runtime" }
 db = { path = "crates/db" }
 db_view = { path = "crates/db_view" }
 redis_view = { path = "crates/redis_view" }
@@ -99,9 +107,10 @@ remote_desktop_view = { path = "crates/remote_desktop_view" }
 sftp_view = { path = "crates/sftp_view" }
 one-core = { path = "crates/core" }
 mongodb_view = {path = "crates/mongodb_view"}
+onetcli_cli = { path = "crates/onetcli_cli" }
+onetcli_runtime = { path = "crates/onetcli_runtime" }
 remote_file_editor = { path = "crates/remote_file_editor" }
 er_flow = { path = "crates/er_flow" }
-ipc = { path = "crates/ipc" }
 extension-protocol = { path = "crates/extension-protocol" }
 extension-host = { path = "crates/extension-host" }
 extension-driver = { path = "crates/extension-driver" }

@@ -7,6 +7,12 @@ use gpui_component::Sizable;
 use gpui_component::WindowExt;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
+use raw_window_handle::HasWindowHandle;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use raw_window_handle::RawWindowHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ALWAYS_ON_TOP: AtomicBool = AtomicBool::new(false);
 
 actions!(
     onetcli_app,
@@ -21,6 +27,7 @@ actions!(
         ActivateTab8,
         ActivateTab9,
         ToggleFullscreen,
+        ToggleAlwaysOnTop,
         MinimizeWindow,
         DuplicateTab,
         QuitApp,
@@ -98,6 +105,106 @@ fn toggle_fullscreen(cx: &mut App) {
             window.toggle_fullscreen();
         });
     });
+}
+
+fn toggle_always_on_top(cx: &mut App) {
+    let Some(active_window) = cx.active_window() else {
+        return;
+    };
+    cx.defer(move |cx| {
+        _ = active_window.update(cx, |_, window, _| {
+            let next = !ALWAYS_ON_TOP.load(Ordering::Relaxed);
+            if set_window_always_on_top(window, next).is_ok() {
+                ALWAYS_ON_TOP.store(next, Ordering::Relaxed);
+            }
+        });
+    });
+}
+
+fn set_window_always_on_top(window: &Window, _always_on_top: bool) -> anyhow::Result<()> {
+    let handle = HasWindowHandle::window_handle(window)
+        .map_err(|err| anyhow::anyhow!("获取窗口句柄失败: {err:?}"))?
+        .as_raw();
+    match handle {
+        #[cfg(target_os = "macos")]
+        RawWindowHandle::AppKit(handle) => {
+            set_macos_always_on_top(handle.ns_view.as_ptr(), _always_on_top)
+        }
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(handle) => {
+            set_windows_always_on_top(handle.hwnd.get(), _always_on_top)
+        }
+        _ => Err(anyhow::anyhow!("当前平台暂不支持窗口置顶")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_always_on_top(
+    ns_view: *mut std::ffi::c_void,
+    always_on_top: bool,
+) -> anyhow::Result<()> {
+    if ns_view.is_null() {
+        return Err(anyhow::anyhow!("获取 NSView 失败"));
+    }
+
+    type Id = *mut std::ffi::c_void;
+    type Sel = *mut std::ffi::c_void;
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        #[link_name = "sel_registerName"]
+        fn sel_register_name(name: *const std::ffi::c_char) -> Sel;
+        #[link_name = "objc_msgSend"]
+        fn objc_msg_send(receiver: Id, selector: Sel, ...) -> Id;
+    }
+
+    const NS_NORMAL_WINDOW_LEVEL: isize = 0;
+    const NS_FLOATING_WINDOW_LEVEL: isize = 3;
+    let level = if always_on_top {
+        NS_FLOATING_WINDOW_LEVEL
+    } else {
+        NS_NORMAL_WINDOW_LEVEL
+    };
+    let window_selector = std::ffi::CString::new("window")?;
+    let set_level_selector = std::ffi::CString::new("setLevel:")?;
+    unsafe {
+        let ns_window = objc_msg_send(ns_view.cast(), sel_register_name(window_selector.as_ptr()));
+        if ns_window.is_null() {
+            return Err(anyhow::anyhow!("获取 NSWindow 失败"));
+        }
+        objc_msg_send(
+            ns_window,
+            sel_register_name(set_level_selector.as_ptr()),
+            level,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_always_on_top(hwnd: isize, always_on_top: bool) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+
+    let insert_after = if always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    unsafe {
+        SetWindowPos(
+            HWND(hwnd as *mut _),
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )?;
+    }
+    Ok(())
 }
 
 fn duplicate_tab(cx: &mut App) {
@@ -244,6 +351,8 @@ pub fn init(cx: &mut App) {
     }
     terminal_view::init(cx);
     redis_view::init(cx);
+    crate::public_mcp_approval::init(cx);
+    crate::public_mcp_runtime::init(cx);
     mongodb_view::init(cx);
     remote_desktop_view::init(cx);
     crate::home_tab::init(cx);
@@ -336,6 +445,15 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
     keybindings.extend(
         shortcuts_for(
             cx,
+            action_id::WINDOW_TOGGLE_ALWAYS_ON_TOP,
+            &[default_shortcut("ctrl-cmd-t", "ctrl-alt-t")],
+        )
+        .into_iter()
+        .map(|key| KeyBinding::new(&key, ToggleAlwaysOnTop, None)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
             action_id::APP_DUPLICATE_TAB,
             &[default_shortcut("cmd-shift-t", "alt-shift-t")],
         )
@@ -380,6 +498,13 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
     ));
     keybindings.extend(rebind_keybindings(
         cx,
+        action_id::WINDOW_TOGGLE_ALWAYS_ON_TOP,
+        &[default_shortcut("ctrl-cmd-t", "ctrl-alt-t")],
+        None,
+        ToggleAlwaysOnTop,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
         action_id::APP_DUPLICATE_TAB,
         &[default_shortcut("cmd-shift-t", "alt-shift-t")],
         None,
@@ -406,6 +531,7 @@ fn init_action_handlers(cx: &mut App) {
     cx.on_action(|_: &ActivateTab8, cx| activate_tab_by_number(8, cx));
     cx.on_action(|_: &ActivateTab9, cx| activate_tab_by_number(9, cx));
     cx.on_action(|_: &ToggleFullscreen, cx| toggle_fullscreen(cx));
+    cx.on_action(|_: &ToggleAlwaysOnTop, cx| toggle_always_on_top(cx));
     cx.on_action(|_: &DuplicateTab, cx| duplicate_tab(cx));
     cx.on_action(|_: &QuitApp, cx| quit_app(cx));
     cx.on_action(|_: &OpenConnectionQuickOpen, cx| {
@@ -479,7 +605,22 @@ impl OnetCliApp {
 
             #[cfg(not(target_os = "macos"))]
             {
-                container = container.with_window_controls(true)
+                // 窗口置顶按钮注入：点击时切换置顶并刷新按钮视觉状态
+                let on_toggle: std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync> =
+                    std::sync::Arc::new(|_window: &mut Window, cx: &mut App| {
+                        toggle_always_on_top(cx);
+                        if let Some(tab_container) = cx
+                            .try_global::<GlobalTabContainer>()
+                            .map(|global| global.tab_container.clone())
+                        {
+                            tab_container.update(cx, |_, cx| cx.notify());
+                        }
+                    });
+                let is_active: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+                    std::sync::Arc::new(|| ALWAYS_ON_TOP.load(Ordering::Relaxed));
+                container = container
+                    .with_window_controls(true)
+                    .with_always_on_top_control(on_toggle, is_active);
             }
 
             container

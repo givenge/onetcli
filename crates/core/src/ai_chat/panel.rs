@@ -10,21 +10,19 @@ use crate::llm::{
     storage::ProviderRepository,
 };
 use crate::storage::{GlobalStorageState, traits::Repository};
-use crate::tab_container::{TabContent, TabContentEvent};
 use gpui::{
     App, AppContext, AsyncApp, Context, Corner, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, WindowExt as _,
+    ActiveTheme, IconName, Sizable, Size, WindowExt as _,
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
     list::{List, ListState},
     popover::Popover,
-    text::TextView,
     v_flex,
 };
 use rust_i18n::t;
@@ -35,13 +33,12 @@ use tracing::{info, warn};
 use super::engine::ChatEngine;
 use super::rendering::ChatMessageRenderer;
 use super::stream::{ChatStreamProcessor, StreamEvent};
+use super::types::{ChatMessageUIGeneric, MessageVariant};
 // 使用共享组件
 use super::components::{
     ModelSettings, ModelSettingsEvent, ModelSettingsPanel, ProviderItem, ProviderSelectEvent,
     ProviderSelectState, SessionData, SessionListConfig, SessionListDelegate, SessionListHost,
 };
-use super::context_window::trim_messages_to_context_window;
-use super::types::MessageVariant;
 
 /// AI 聊天面板的自定义颜色配置
 ///
@@ -329,89 +326,10 @@ pub struct AiChatPanel {
     is_logged_in: bool,
     /// 场景专属系统提示词，仅在发送消息时前置注入
     system_instruction: Option<String>,
-    /// 是否由外部 agent 接管提交和流式更新
     external_submit_enabled: bool,
 }
 
-fn extract_fenced_command(entry: &str) -> Option<String> {
-    let start = entry.find("```bash\n")?;
-    let rest = &entry[start + "```bash\n".len()..];
-    let end = rest.find("\n```")?;
-    Some(rest[..end].trim().to_string())
-}
-
-fn summarize_tool_history_entry(entry: &str) -> Option<String> {
-    let command = extract_fenced_command(entry)?;
-    let status = if entry.contains("授权结果：已拒绝") {
-        "已拒绝".to_string()
-    } else if let Some(start) = entry.find("执行结果：退出码 ") {
-        let rest = &entry[start + "执行结果：退出码 ".len()..];
-        let exit_code = rest.lines().next().unwrap_or("unknown").trim();
-        format!("已执行，退出码 {exit_code}")
-    } else if entry.contains("执行失败：") {
-        "执行失败".to_string()
-    } else {
-        "已执行".to_string()
-    };
-
-    Some(format!("- `{command}`: {status}"))
-}
-
 impl AiChatPanel {
-    fn persist_provider_config(
-        &mut self,
-        provider_id: i64,
-        update: impl FnOnce(&mut ProviderConfig),
-    ) {
-        let Some(index) = self
-            .engine
-            .provider_configs
-            .iter()
-            .position(|config| config.id == provider_id)
-        else {
-            return;
-        };
-
-        let mut config = self.engine.provider_configs[index].clone();
-        update(&mut config);
-
-        let repo = match self
-            .engine
-            .session_service
-            .storage_manager()
-            .get::<ProviderRepository>()
-        {
-            Some(repo) => repo,
-            None => return,
-        };
-
-        if repo.update(&config).is_ok() {
-            self.engine.provider_configs[index] = config;
-        }
-    }
-
-    fn sync_model_settings_from_provider(
-        &mut self,
-        provider_id: i64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(config) = self
-            .engine
-            .provider_configs
-            .iter()
-            .find(|config| config.id == provider_id)
-            .cloned()
-        else {
-            return;
-        };
-
-        let settings = ModelSettings::from_provider_config(&config);
-        self.engine.model_settings = settings.clone();
-        self.settings_panel
-            .update(cx, |panel, cx| panel.update_settings(settings, window, cx));
-    }
-
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
@@ -435,22 +353,11 @@ impl AiChatPanel {
                     this.engine.selected_model = this
                         .provider_select_state
                         .update_models_for_provider(&provider_id, window, cx);
-                    if let Ok(provider_id) = provider_id.parse::<i64>() {
-                        this.sync_model_settings_from_provider(provider_id, window, cx);
-                    }
+                    cx.notify();
                 }
                 ProviderSelectEvent::ModelChanged { model } => {
                     this.engine.selected_model = Some(model.clone());
-                    if let Some(provider_id) = this
-                        .engine
-                        .provider_id
-                        .as_deref()
-                        .and_then(|value| value.parse::<i64>().ok())
-                    {
-                        this.persist_provider_config(provider_id, |config| {
-                            config.model = model.clone();
-                        });
-                    }
+                    cx.notify();
                 }
             });
 
@@ -478,19 +385,10 @@ impl AiChatPanel {
         subscriptions.push(cx.subscribe_in(
             &settings_panel,
             window,
-            |this, _panel, event: &ModelSettingsEvent, _window, _cx| match event {
+            |this, _panel, event: &ModelSettingsEvent, _window, cx| match event {
                 ModelSettingsEvent::Changed(settings) => {
                     this.engine.model_settings = settings.clone();
-                    if let Some(provider_id) = this
-                        .engine
-                        .provider_id
-                        .as_deref()
-                        .and_then(|value| value.parse::<i64>().ok())
-                    {
-                        this.persist_provider_config(provider_id, |config| {
-                            settings.apply_to_provider_config(config);
-                        });
-                    }
+                    cx.notify();
                 }
             },
         ));
@@ -558,18 +456,6 @@ impl AiChatPanel {
                                     panel.provider_select_state.selected_provider().cloned();
                                 panel.engine.selected_model =
                                     panel.provider_select_state.selected_model().cloned();
-                                if let Some(provider_id) = panel
-                                    .engine
-                                    .provider_id
-                                    .as_deref()
-                                    .and_then(|value| value.parse::<i64>().ok())
-                                {
-                                    panel.sync_model_settings_from_provider(
-                                        provider_id,
-                                        window,
-                                        cx,
-                                    );
-                                }
                                 cx.notify();
                             });
                         }
@@ -595,11 +481,6 @@ impl AiChatPanel {
             let trimmed = instruction.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         });
-        cx.notify();
-    }
-
-    pub fn set_external_submit_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.external_submit_enabled = enabled;
         cx.notify();
     }
 
@@ -684,7 +565,6 @@ impl AiChatPanel {
         if message.trim().is_empty() {
             return;
         }
-
         if self.external_submit_enabled {
             cx.emit(AiChatPanelEvent::Submit(message));
         } else {
@@ -692,90 +572,9 @@ impl AiChatPanel {
         }
     }
 
-    fn selected_provider_config(&self, provider_id: i64) -> Option<ProviderConfig> {
-        let mut config = self
-            .engine
-            .provider_configs
-            .iter()
-            .find(|item| item.id == provider_id)
-            .cloned()?;
-
-        if let Some(model) = self
-            .engine
-            .selected_model
-            .clone()
-            .filter(|model| !model.trim().is_empty())
-        {
-            config.model = model;
-        }
-
-        config.max_tokens = Some(self.engine.model_settings.max_tokens as i32);
-        config.temperature = Some(self.engine.model_settings.temperature);
-        config.reasoning_effort = Some(self.engine.model_settings.reasoning_effort);
-        Some(config)
-    }
-
-    fn build_request_messages(&self, content: &str, session_id: Option<i64>) -> Vec<Message> {
-        let history_count = self.engine.model_settings.history_count;
-        let context_window_size = self.engine.model_settings.context_window_size;
-        let mut messages = if let Some(sid) = session_id {
-            match self.engine.session_service.get_messages(sid) {
-                Ok(history) => {
-                    let mut items: Vec<Message> = history
-                        .iter()
-                        .filter_map(|msg| {
-                            let role = match msg.role.as_str() {
-                                "user" => Some(Role::User),
-                                "assistant" => Some(Role::Assistant),
-                                "system" => Some(Role::System),
-                                _ => None,
-                            }?;
-                            Some(Message::text(role, &msg.content))
-                        })
-                        .collect();
-                    if items.len() > history_count {
-                        items = items.split_off(items.len() - history_count);
-                    }
-                    items
-                }
-                Err(_) => vec![Message::text(Role::User, content)],
-            }
-        } else {
-            vec![Message::text(Role::User, content)]
-        };
-
-        if let Some(instruction) = self.system_instruction.as_deref() {
-            messages.insert(0, Message::text(Role::System, instruction));
-        }
-
-        trim_messages_to_context_window(messages, context_window_size)
-    }
-
-    fn build_external_tool_history_context(&self, session_id: Option<i64>) -> Option<Message> {
-        let sid = session_id?;
-        let history = self.engine.session_service.get_messages(sid).ok()?;
-        let summaries: Vec<String> = history
-            .iter()
-            .filter(|msg| msg.role == "tool_history")
-            .filter_map(|msg| summarize_tool_history_entry(&msg.content))
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
-        if summaries.is_empty() {
-            return None;
-        }
-
-        Some(Message::text(
-            Role::System,
-            format!(
-                "以下是本会话已完成的工具执行记录。除非结果为空、命令失败、环境已变化，或你明确说明必须重新验证，否则不要重复执行相同或等价命令；应直接基于这些记录继续下一步。\n\n{}",
-                summaries.join("\n")
-            ),
-        ))
+    pub fn set_external_submit_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.external_submit_enabled = enabled;
+        cx.notify();
     }
 
     pub fn begin_external_request(
@@ -795,18 +594,19 @@ impl AiChatPanel {
             return Err(message);
         };
 
-        let provider_id: i64 = match provider_id_str.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                let message = t!("AiChat.invalid_provider_id").to_string();
-                self.engine.push_assistant(message.clone());
-                cx.notify();
-                return Err(message);
-            }
-        };
+        let provider_id: i64 = provider_id_str.parse().map_err(|_| {
+            let message = t!("AiChat.invalid_provider_id").to_string();
+            self.engine.push_assistant(message.clone());
+            cx.notify();
+            message
+        })?;
 
         let provider_config = self
-            .selected_provider_config(provider_id)
+            .engine
+            .provider_configs
+            .iter()
+            .find(|config| config.id == provider_id)
+            .cloned()
             .ok_or_else(|| t!("AiChat.invalid_provider_id").to_string())?;
 
         let session_id = self.ensure_session_id(&provider_id_str, cx);
@@ -814,13 +614,7 @@ impl AiChatPanel {
             self.persist_user_message(session_id, &content, cx);
         }
 
-        let mut messages = self.build_request_messages(&content, session_id);
-        if let Some(tool_history) = self.build_external_tool_history_context(session_id) {
-            messages.push(tool_history);
-            let context_window_size = self.engine.model_settings.context_window_size;
-            messages = trim_messages_to_context_window(messages, context_window_size);
-        }
-
+        let messages = self.external_request_messages(&content, session_id, cx);
         self.engine.push_user_message(content);
         let assistant_message_id = self.engine.push_streaming_assistant();
         self.engine.auto_scroll_enabled = true;
@@ -835,6 +629,49 @@ impl AiChatPanel {
             assistant_message_id,
             session_id,
         })
+    }
+
+    fn external_request_messages(
+        &self,
+        content: &str,
+        session_id: Option<i64>,
+        cx: &App,
+    ) -> Vec<Message> {
+        let global_state = cx.global::<GlobalStorageState>();
+        let storage_manager = global_state.storage.clone();
+        let history_count = self.engine.model_settings.history_count;
+
+        let mut messages = session_id
+            .and_then(|sid| {
+                storage_manager
+                    .get::<MessageRepository>()
+                    .map(|repo| (sid, repo))
+            })
+            .and_then(|(sid, repo)| repo.list_by_session(sid).ok())
+            .map(|history| {
+                let mut messages: Vec<Message> = history
+                    .iter()
+                    .map(|msg| {
+                        let role = match msg.role.as_str() {
+                            "assistant" => Role::Assistant,
+                            "system" => Role::System,
+                            _ => Role::User,
+                        };
+                        Message::text(role, &msg.content)
+                    })
+                    .collect();
+                if messages.len() > history_count {
+                    messages = messages.split_off(messages.len() - history_count);
+                }
+                messages
+            })
+            .unwrap_or_else(|| vec![Message::text(Role::User, content)]);
+
+        if let Some(instruction) = self.system_instruction.as_deref() {
+            messages.insert(0, Message::text(Role::System, instruction));
+        }
+
+        messages
     }
 
     pub fn set_external_status(
@@ -865,7 +702,6 @@ impl AiChatPanel {
         content: String,
         cx: &mut Context<Self>,
     ) {
-        let mut should_persist = false;
         if let Some(msg) = self
             .engine
             .messages
@@ -877,13 +713,12 @@ impl AiChatPanel {
             msg.content = content.clone();
         } else {
             self.engine.messages.push(
-                crate::ai_chat::types::ChatMessageUIGeneric::streaming_thinking()
+                ChatMessageUIGeneric::streaming_thinking()
                     .with_id(thinking_message_id.to_string())
                     .with_content(content.clone()),
             );
-            should_persist = true;
         }
-        if should_persist && let Some(session_id) = self.engine.session_id {
+        if let Some(session_id) = self.engine.session_id {
             self.engine
                 .persist_ui_message(session_id, "thinking", content);
         }
@@ -917,10 +752,7 @@ impl AiChatPanel {
         }
         self.engine
             .messages
-            .push(crate::ai_chat::types::ChatMessageUIGeneric::tool_history(
-                "工具执行记录",
-                entry,
-            ));
+            .push(ChatMessageUIGeneric::tool_history("工具执行记录", entry));
         self.engine.scroll_to_bottom();
         cx.notify();
     }
@@ -952,36 +784,21 @@ impl AiChatPanel {
         content: String,
         cx: &mut Context<Self>,
     ) {
-        let remove_index = self
-            .engine
-            .messages
-            .iter()
-            .enumerate()
-            .find(|(_, msg)| msg.id == assistant_message_id)
-            .and_then(|(index, msg)| {
-                if matches!(msg.variant, MessageVariant::Status { .. })
-                    || msg.content.trim().is_empty()
-                {
-                    Some(index)
-                } else {
-                    None
-                }
-            });
-
-        if let Some(index) = remove_index {
-            self.engine.messages.remove(index);
-        } else if let Some(msg) = self
+        if let Some(msg) = self
             .engine
             .messages
             .iter_mut()
             .find(|msg| msg.id == assistant_message_id)
         {
+            msg.variant = MessageVariant::Text;
             msg.is_streaming = false;
+            msg.content = content.clone();
+        } else {
+            self.engine.push_assistant(content.clone());
         }
 
         self.engine.is_loading = false;
         self.engine.cancel_token = None;
-        self.engine.push_assistant(content.clone());
         if let Some(session_id) = session_id {
             self.engine.persist_assistant_message(session_id, content);
             self.load_history_sessions(cx);
@@ -1005,7 +822,7 @@ impl AiChatPanel {
             msg.variant = MessageVariant::Text;
             msg.is_streaming = false;
             if msg.content.trim().is_empty() {
-                msg.content = error.clone();
+                msg.content = error;
             } else {
                 msg.content.push_str("\n\n");
                 msg.content.push_str(&error);
@@ -1022,23 +839,6 @@ impl AiChatPanel {
         self.engine.cancel_token = None;
         self.engine.scroll_to_bottom();
         cx.notify();
-    }
-
-    fn toggle_message_expanded(&mut self, message_id: &str, cx: &mut Context<Self>) {
-        if let Some(msg) = self
-            .engine
-            .messages
-            .iter_mut()
-            .find(|msg| msg.id == message_id)
-        {
-            match msg.variant {
-                MessageVariant::Thinking | MessageVariant::ToolHistory { .. } => {
-                    msg.is_expanded = !msg.is_expanded;
-                    cx.notify();
-                }
-                _ => {}
-            }
-        }
     }
 
     // 创建新会话 - 同步返回，异步保存
@@ -1115,7 +915,7 @@ impl AiChatPanel {
                     Some(r) => r,
                     None => return,
                 };
-                match session_repo.list_by_kind(ChatSessionKind::Ai) {
+                match session_repo.list() {
                     Ok(s) => s,
                     Err(_) => return,
                 }
@@ -1320,10 +1120,8 @@ impl AiChatPanel {
         let storage_manager = global_state.storage.clone();
         let session_id = self.engine.session_id;
         let history_count = self.engine.model_settings.history_count;
-        let context_window_size = self.engine.model_settings.context_window_size;
         let max_tokens = self.engine.model_settings.max_tokens;
         let temperature = self.engine.model_settings.temperature;
-        let reasoning_effort = self.engine.model_settings.reasoning_effort;
         let system_instruction = self.system_instruction.clone();
 
         // 获取用户选择的模型
@@ -1369,14 +1167,14 @@ impl AiChatPanel {
                             Ok(messages) => {
                                 let mut msgs: Vec<Message> = messages
                                     .iter()
-                                    .filter_map(|msg| {
+                                    .map(|msg| {
                                         let role = match msg.role.as_str() {
-                                            "user" => Some(Role::User),
-                                            "assistant" => Some(Role::Assistant),
-                                            "system" => Some(Role::System),
-                                            _ => None,
-                                        }?;
-                                        Some(Message::text(role, &msg.content))
+                                            "user" => Role::User,
+                                            "assistant" => Role::Assistant,
+                                            "system" => Role::System,
+                                            _ => Role::User,
+                                        };
+                                        Message::text(role, &msg.content)
                                     })
                                     .collect();
                                 // 限制历史条数
@@ -1398,7 +1196,7 @@ impl AiChatPanel {
                     messages.insert(0, Message::text(Role::System, instruction));
                 }
 
-                trim_messages_to_context_window(messages, context_window_size)
+                messages
             };
 
             // 直接使用 ChatStreamProcessor 进行流式对话
@@ -1408,7 +1206,6 @@ impl AiChatPanel {
                 messages,
                 max_tokens as u32,
                 temperature,
-                Some(reasoning_effort),
                 cancel_token,
                 global_provider_state,
                 storage_manager.clone(),
@@ -1434,35 +1231,8 @@ impl AiChatPanel {
             };
 
             // 处理流式事件
-            let mut thinking_msg_id: Option<String> = None;
             while let Some(event) = rx.recv().await {
                 match event {
-                    StreamEvent::ThinkingDelta { full_thinking, .. } => {
-                        if let Some(entity) = this.upgrade() {
-                            let msg_id = if let Some(existing) = &thinking_msg_id {
-                                existing.clone()
-                            } else {
-                                let new_id = assistant_msg_id.clone() + "-thinking";
-                                thinking_msg_id = Some(new_id.clone());
-                                new_id
-                            };
-                            cx.update(|cx| {
-                                entity.update(cx, |this, cx| {
-                                    if !this.engine.messages.iter().any(|msg| msg.id == msg_id) {
-                                        this.engine.messages.push(
-                                            crate::ai_chat::types::ChatMessageUIGeneric::streaming_thinking()
-                                                .with_id(msg_id.clone()),
-                                        );
-                                    }
-                                    this.engine.update_streaming_content(&msg_id, full_thinking);
-                                    this.engine.scroll_to_bottom();
-                                    cx.notify();
-                                })
-                            });
-                        } else {
-                            return;
-                        }
-                    }
                     StreamEvent::ContentDelta { full_content, .. } => {
                         if let Some(entity) = this.upgrade() {
                             let msg_id = assistant_msg_id.clone();
@@ -1477,24 +1247,27 @@ impl AiChatPanel {
                             return;
                         }
                     }
+                    StreamEvent::ReasoningDelta { full_reasoning, .. } => {
+                        if let Some(entity) = this.upgrade() {
+                            let msg_id = assistant_msg_id.clone();
+                            cx.update(|cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.engine
+                                        .update_streaming_reasoning(&msg_id, full_reasoning);
+                                    this.engine.scroll_to_bottom();
+                                    cx.notify();
+                                })
+                            });
+                        } else {
+                            return;
+                        }
+                    }
                     StreamEvent::Completed { full_content } => {
                         if let Some(entity) = this.upgrade() {
                             let msg_id = assistant_msg_id.clone();
-                            let thinking_id = thinking_msg_id.clone();
                             let storage_for_save = storage_manager.clone();
                             cx.update(|cx| {
                                 entity.update(cx, |this, cx| {
-                                    if let Some(thinking_id) = &thinking_id {
-                                        this.engine.finalize_streaming(
-                                            thinking_id,
-                                            this.engine
-                                                .messages
-                                                .iter()
-                                                .find(|msg| msg.id == *thinking_id)
-                                                .map(|msg| msg.content.clone())
-                                                .unwrap_or_default(),
-                                        );
-                                    }
                                     this.engine
                                         .finalize_streaming(&msg_id, full_content.clone());
                                     this.engine.is_loading = false;
@@ -1532,19 +1305,8 @@ impl AiChatPanel {
                     StreamEvent::Error { message } => {
                         if let Some(entity) = this.upgrade() {
                             let msg_id = assistant_msg_id.clone();
-                            let thinking_id = thinking_msg_id.clone();
                             cx.update(|cx| {
                                 entity.update(cx, |this, cx| {
-                                    if let Some(thinking_id) = &thinking_id {
-                                        if let Some(msg) = this
-                                            .engine
-                                            .messages
-                                            .iter_mut()
-                                            .find(|msg| msg.id == *thinking_id)
-                                        {
-                                            msg.is_streaming = false;
-                                        }
-                                    }
                                     this.engine.set_message_error(&msg_id, message);
                                     this.engine.is_loading = false;
                                     this.engine.cancel_token = None;
@@ -1558,19 +1320,8 @@ impl AiChatPanel {
                     StreamEvent::Cancelled => {
                         info!("Stream cancelled by user");
                         if let Some(entity) = this.upgrade() {
-                            let thinking_id = thinking_msg_id.clone();
                             let _ = cx.update(|cx| {
                                 entity.update(cx, |this, cx| {
-                                    if let Some(thinking_id) = &thinking_id {
-                                        if let Some(msg) = this
-                                            .engine
-                                            .messages
-                                            .iter_mut()
-                                            .find(|msg| msg.id == *thinking_id)
-                                        {
-                                            msg.is_streaming = false;
-                                        }
-                                    }
                                     this.engine.is_loading = false;
                                     this.engine.cancel_token = None;
                                     cx.notify();
@@ -1658,7 +1409,6 @@ impl AiChatPanel {
                             .icon(IconName::Close)
                             .ghost()
                             .small()
-                            .tooltip("关闭面板")
                             .on_click(cx.listener(|_this, _event, _window, cx| {
                                 cx.emit(AiChatPanelEvent::Close);
                             })),
@@ -1666,7 +1416,7 @@ impl AiChatPanel {
             )
     }
 
-    fn render_messages(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_messages(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let code_block_actions = self.engine.code_block_actions.clone();
 
         div()
@@ -1682,179 +1432,8 @@ impl AiChatPanel {
                 v_flex()
                     .w_full()
                     .gap_4()
-                    .children(self.engine.messages.iter().map(|msg| match &msg.variant {
-                        MessageVariant::Thinking => {
-                            let message_id = msg.id.clone();
-                            v_flex()
-                                .w_full()
-                                .child(
-                                    h_flex()
-                                        .id(SharedString::from(format!(
-                                            "toggle-message-{message_id}"
-                                        )))
-                                        .w_full()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_0p5()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .hover(|this| this.bg(self.background(cx).opacity(0.35)))
-                                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                                            this.toggle_message_expanded(&message_id, cx);
-                                        }))
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    gpui_component::Icon::new(IconName::Bot)
-                                                        .with_size(Size::XSmall)
-                                                        .text_color(self.muted(cx)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(self.foreground(cx))
-                                                        .child("Thinking".to_string()),
-                                                ),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(self.muted(cx))
-                                                        .child(if msg.is_expanded {
-                                                            "详情".to_string()
-                                                        } else {
-                                                            "详情".to_string()
-                                                        }),
-                                                )
-                                                .child(
-                                                    gpui_component::Icon::new(if msg.is_expanded {
-                                                        IconName::ChevronUp
-                                                    } else {
-                                                        IconName::ChevronDown
-                                                    })
-                                                    .with_size(Size::XSmall)
-                                                    .text_color(self.muted(cx)),
-                                                ),
-                                        ),
-                                )
-                                .when(msg.is_expanded, |this| {
-                                    this.child(
-                                        div()
-                                            .w_full()
-                                            .mt_1()
-                                            .border_l_2()
-                                            .border_color(self.border(cx).opacity(0.55))
-                                            .pl_2()
-                                            .py_0p5()
-                                            .child(
-                                                TextView::markdown(
-                                                    SharedString::from(format!(
-                                                        "ai-thinking-body-{}",
-                                                        msg.id
-                                                    )),
-                                                    msg.content.clone(),
-                                                )
-                                                .text_color(self.foreground(cx))
-                                                .p_0()
-                                                .selectable(true),
-                                            ),
-                                    )
-                                })
-                                .into_any_element()
-                        }
-                        MessageVariant::ToolHistory { title } => {
-                            let message_id = msg.id.clone();
-                            v_flex()
-                                .w_full()
-                                .child(
-                                    h_flex()
-                                        .id(SharedString::from(format!(
-                                            "toggle-message-{message_id}"
-                                        )))
-                                        .w_full()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_0p5()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .hover(|this| this.bg(self.background(cx).opacity(0.35)))
-                                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                                            this.toggle_message_expanded(&message_id, cx);
-                                        }))
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    gpui_component::Icon::new(IconName::Search)
-                                                        .with_size(Size::XSmall)
-                                                        .text_color(self.muted(cx)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(self.foreground(cx))
-                                                        .child(title.to_string()),
-                                                ),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(self.muted(cx))
-                                                        .child(if msg.is_expanded {
-                                                            "详情".to_string()
-                                                        } else {
-                                                            "详情".to_string()
-                                                        }),
-                                                )
-                                                .child(
-                                                    gpui_component::Icon::new(if msg.is_expanded {
-                                                        IconName::ChevronUp
-                                                    } else {
-                                                        IconName::ChevronDown
-                                                    })
-                                                    .with_size(Size::XSmall)
-                                                    .text_color(self.muted(cx)),
-                                                ),
-                                        ),
-                                )
-                                .when(msg.is_expanded, |this| {
-                                    this.child(
-                                        div()
-                                            .w_full()
-                                            .mt_1()
-                                            .border_l_2()
-                                            .border_color(self.border(cx).opacity(0.55))
-                                            .pl_2()
-                                            .py_0p5()
-                                            .child(
-                                                TextView::markdown(
-                                                    SharedString::from(format!(
-                                                        "ai-tool-history-body-{}",
-                                                        msg.id
-                                                    )),
-                                                    msg.content.clone(),
-                                                )
-                                                .text_color(self.foreground(cx))
-                                                .selectable(true),
-                                            ),
-                                    )
-                                })
-                                .into_any_element()
-                        }
-                        _ => ChatMessageRenderer::render_message(msg, &code_block_actions, cx),
+                    .children(self.engine.messages.iter().map(|msg| {
+                        ChatMessageRenderer::render_message(msg, &code_block_actions, window, cx)
                     })),
             )
     }
@@ -1956,7 +1535,6 @@ impl AiChatPanel {
 }
 
 impl EventEmitter<AiChatPanelEvent> for AiChatPanel {}
-impl EventEmitter<TabContentEvent> for AiChatPanel {}
 
 impl Focusable for AiChatPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -2018,42 +1596,5 @@ impl Render for AiChatPanel {
                 .child(self.render_messages(window, cx))
                 .child(self.render_input(window, cx)),
         )
-    }
-}
-
-impl TabContent for AiChatPanel {
-    fn content_key(&self) -> &'static str {
-        "AI-Chat"
-    }
-
-    fn title(&self, _cx: &App) -> SharedString {
-        SharedString::from(t!("AiChat.title").to_string())
-    }
-
-    fn icon(&self, _cx: &App) -> Option<Icon> {
-        Some(IconName::AI.color().with_size(Size::Medium))
-    }
-
-    fn closeable(&self, _cx: &App) -> bool {
-        true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::summarize_tool_history_entry;
-
-    #[test]
-    fn summarize_tool_history_entry_extracts_command_and_exit_code() {
-        let entry = "申请执行命令：\n```bash\nnginx -t\n```\n\n授权结果：已批准\n\n执行结果：退出码 0\n```text\nok\n```";
-        let summary = summarize_tool_history_entry(entry).expect("should summarize");
-        assert_eq!(summary, "- `nginx -t`: 已执行，退出码 0");
-    }
-
-    #[test]
-    fn summarize_tool_history_entry_marks_denied_commands() {
-        let entry = "申请执行命令：\n```bash\nsystemctl reload nginx\n```\n\n授权结果：已拒绝";
-        let summary = summarize_tool_history_entry(entry).expect("should summarize");
-        assert_eq!(summary, "- `systemctl reload nginx`: 已拒绝");
     }
 }

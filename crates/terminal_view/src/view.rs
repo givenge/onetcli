@@ -38,6 +38,7 @@ use crate::cd_completion::{
     CdCompletionQuery, build_cd_completion_suggestions, parse_cd_completion_query,
 };
 use crate::history_prompt::{HistoryPromptAccept, HistoryPromptMode, HistoryPromptState};
+use crate::public_mcp::TerminalPublicMcpRegistration;
 use crate::settings::{
     GlobalTerminalLocalSettings, TerminalHighlightRule, TerminalSettings, TerminalSettingsEvent,
     current_settings, update_settings,
@@ -907,6 +908,7 @@ enum ResizingPanel {
 
 pub fn init(cx: &mut App) {
     crate::settings::init_settings(cx);
+    crate::public_mcp::init(cx);
     cx.bind_keys(init_keybindings(cx));
 }
 
@@ -1236,6 +1238,7 @@ pub struct TerminalView {
 
     scrollbar_metrics: Rc<RefCell<TerminalScrollbarMetrics>>,
     scrollbar_handle: TerminalScrollbarHandle,
+    public_mcp_registration: Option<TerminalPublicMcpRegistration>,
 }
 
 /// Mouse interaction state
@@ -1343,6 +1346,7 @@ impl TerminalView {
     }
 
     fn close_terminal_now(&mut self, cx: &mut Context<Self>) {
+        self.unregister_public_mcp_session(cx);
         self.release_active_connection(cx);
         self.terminal.read(cx).shutdown();
     }
@@ -1642,10 +1646,33 @@ impl TerminalView {
             pending_agent_command: None,
             scrollbar_metrics,
             scrollbar_handle,
+            public_mcp_registration: None,
         };
         let initial_settings = current_settings(cx);
         this.apply_settings_snapshot(&initial_settings, window, cx);
+        this.register_public_mcp_session(cx);
         this
+    }
+
+    fn register_public_mcp_session(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.terminal.read(cx);
+        let Some(registration) = crate::public_mcp::register_terminal(terminal, cx) else {
+            return;
+        };
+        self.public_mcp_registration = Some(registration);
+    }
+
+    fn refresh_public_mcp_session(&self, cx: &mut Context<Self>) {
+        let Some(registration) = &self.public_mcp_registration else {
+            return;
+        };
+        registration.refresh(self.terminal.read(cx));
+    }
+
+    fn unregister_public_mcp_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(registration) = self.public_mcp_registration.take() {
+            registration.unregister(cx);
+        }
     }
 
     fn handle_terminal_settings_event(
@@ -1693,7 +1720,10 @@ impl TerminalView {
                 self.set_font_size(*size, cx);
             }
             TerminalSidebarEvent::FontFamilyChanged(family) => {
-                self.set_font_family(family.clone(), cx);
+                let family = family.clone();
+                let _ = update_settings(cx, move |settings| {
+                    settings.font_family = family;
+                });
             }
             TerminalSidebarEvent::ThemeChanged(theme) => {
                 let theme_name = theme.name.to_string();
@@ -2390,6 +2420,7 @@ impl TerminalView {
             }
             _ => {}
         }
+        self.refresh_public_mcp_session(cx);
 
         if should_reset_history_prompt_for_terminal_event(event) {
             self.dismiss_history_prompt();
@@ -2633,7 +2664,7 @@ impl TerminalView {
     pub fn apply_terminal_settings(
         &mut self,
         font_size: f32,
-        font_family: &str,
+        font_family: String,
         auto_copy: bool,
         autocomplete_enabled: bool,
         middle_click_paste: bool,
@@ -2649,8 +2680,9 @@ impl TerminalView {
             self.font_size = px(clamped);
             self.line_height = self.font_size * self.line_height_scale;
         }
-        if self.font_family.as_ref() != font_family {
-            self.font_family = SharedString::from(font_family.to_string());
+        let font_family = SharedString::from(font_family);
+        if self.font_family != font_family {
+            self.font_family = font_family.clone();
         }
 
         self.auto_copy_on_select = auto_copy;
@@ -2671,6 +2703,7 @@ impl TerminalView {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.update_current_theme(&theme, window, cx);
             sidebar.set_font_size(clamped, window, cx);
+            sidebar.set_font_family(font_family, window, cx);
             sidebar.set_auto_copy(auto_copy, cx);
             sidebar.set_middle_click_paste(middle_click_paste, cx);
             sidebar.set_vim_scroll_to_arrow_keys(vim_scroll_to_arrow_keys, cx);
@@ -2691,7 +2724,7 @@ impl TerminalView {
         }
         self.apply_terminal_settings(
             settings.font_size,
-            &settings.font_family,
+            settings.font_family.clone(),
             settings.auto_copy,
             settings.enable_autocomplete,
             settings.middle_click_paste,
@@ -4975,39 +5008,16 @@ impl TerminalView {
         let point = self.pixel_to_point(event.position, bounds, cx);
         let screen_line = point.line.0 as usize;
         let column = point.column.0;
-        if let Some(pending) = &self.mouse_state.pending_sgr_left_press {
-            if should_start_selection_from_pending_sgr_press(pending.point, point) {
-                let pending = self.mouse_state.pending_sgr_left_press.take().unwrap();
-                let now = std::time::Instant::now();
-                let is_double_click = self.mouse_state.last_click_point == Some(pending.point)
-                    && self
-                        .mouse_state
-                        .last_click_time
-                        .map_or(false, |t| now.duration_since(t).as_millis() < 500);
 
-                self.mouse_state.click_count = if is_double_click {
-                    self.mouse_state.click_count + 1
-                } else {
-                    1
-                };
-                self.mouse_state.last_click_point = Some(pending.point);
-                self.mouse_state.last_click_time = Some(now);
-                let selection_type = match self.mouse_state.click_count {
-                    1 => SelectionType::Simple,
-                    2 => SelectionType::Semantic,
-                    _ => SelectionType::Lines,
-                };
-
-                self.terminal.update(cx, |terminal, _| {
-                    terminal.start_selection(
-                        selection_type,
-                        pending.point,
-                        self.pixel_to_side(pending.position, bounds),
-                    );
-                });
-                self.mouse_state.selecting = true;
-            }
+        if !event.dragging() {
+            self.mouse_state.pending_sgr_left_press = None;
+            self.finish_mouse_selection(cx);
         }
+
+        if event.dragging() {
+            self.start_selection_from_pending_sgr_press(point, bounds, cx);
+        }
+
         let line_text = self.get_line_text(screen_line, cx);
         let is_local = self.terminal.read(cx).connection_kind() == TerminalConnectionKind::Local;
         let hover_changed = {
@@ -5032,6 +5042,11 @@ impl TerminalView {
             return;
         }
 
+        if !event.dragging() {
+            self.finish_mouse_selection(cx);
+            return;
+        }
+
         let point = self.pixel_to_point(event.position, bounds, cx);
         let side = self.pixel_to_side(event.position, bounds);
 
@@ -5039,6 +5054,54 @@ impl TerminalView {
             terminal.update_selection(point, side);
         });
         cx.notify();
+    }
+
+    fn start_selection_from_pending_sgr_press(
+        &mut self,
+        point: AlacPoint,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let should_start = self
+            .mouse_state
+            .pending_sgr_left_press
+            .as_ref()
+            .map_or(false, |pending| {
+                should_start_selection_from_pending_sgr_press(pending.point, point)
+            });
+        if !should_start {
+            return;
+        }
+
+        let pending = self.mouse_state.pending_sgr_left_press.take().unwrap();
+        let now = std::time::Instant::now();
+        let is_double_click = self.mouse_state.last_click_point == Some(pending.point)
+            && self
+                .mouse_state
+                .last_click_time
+                .map_or(false, |t| now.duration_since(t).as_millis() < 500);
+
+        self.mouse_state.click_count = if is_double_click {
+            self.mouse_state.click_count + 1
+        } else {
+            1
+        };
+        self.mouse_state.last_click_point = Some(pending.point);
+        self.mouse_state.last_click_time = Some(now);
+        let selection_type = match self.mouse_state.click_count {
+            1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+
+        self.terminal.update(cx, |terminal, _| {
+            terminal.start_selection(
+                selection_type,
+                pending.point,
+                self.pixel_to_side(pending.position, bounds),
+            );
+        });
+        self.mouse_state.selecting = true;
     }
 
     fn handle_mouse_up(
@@ -5102,6 +5165,34 @@ impl TerminalView {
             );
             let _ = self.addon_manager.dispatch_mouse_up(&mut context);
         }
+        self.finish_mouse_selection(cx);
+    }
+
+    fn handle_window_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+
+        if self.mouse_state.pending_sgr_left_press.is_some() {
+            if !self.terminal_bounds.contains(&event.position) {
+                self.handle_mouse_up(event, window, cx);
+            }
+            return;
+        }
+
+        self.finish_mouse_selection(cx);
+    }
+
+    fn finish_mouse_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.mouse_state.selecting {
+            return;
+        }
+
         self.mouse_state.selecting = false;
         if self.auto_copy_on_select {
             if let Some(text) = self.terminal.read(cx).selection_text() {
@@ -5677,6 +5768,15 @@ impl Element for ResizeEventHandler {
                 }
             }
         });
+
+        window.on_mouse_event({
+            let view = self.view.clone();
+            move |e: &MouseUpEvent, phase, window, cx| {
+                if phase.bubble() {
+                    view.update(cx, |view, cx| view.handle_window_mouse_up(e, window, cx));
+                }
+            }
+        });
     }
 }
 
@@ -5792,6 +5892,14 @@ mod tests {
 
         assert!(source.contains("ContextMenu.clear_screen_with_shortcut"));
         assert!(source.contains("this.clear_screen(&ClearScreen, window, cx)"));
+    }
+
+    #[test]
+    fn terminal_selection_has_window_mouse_up_fallback() {
+        let source = include_str!("view.rs");
+
+        assert!(source.matches("handle_window_mouse_up").count() >= 2);
+        assert!(source.contains("window.on_mouse_event({"));
     }
 
     #[test]

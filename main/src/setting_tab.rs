@@ -1,16 +1,20 @@
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::app_init::is_valid_system_hotkey;
 use crate::auth::get_auth_service;
 use crate::settings::llm_providers_view::LlmProvidersView;
+use crate::settings::mcp_settings::mcp_setting_group;
 use crate::update;
 use crate::webdav_backup;
+use font_kit::{file_type::FileType, font::Font};
 use gpui::http_client::{AsyncBody, Method, Request};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, AsyncApp, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement, Render,
-    SharedString, Styled, WeakEntity, Window, div, px,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
+    PathPromptOptions, Render, SharedString, Styled, WeakEntity, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, Size, Theme, ThemeMode, TitleBar,
@@ -32,18 +36,209 @@ use one_core::keybindings::action_id;
 use one_core::llm::manager::GlobalProviderState;
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 pub const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
-pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-space";
+pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
 
 pub use one_core::settings::{
-    AppSettings, DatabaseOpenMode, GlobalCurrentUser, GlobalProxySettings,
-    LargeTextCellEditorOpenMode, ProxyType, WebDavBackupSettings,
+    AppSettings, CustomFont, DatabaseOpenMode, GlobalCurrentUser, GlobalProxySettings, LOCALE_EN,
+    LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK, LargeTextCellEditorOpenMode, ProxyType,
+    WebDavBackupSettings, effective_locale_for_setting,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
 use reqwest_client::ReqwestClient;
 use rust_i18n::t;
+use terminal_view::TerminalTheme;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+fn builtin_app_font_options() -> Vec<(SharedString, SharedString)> {
+    [
+        "Arial",
+        "Helvetica",
+        "Times New Roman",
+        "Courier New",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "Microsoft YaHei",
+        "PingFang SC",
+        "SimSun",
+    ]
+    .into_iter()
+    .map(|font| (font.into(), font.into()))
+    .collect()
+}
+
+fn app_font_options(cx: &App) -> Vec<(SharedString, SharedString)> {
+    merge_font_options_with_custom_fonts(
+        builtin_app_font_options(),
+        &AppSettings::global(cx).custom_fonts,
+        FontFamilyKind::Any,
+    )
+}
+
+fn builtin_monospace_font_options() -> Vec<(SharedString, SharedString)> {
+    TerminalTheme::available_monospace_fonts()
+        .into_iter()
+        .map(|font| (font.into(), font.into()))
+        .collect()
+}
+
+fn monospace_font_options(cx: &App) -> Vec<(SharedString, SharedString)> {
+    merge_font_options_with_custom_fonts(
+        builtin_monospace_font_options(),
+        &AppSettings::global(cx).custom_fonts,
+        FontFamilyKind::Monospace,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FontFamilyKind {
+    Any,
+    Monospace,
+}
+
+fn merge_font_options_with_custom_fonts(
+    mut options: Vec<(SharedString, SharedString)>,
+    custom_fonts: &[CustomFont],
+    kind: FontFamilyKind,
+) -> Vec<(SharedString, SharedString)> {
+    let custom_families = custom_fonts.iter().flat_map(|font| match kind {
+        FontFamilyKind::Any => font.families.iter(),
+        FontFamilyKind::Monospace => font.monospace_families.iter(),
+    });
+    for family in custom_families {
+        if family.trim().is_empty() || options.iter().any(|(value, _)| value.as_ref() == family) {
+            continue;
+        }
+        options.push((family.clone().into(), family.clone().into()));
+    }
+    options
+}
+
+const FONT_FILE_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc", "otc"];
+
+fn is_supported_font_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            FONT_FILE_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+fn read_font_file(path: &Path) -> Result<Vec<u8>, String> {
+    if !is_supported_font_file(path) {
+        return Err(t!("Settings.General.Font.unsupported_font_file").to_string());
+    }
+    std::fs::read(path).map_err(|err| err.to_string())
+}
+
+fn load_custom_font_path(path: &Path, cx: &mut App) -> Result<(), String> {
+    let bytes = read_font_file(path)?;
+    load_custom_font_bytes(bytes, cx)
+}
+
+fn load_custom_font_bytes(bytes: Vec<u8>, cx: &mut App) -> Result<(), String> {
+    cx.text_system()
+        .add_fonts(vec![Cow::Owned(bytes)])
+        .map_err(|err| err.to_string())
+}
+
+fn load_custom_fonts(fonts: &[CustomFont], cx: &mut App) -> usize {
+    fonts
+        .iter()
+        .filter(|font| load_custom_font_path(Path::new(&font.path), cx).is_ok())
+        .count()
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedFontFamilies {
+    families: Vec<String>,
+    monospace_families: Vec<String>,
+}
+
+fn parse_font_families(bytes: &[u8]) -> ParsedFontFamilies {
+    let font_data = Arc::new(bytes.to_vec());
+    let mut parsed = ParsedFontFamilies::default();
+
+    let indexes = match Font::analyze_bytes(Arc::clone(&font_data)) {
+        Ok(FileType::Single) => 0..1,
+        Ok(FileType::Collection(count)) => 0..count,
+        Err(_) => return parsed,
+    };
+
+    for index in indexes {
+        if let Ok(font) = Font::from_bytes(Arc::clone(&font_data), index) {
+            let family = font.family_name();
+            push_unique_font_family(&mut parsed.families, family.trim());
+            if font.is_monospace() {
+                push_unique_font_family(&mut parsed.monospace_families, family.trim());
+            }
+        }
+    }
+
+    parsed
+}
+
+fn push_unique_font_family(families: &mut Vec<String>, family: &str) {
+    if !family.is_empty() && !families.iter().any(|existing| existing == family) {
+        families.push(family.to_string());
+    }
+}
+
+fn import_custom_fonts(paths: Vec<PathBuf>, cx: &mut App) -> String {
+    let mut settings = AppSettings::current(cx);
+    let mut loaded = 0usize;
+    let mut monospace_count = 0usize;
+
+    for path in paths {
+        let Ok(bytes) = read_font_file(&path) else {
+            continue;
+        };
+        let families = parse_font_families(&bytes);
+        if load_custom_font_bytes(bytes, cx).is_err() {
+            continue;
+        }
+
+        let path = path.to_string_lossy().to_string();
+        monospace_count += families.monospace_families.len();
+        upsert_custom_font(&mut settings.custom_fonts, path, families);
+        loaded += 1;
+    }
+
+    if loaded > 0 {
+        settings.save();
+        cx.set_global(settings);
+        t!(
+            "Settings.General.Font.custom_fonts_import_success_with_monospace",
+            count = loaded,
+            monospace_count = monospace_count
+        )
+        .to_string()
+    } else {
+        t!("Settings.General.Font.custom_fonts_import_empty").to_string()
+    }
+}
+
+fn upsert_custom_font(
+    custom_fonts: &mut Vec<CustomFont>,
+    path: String,
+    families: ParsedFontFamilies,
+) {
+    if let Some(existing) = custom_fonts.iter_mut().find(|font| font.path == path) {
+        if !families.families.is_empty() {
+            existing.families = families.families;
+            existing.monospace_families = families.monospace_families;
+        }
+    } else {
+        custom_fonts.push(CustomFont {
+            path,
+            families: families.families,
+            monospace_families: families.monospace_families,
+        });
+    }
+}
 
 pub fn init_settings(cx: &mut App) {
     let settings = AppSettings::load();
@@ -53,6 +248,7 @@ pub fn init_settings(cx: &mut App) {
         settings.sql_auto_save_interval,
     ));
     settings.apply(cx);
+    load_custom_fonts(&settings.custom_fonts, cx);
     init_tracing(&settings);
     let http_client = build_app_http_client(&settings.global_proxy).expect("HTTP 客户端初始化失败");
     cx.set_http_client(http_client);
@@ -125,10 +321,12 @@ impl SettingsPanel {
         }
     }
 
-    fn setting_pages(&self, _window: &mut Window, _cx: &App) -> Vec<SettingPage> {
+    fn setting_pages(&self, _window: &mut Window, cx: &App) -> Vec<SettingPage> {
         let llm_view = self.llm_providers_view.clone();
         let default_settings = AppSettings::default();
         let default_system_hotkey = AppSettings::default().current_system_hotkey().to_string();
+        let app_font_options = app_font_options(cx);
+        let font_options = monospace_font_options(cx);
 
         vec![
             SettingPage::new(t!("Settings.General.title"))
@@ -143,21 +341,27 @@ impl SettingsPanel {
                                 SettingField::dropdown(
                                     vec![
                                         (
-                                            "zh-CN".into(),
+                                            LOCALE_SYSTEM.into(),
+                                            t!("Settings.General.Language.system").into(),
+                                        ),
+                                        (
+                                            LOCALE_ZH_CN.into(),
                                             t!("Settings.General.Language.zh_cn").into(),
                                         ),
                                         (
-                                            "zh-HK".into(),
+                                            LOCALE_ZH_HK.into(),
                                             t!("Settings.General.Language.zh_hk").into(),
                                         ),
-                                        ("en".into(), t!("Settings.General.Language.en").into()),
+                                        (LOCALE_EN.into(), t!("Settings.General.Language.en").into()),
                                     ],
                                     |cx: &App| {
                                         SharedString::from(AppSettings::global(cx).locale.clone())
                                     },
                                     |val: SharedString, cx: &mut App| {
                                         let locale = val.to_string();
-                                        gpui_component::set_locale(&locale);
+                                        gpui_component::set_locale(effective_locale_for_setting(
+                                            &locale,
+                                        ));
                                         AppSettings::update_and_save(cx, |settings| {
                                             settings.locale = locale;
                                         });
@@ -223,12 +427,7 @@ impl SettingsPanel {
                             SettingItem::new(
                                 t!("Settings.General.Font.font_family"),
                                 SettingField::dropdown(
-                                    vec![
-                                        ("Arial".into(), "Arial".into()),
-                                        ("Helvetica".into(), "Helvetica".into()),
-                                        ("Times New Roman".into(), "Times New Roman".into()),
-                                        ("Courier New".into(), "Courier New".into()),
-                                    ],
+                                    app_font_options,
                                     |cx: &App| {
                                         SharedString::from(
                                             AppSettings::global(cx).font_family.clone(),
@@ -243,6 +442,130 @@ impl SettingsPanel {
                                 .default_value(SharedString::from(default_settings.font_family)),
                             )
                             .description(t!("Settings.General.Font.font_family_desc").to_string()),
+                        )
+                        .item(
+                            SettingItem::new(
+                                t!("Settings.General.Font.sql_editor_font_family"),
+                                SettingField::dropdown(
+                                    font_options.clone(),
+                                    |cx: &App| {
+                                        SharedString::from(
+                                            AppSettings::global(cx).sql_editor_font_family.clone(),
+                                        )
+                                    },
+                                    |val: SharedString, cx: &mut App| {
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.sql_editor_font_family = val.to_string();
+                                        });
+                                    },
+                                )
+                                .default_value(SharedString::from(
+                                    default_settings.sql_editor_font_family,
+                                )),
+                            )
+                            .description(
+                                t!("Settings.General.Font.sql_editor_font_family_desc").to_string(),
+                            ),
+                        )
+                        .item(
+                            SettingItem::new(
+                                t!("Settings.General.Font.table_preview_font_family"),
+                                SettingField::dropdown(
+                                    font_options.clone(),
+                                    |cx: &App| {
+                                        SharedString::from(
+                                            AppSettings::global(cx)
+                                                .table_preview_font_family
+                                                .clone(),
+                                        )
+                                    },
+                                    |val: SharedString, cx: &mut App| {
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.table_preview_font_family = val.to_string();
+                                        });
+                                    },
+                                )
+                                .default_value(SharedString::from(
+                                    default_settings.table_preview_font_family,
+                                )),
+                            )
+                            .description(
+                                t!("Settings.General.Font.table_preview_font_family_desc")
+                                    .to_string(),
+                            ),
+                        )
+                        .item(
+                            SettingItem::new(
+                                t!("Settings.General.Font.terminal_font_family"),
+                                SettingField::dropdown(
+                                    font_options.clone(),
+                                    |cx: &App| {
+                                        SharedString::from(
+                                            AppSettings::global(cx).terminal_font_family.clone(),
+                                        )
+                                    },
+                                    |val: SharedString, cx: &mut App| {
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.terminal_font_family = val.to_string();
+                                        });
+                                    },
+                                )
+                                .default_value(SharedString::from(
+                                    default_settings.terminal_font_family,
+                                )),
+                            )
+                            .description(
+                                t!("Settings.General.Font.terminal_font_family_desc").to_string(),
+                            ),
+                        )
+                        .item(
+                            SettingItem::new(
+                                t!("Settings.General.Font.custom_fonts"),
+                                SettingField::render(|options, _window, _cx| {
+                                    Button::new("settings-import-custom-fonts")
+                                        .icon(IconName::File)
+                                        .label(t!("Settings.General.Font.import_custom_fonts"))
+                                        .with_size(options.size)
+                                        .on_click(|_, window, cx| {
+                                            let target_window = window.window_handle();
+                                            let future = cx.prompt_for_paths(PathPromptOptions {
+                                                files: true,
+                                                directories: false,
+                                                multiple: true,
+                                                prompt: Some(
+                                                    t!("Settings.General.Font.select_font_files")
+                                                        .to_string()
+                                                        .into(),
+                                                ),
+                                            });
+
+                                            window
+                                                .spawn(cx, async move |cx| {
+                                                    if let Ok(Ok(Some(paths))) = future.await {
+                                                        let _ = cx.update(
+                                                            |_view, cx: &mut App| {
+                                                                let message =
+                                                                    import_custom_fonts(paths, cx);
+                                                                let _ = cx.update_window(
+                                                                    target_window,
+                                                                    |_, window, cx| {
+                                                                        window.push_notification(
+                                                                            message, cx,
+                                                                        );
+                                                                        window.refresh();
+                                                                    },
+                                                                );
+                                                            },
+                                                        );
+                                                    }
+                                                })
+                                                .detach();
+                                        })
+                                }),
+                            )
+                            .description(
+                                t!("Settings.General.Font.custom_fonts_desc").to_string(),
+                            ),
                         )
                         .item(
                             SettingItem::new(
@@ -393,6 +716,26 @@ impl SettingsPanel {
                                 t!("Settings.General.Database.auto_save_interval_desc").to_string(),
                             ),
                             SettingItem::new(
+                                t!("Settings.General.Database.sql_query_max_rows"),
+                                SettingField::number_input(
+                                    NumberFieldOptions {
+                                        min: 0.0,
+                                        max: 1_000_000.0,
+                                        step: 100.0,
+                                    },
+                                    |cx: &App| AppSettings::global(cx).sql_query_max_rows as f64,
+                                    |val: f64, cx: &mut App| {
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.sql_query_max_rows = val as u32;
+                                        });
+                                    },
+                                )
+                                .default_value(default_settings.sql_query_max_rows as f64),
+                            )
+                            .description(
+                                t!("Settings.General.Database.sql_query_max_rows_desc").to_string(),
+                            ),
+                            SettingItem::new(
                                 t!("Settings.General.Database.table_row_height"),
                                 SettingField::number_input(
                                     NumberFieldOptions {
@@ -414,6 +757,7 @@ impl SettingsPanel {
                                 t!("Settings.General.Database.table_row_height_desc").to_string(),
                             ),
                         ]),
+                    mcp_setting_group(&default_settings.mcp),
                     SettingGroup::new()
                         .title(t!("Settings.General.Log.group_title"))
                         .item(
@@ -1420,6 +1764,13 @@ const WINDOW_SHORTCUTS: &[ShortcutEntry] = &[
         system_hotkey: false,
     },
     ShortcutEntry {
+        keys_macos: &["ctrl-cmd-t"],
+        keys_other: &["ctrl-alt-t"],
+        label_key: "Settings.Shortcuts.toggle_always_on_top",
+        action_id: Some(action_id::WINDOW_TOGGLE_ALWAYS_ON_TOP),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
         keys_macos: &["shift-escape"],
         keys_other: &["shift-escape"],
         label_key: "Settings.Shortcuts.toggle_zoom",
@@ -1604,6 +1955,13 @@ const DATABASE_SHORTCUTS: &[ShortcutEntry] = &[
         keys_other: &["cmd-enter", "ctrl-enter"],
         label_key: "Settings.Shortcuts.sql_run_query",
         action_id: Some(action_id::SQL_RUN_QUERY),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["cmd-shift-enter", "ctrl-shift-enter"],
+        keys_other: &["cmd-shift-enter", "ctrl-shift-enter"],
+        label_key: "Settings.Shortcuts.sql_run_all_query",
+        action_id: Some(action_id::SQL_RUN_ALL_QUERY),
         system_hotkey: false,
     },
 ];
@@ -2108,7 +2466,12 @@ fn render_shortcuts_section(
 mod tests {
     use gpui::http_client::HttpClient;
 
-    use super::{AppSettings, GlobalProxySettings, ProxyType, build_app_http_client};
+    use super::{
+        AppSettings, CustomFont, FontFamilyKind, GlobalProxySettings, ProxyType,
+        build_app_http_client, builtin_monospace_font_options, is_supported_font_file,
+        merge_font_options_with_custom_fonts, parse_font_families,
+    };
+    use std::path::Path;
 
     #[test]
     fn global_proxy_settings_build_proxy_url_without_auth() {
@@ -2156,6 +2519,88 @@ mod tests {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
 
         assert!(settings.custom_keybindings.is_empty());
+    }
+
+    #[test]
+    fn supported_font_file_detection_accepts_common_font_extensions() {
+        assert!(is_supported_font_file(Path::new("NotoSansCJK-Regular.ttc")));
+        assert!(is_supported_font_file(Path::new("JetBrainsMono.ttf")));
+        assert!(is_supported_font_file(Path::new("SourceHanSans.otf")));
+        assert!(!is_supported_font_file(Path::new("font.zip")));
+    }
+
+    #[test]
+    fn monospace_font_options_include_only_cjk_monospace_fonts() {
+        let values = builtin_monospace_font_options()
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.iter().any(|value| value == "Noto Sans Mono CJK SC"));
+        assert!(values.iter().any(|value| value == "Source Han Mono SC"));
+        assert!(!values.iter().any(|value| value == "Noto Sans CJK SC"));
+        assert!(!values.iter().any(|value| value == "Source Han Sans SC"));
+        assert!(!values.iter().any(|value| value == "Microsoft YaHei"));
+        assert!(!values.iter().any(|value| value == "PingFang SC"));
+        assert!(!values.iter().any(|value| value == "SimSun"));
+    }
+
+    #[test]
+    fn imported_font_families_are_added_to_font_options() {
+        let options = merge_font_options_with_custom_fonts(
+            builtin_monospace_font_options(),
+            &[CustomFont {
+                path: "/tmp/NotoSansCJK-Regular.ttc".to_string(),
+                families: vec![
+                    "Noto Sans Mono CJK SC".to_string(),
+                    "Custom Mono SC".to_string(),
+                ],
+                monospace_families: vec![
+                    "Noto Sans Mono CJK SC".to_string(),
+                    "Custom Mono SC".to_string(),
+                ],
+            }],
+            FontFamilyKind::Monospace,
+        );
+
+        let values = options
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.iter().any(|value| value == "Custom Mono SC"));
+        assert_eq!(
+            1,
+            values
+                .iter()
+                .filter(|value| value.as_str() == "Noto Sans Mono CJK SC")
+                .count()
+        );
+    }
+
+    #[test]
+    fn monospace_font_options_ignore_non_monospace_custom_fonts() {
+        let options = merge_font_options_with_custom_fonts(
+            builtin_monospace_font_options(),
+            &[CustomFont {
+                path: "/tmp/NotoSansSC-VF.ttf".to_string(),
+                families: vec!["Noto Sans SC".to_string()],
+                monospace_families: Vec::new(),
+            }],
+            FontFamilyKind::Monospace,
+        );
+
+        let values = options
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(!values.iter().any(|value| value == "Noto Sans SC"));
+    }
+
+    #[test]
+    fn parse_font_families_ignores_invalid_font_bytes() {
+        assert_eq!(parse_font_families(b"not a font"), Default::default());
     }
 
     #[test]

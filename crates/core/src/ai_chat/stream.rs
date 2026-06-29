@@ -12,9 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm::manager::GlobalProviderState;
 use crate::llm::storage::ProviderRepository;
-use crate::llm::{
-    ChatRequest, Message, ReasoningEffort, extract_stream_content, extract_stream_reasoning,
-};
+use crate::llm::{ChatRequest, Message, extract_stream_text_parts};
 use crate::storage::StorageManager;
 use crate::storage::traits::Repository;
 
@@ -25,17 +23,19 @@ use crate::storage::traits::Repository;
 /// 流式响应事件
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// 思考/推理内容增量（带完整累积内容）
-    ThinkingDelta {
-        delta: String,
-        full_thinking: String,
-    },
     /// 内容增量（带完整累积内容）
     ContentDelta {
         /// 增量内容
         delta: String,
         /// 累积的完整内容
         full_content: String,
+    },
+    /// 思考内容增量（带完整累积内容）
+    ReasoningDelta {
+        /// 增量内容
+        delta: String,
+        /// 累积的完整思考内容
+        full_reasoning: String,
     },
     /// 完成
     Completed {
@@ -104,7 +104,6 @@ impl ChatStreamProcessor {
         messages: Vec<Message>,
         max_tokens: u32,
         temperature: f32,
-        reasoning_effort: Option<ReasoningEffort>,
         cancel_token: CancellationToken,
         global_provider_state: GlobalProviderState,
         storage_manager: StorageManager,
@@ -120,7 +119,6 @@ impl ChatStreamProcessor {
                 messages,
                 max_tokens,
                 temperature,
-                reasoning_effort,
                 global_provider_state,
                 storage_manager,
                 tx.clone(),
@@ -149,7 +147,6 @@ impl ChatStreamProcessor {
         messages: Vec<Message>,
         max_tokens: u32,
         temperature: f32,
-        reasoning_effort: Option<ReasoningEffort>,
         cancel_token: CancellationToken,
         global_provider_state: GlobalProviderState,
         storage_manager: StorageManager,
@@ -168,7 +165,6 @@ impl ChatStreamProcessor {
                 messages,
                 max_tokens,
                 temperature,
-                reasoning_effort,
                 global_provider_state,
                 storage_manager,
                 tx.clone(),
@@ -195,7 +191,6 @@ impl ChatStreamProcessor {
         messages: Vec<Message>,
         max_tokens: u32,
         temperature: f32,
-        reasoning_effort: Option<ReasoningEffort>,
         global_provider_state: GlobalProviderState,
         storage: StorageManager,
         tx: mpsc::Sender<StreamEvent>,
@@ -220,7 +215,6 @@ impl ChatStreamProcessor {
             messages,
             max_tokens: Some(max_tokens),
             temperature: Some(temperature),
-            reasoning_effort,
             stream: Some(true),
             ..Default::default()
         };
@@ -237,9 +231,9 @@ impl ChatStreamProcessor {
             .map_err(|e| StreamError::ApiError(e.to_string()))?;
 
         let mut full_content = String::new();
-        let mut full_thinking = String::new();
         let mut pending_delta = String::new();
-        let mut pending_thinking_delta = String::new();
+        let mut full_reasoning = String::new();
+        let mut pending_reasoning = String::new();
         let mut last_emit = Instant::now();
         let throttle_duration = Duration::from_millis(50);
 
@@ -252,31 +246,24 @@ impl ChatStreamProcessor {
                 result = stream.next() => {
                     match result {
                         Some(Ok(response)) => {
-                            if let Some(reasoning) = extract_stream_reasoning(&response) {
-                                full_thinking.push_str(reasoning);
-                                pending_thinking_delta.push_str(reasoning);
+                            let parts = extract_stream_text_parts(&response);
+                            if let Some(reasoning) = parts.reasoning {
+                                full_reasoning.push_str(reasoning);
+                                pending_reasoning.push_str(reasoning);
                             }
-
-                            if let Some(content) = extract_stream_content(&response) {
+                            if let Some(content) = parts.content {
                                 full_content.push_str(content);
                                 pending_delta.push_str(content);
                             }
 
                             if last_emit.elapsed() >= throttle_duration {
-                                if !pending_thinking_delta.is_empty() {
-                                    let delta = std::mem::take(&mut pending_thinking_delta);
-                                    let _ = tx.send(StreamEvent::ThinkingDelta {
-                                        delta,
-                                        full_thinking: full_thinking.clone(),
-                                    }).await;
-                                }
-                                if !pending_delta.is_empty() {
-                                    let delta = std::mem::take(&mut pending_delta);
-                                    let _ = tx.send(StreamEvent::ContentDelta {
-                                        delta,
-                                        full_content: full_content.clone(),
-                                    }).await;
-                                }
+                                Self::send_pending_updates(
+                                    &tx,
+                                    &mut pending_delta,
+                                    &full_content,
+                                    &mut pending_reasoning,
+                                    &full_reasoning,
+                                ).await;
                                 last_emit = Instant::now();
                             }
 
@@ -285,18 +272,13 @@ impl ChatStreamProcessor {
                             });
 
                             if is_done {
-                                if !pending_thinking_delta.is_empty() {
-                                    let _ = tx.send(StreamEvent::ThinkingDelta {
-                                        delta: pending_thinking_delta,
-                                        full_thinking: full_thinking.clone(),
-                                    }).await;
-                                }
-                                if !pending_delta.is_empty() {
-                                    let _ = tx.send(StreamEvent::ContentDelta {
-                                        delta: pending_delta,
-                                        full_content: full_content.clone(),
-                                    }).await;
-                                }
+                                Self::send_pending_updates(
+                                    &tx,
+                                    &mut pending_delta,
+                                    &full_content,
+                                    &mut pending_reasoning,
+                                    &full_reasoning,
+                                ).await;
                                 let _ = tx.send(StreamEvent::Completed { full_content }).await;
                                 break;
                             }
@@ -308,18 +290,13 @@ impl ChatStreamProcessor {
                             break;
                         }
                         None => {
-                            if !pending_thinking_delta.is_empty() {
-                                let _ = tx.send(StreamEvent::ThinkingDelta {
-                                    delta: pending_thinking_delta,
-                                    full_thinking: full_thinking.clone(),
-                                }).await;
-                            }
-                            if !pending_delta.is_empty() {
-                                let _ = tx.send(StreamEvent::ContentDelta {
-                                    delta: pending_delta,
-                                    full_content: full_content.clone(),
-                                }).await;
-                            }
+                            Self::send_pending_updates(
+                                &tx,
+                                &mut pending_delta,
+                                &full_content,
+                                &mut pending_reasoning,
+                                &full_reasoning,
+                            ).await;
                             let _ = tx.send(StreamEvent::Completed { full_content }).await;
                             break;
                         }
@@ -329,5 +306,33 @@ impl ChatStreamProcessor {
         }
 
         Ok(())
+    }
+
+    async fn send_pending_updates(
+        tx: &mpsc::Sender<StreamEvent>,
+        pending_content: &mut String,
+        full_content: &str,
+        pending_reasoning: &mut String,
+        full_reasoning: &str,
+    ) {
+        if !pending_reasoning.is_empty() {
+            let delta = std::mem::take(pending_reasoning);
+            let _ = tx
+                .send(StreamEvent::ReasoningDelta {
+                    delta,
+                    full_reasoning: full_reasoning.to_string(),
+                })
+                .await;
+        }
+
+        if !pending_content.is_empty() {
+            let delta = std::mem::take(pending_content);
+            let _ = tx
+                .send(StreamEvent::ContentDelta {
+                    delta,
+                    full_content: full_content.to_string(),
+                })
+                .await;
+        }
     }
 }

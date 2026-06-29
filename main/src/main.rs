@@ -10,6 +10,8 @@ mod home_tab;
 mod license;
 pub mod new_connection;
 mod onetcli_app;
+mod public_mcp_approval;
+mod public_mcp_runtime;
 mod setting_tab;
 mod settings;
 mod update;
@@ -91,6 +93,9 @@ fn main() {
     if update::handle_update_command() {
         return;
     }
+    if let Some(exit_code) = handle_cli_command() {
+        std::process::exit(exit_code);
+    }
 
     let app = Application::new()
         .with_assets(AppAssets::new())
@@ -137,4 +142,14 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn handle_cli_command() -> Option<i32> {
+    onetcli_runtime::cli_host::handle_command(|| crate::public_mcp_runtime::cli_tool_registry())
+}
+
+#[cfg(target_os = "windows")]
+fn handle_cli_command() -> Option<i32> {
+    None
 }

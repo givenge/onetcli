@@ -5,7 +5,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::agent::types::{Agent, AgentContext, AgentDescriptor, AgentEvent, AgentResult};
-use crate::llm::{ChatRequest, Message, Role, extract_stream_content, extract_stream_reasoning};
+use crate::llm::{ChatRequest, Message, Role, extract_stream_text_parts};
 
 static DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     id: "general_chat",
@@ -56,7 +56,6 @@ impl GeneralChatAgent {
                 .map(|v| v as u32)
                 .or(Some(4096)),
             temperature: ctx.provider_config.temperature.or(Some(0.7)),
-            reasoning_effort: ctx.provider_config.reasoning_effort,
             stream: Some(true),
             ..Default::default()
         };
@@ -75,9 +74,8 @@ impl GeneralChatAgent {
             .map_err(|e| format!("Failed to start stream: {}", e))?;
 
         let mut full_content = String::new();
-        let mut full_thinking = String::new();
         let mut pending_delta = String::new();
-        let mut pending_thinking_delta = String::new();
+        let mut pending_reasoning = String::new();
         let mut last_emit = Instant::now();
         let throttle = Duration::from_millis(50);
 
@@ -90,24 +88,21 @@ impl GeneralChatAgent {
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(response)) => {
-                            if let Some(thinking) = extract_stream_reasoning(&response) {
-                                full_thinking.push_str(thinking);
-                                pending_thinking_delta.push_str(thinking);
+                            let parts = extract_stream_text_parts(&response);
+                            if let Some(reasoning) = parts.reasoning {
+                                pending_reasoning.push_str(reasoning);
                             }
-                            if let Some(content) = extract_stream_content(&response) {
+                            if let Some(content) = parts.content {
                                 full_content.push_str(content);
                                 pending_delta.push_str(content);
                             }
 
                             if last_emit.elapsed() >= throttle {
-                                if !pending_thinking_delta.is_empty() {
-                                    let delta = std::mem::take(&mut pending_thinking_delta);
-                                    let _ = tx.send(AgentEvent::ThinkingDelta(delta)).await;
-                                }
-                                if !pending_delta.is_empty() {
-                                    let delta = std::mem::take(&mut pending_delta);
-                                    let _ = tx.send(AgentEvent::TextDelta(delta)).await;
-                                }
+                                Self::send_pending_deltas(
+                                    tx,
+                                    &mut pending_delta,
+                                    &mut pending_reasoning,
+                                ).await;
                                 last_emit = Instant::now();
                             }
 
@@ -119,12 +114,11 @@ impl GeneralChatAgent {
                             });
 
                             if is_done {
-                                if !pending_thinking_delta.is_empty() {
-                                    let _ = tx.send(AgentEvent::ThinkingDelta(pending_thinking_delta)).await;
-                                }
-                                if !pending_delta.is_empty() {
-                                    let _ = tx.send(AgentEvent::TextDelta(pending_delta)).await;
-                                }
+                                Self::send_pending_deltas(
+                                    tx,
+                                    &mut pending_delta,
+                                    &mut pending_reasoning,
+                                ).await;
                                 let _ = tx
                                     .send(AgentEvent::Completed(AgentResult {
                                         content: full_content,
@@ -139,12 +133,11 @@ impl GeneralChatAgent {
                         }
                         None => {
                             // Stream ended without an explicit finish_reason.
-                            if !pending_thinking_delta.is_empty() {
-                                let _ = tx.send(AgentEvent::ThinkingDelta(pending_thinking_delta)).await;
-                            }
-                            if !pending_delta.is_empty() {
-                                let _ = tx.send(AgentEvent::TextDelta(pending_delta)).await;
-                            }
+                            Self::send_pending_deltas(
+                                tx,
+                                &mut pending_delta,
+                                &mut pending_reasoning,
+                            ).await;
                             let _ = tx
                                 .send(AgentEvent::Completed(AgentResult {
                                     content: full_content,
@@ -156,6 +149,25 @@ impl GeneralChatAgent {
                     }
                 }
             }
+        }
+    }
+
+    async fn send_pending_deltas(
+        tx: &mpsc::Sender<AgentEvent>,
+        pending_delta: &mut String,
+        pending_reasoning: &mut String,
+    ) {
+        if !pending_reasoning.is_empty() {
+            let _ = tx
+                .send(AgentEvent::ReasoningDelta(std::mem::take(
+                    pending_reasoning,
+                )))
+                .await;
+        }
+        if !pending_delta.is_empty() {
+            let _ = tx
+                .send(AgentEvent::TextDelta(std::mem::take(pending_delta)))
+                .await;
         }
     }
 }
