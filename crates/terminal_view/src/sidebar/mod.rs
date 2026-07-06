@@ -22,7 +22,6 @@ pub use rich_input_panel::{
 pub use server_monitor_panel::{ServerMonitorPanel, ServerMonitorPanelEvent};
 pub use settings_panel::SettingsPanel;
 
-use crate::ai_context::build_terminal_ai_system_instruction;
 use crate::{
     TerminalHighlightRule,
     theme::{TerminalColors, TerminalTheme},
@@ -53,7 +52,16 @@ use ssh::SshSessionManager;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use terminal::terminal::SshTerminalConfig;
-use tokio_util::sync::CancellationToken;
+
+const TERMINAL_AI_SYSTEM_INSTRUCTION: &str = r#"你是终端侧边栏中的 Linux 命令助手，默认面向 Linux shell 环境回答。
+请严格遵循以下规则：
+1. 当用户请求安装、配置、排查、运维或执行命令时，优先返回可以直接在 Linux 终端执行的命令。
+2. 所有命令都必须放在 Markdown 代码块中，代码块语言使用 bash。
+3. 每个代码块只能包含一条命令，不要在同一个代码块中放多条命令，不要使用 &&、; 或换行把多个命令塞进同一个代码块，除非用户明确要求组合命令。
+4. 如果任务需要多步骤，请拆成多个独立代码块，每个代码块只对应一步的一条命令。
+5. 解释、注意事项、风险提示、步骤标题必须写在代码块外面，保持简洁。
+6. 如果命令依赖 sudo、包管理器或发行版差异，请先简短说明再给命令。
+7. 如果用户明确要求非 Linux 平台、非命令答案或更详细的解释，再按用户要求调整。"#;
 
 fn agent_theme_from_terminal_theme(theme: &TerminalTheme) -> AgentChatTheme {
     let colors = theme.colors();
@@ -407,8 +415,6 @@ pub enum TerminalSidebarEvent {
     ExecuteCommand(String),
     /// 请求询问 AI
     AskAi,
-    /// 终端 AI 发起 agent 提交
-    AiSubmit(String),
     /// 粘贴代码到终端（用于AI生成的代码块）
     PasteCodeToTerminal(String),
     /// 光标闪烁变更
@@ -455,12 +461,6 @@ pub struct TerminalSidebar {
     file_manager_panel: Option<Entity<FileManagerPanel>>,
     /// 服务器监控面板（仅 SSH 终端时创建）
     server_monitor_panel: Option<Entity<ServerMonitorPanel>>,
-    /// AI 终端上下文中的连接名称
-    ai_connection_name: Option<String>,
-    /// AI 终端上下文中的 SSH 配置
-    ai_ssh_config: Option<SshTerminalConfig>,
-    /// AI 终端上下文中的远程工作目录
-    ai_working_dir: Option<String>,
     /// 路径与终端同步开关（默认开启）
     sync_path_enabled: bool,
     /// 焦点句柄
@@ -487,11 +487,6 @@ impl TerminalSidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         let colors = initial_theme.colors();
-        let ai_connection_name = stored_connection
-            .as_ref()
-            .map(|conn| conn.name.trim().to_string())
-            .filter(|name| !name.is_empty());
-        let ai_ssh_config = ssh_config.clone();
         let has_file_manager = stored_connection.is_some();
         let history_user = ssh_config
             .as_ref()
@@ -735,16 +730,11 @@ impl TerminalSidebar {
             ai_chat_panel,
             file_manager_panel,
             server_monitor_panel,
-            ai_connection_name,
-            ai_ssh_config,
-            ai_working_dir: None,
             sync_path_enabled,
             focus_handle: cx.focus_handle(),
             colors,
             _subs: subs,
-        };
-        this.refresh_ai_system_instruction(cx);
-        this
+        }
     }
 
     /// 获取当前激活的面板
@@ -1035,118 +1025,6 @@ impl TerminalSidebar {
         cx.notify();
     }
 
-    pub fn begin_agent_request(
-        &mut self,
-        content: String,
-        cancel_token: CancellationToken,
-        cx: &mut Context<Self>,
-    ) -> Result<ExternalAgentRequest, String> {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.begin_external_request(content, cancel_token, cx)
-        })
-    }
-
-    pub fn set_agent_status(
-        &mut self,
-        assistant_message_id: &str,
-        title: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.set_external_status(assistant_message_id, title, cx);
-        });
-    }
-
-    pub fn update_agent_content(
-        &mut self,
-        assistant_message_id: &str,
-        content: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.update_external_content(assistant_message_id, content, cx);
-        });
-    }
-
-    pub fn update_agent_thinking(
-        &mut self,
-        thinking_message_id: &str,
-        content: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.update_external_thinking(thinking_message_id, content, cx);
-        });
-    }
-
-    pub fn finish_agent_thinking(&mut self, thinking_message_id: &str, cx: &mut Context<Self>) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.finish_external_thinking(thinking_message_id, cx);
-        });
-    }
-
-    pub fn append_agent_history(
-        &mut self,
-        assistant_message_id: &str,
-        entry: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.append_external_history_entry(assistant_message_id, entry, cx);
-        });
-    }
-
-    pub fn complete_agent_request(
-        &mut self,
-        assistant_message_id: &str,
-        session_id: Option<i64>,
-        content: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.complete_external_request(assistant_message_id, session_id, content, cx);
-        });
-    }
-
-    pub fn fail_agent_request(
-        &mut self,
-        assistant_message_id: &str,
-        error: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.fail_external_request(assistant_message_id, error, cx);
-        });
-    }
-
-    pub fn finish_agent_cancelled(&mut self, cx: &mut Context<Self>) {
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.finish_external_cancelled(cx);
-        });
-    }
-
-    pub fn set_ai_working_dir(&mut self, working_dir: Option<String>, cx: &mut Context<Self>) {
-        let working_dir = working_dir
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        if self.ai_working_dir == working_dir {
-            return;
-        }
-        self.ai_working_dir = working_dir;
-        self.refresh_ai_system_instruction(cx);
-    }
-
-    fn refresh_ai_system_instruction(&mut self, cx: &mut Context<Self>) {
-        let instruction = build_terminal_ai_system_instruction(
-            self.ai_connection_name.as_deref(),
-            self.ai_ssh_config.as_ref(),
-            self.ai_working_dir.as_deref(),
-        );
-        self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.set_system_instruction(Some(instruction), cx);
-        });
-    }
-
     /// 添加快捷命令（外部调用）
     pub fn add_quick_command(&self, command: String, cx: &mut Context<Self>) {
         self.quick_command_panel.update(cx, |panel, cx| {
@@ -1209,19 +1087,25 @@ impl TerminalSidebar {
         let muted_fg = self.colors.muted_foreground;
         let muted_bg = self.colors.muted;
 
-        workbench::side_toolbar_button(
-            SharedString::from(format!("toolbar-btn-{:?}", panel)),
-            is_active,
-            cx,
-        )
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            this.toggle_panel(panel, cx);
-        }))
-        .child(
-            Icon::new(panel.icon())
-                .with_size(Size::Medium)
-                .text_color(if is_active { accent_fg } else { muted_fg }),
-        )
+        div()
+            .id(SharedString::from(format!("toolbar-btn-{:?}", panel)))
+            .w(px(36.0))
+            .h(px(36.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_active, |this| this.bg(accent_color))
+            .when(!is_active, |this| this.hover(|s| s.bg(muted_bg)))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.toggle_panel(panel, cx);
+            }))
+            .child(
+                Icon::new(panel.icon())
+                    .with_size(Size::Medium)
+                    .text_color(if is_active { accent_fg } else { muted_fg }),
+            )
     }
 
     /// 渲染工具栏

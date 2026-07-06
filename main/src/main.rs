@@ -7,7 +7,6 @@ mod auth;
 mod ai_chat_acp;
 mod ai_chat_acp_approval;
 mod app_init;
-mod auth;
 mod external_driver_display;
 mod home;
 mod home_tab;
@@ -27,8 +26,6 @@ mod sync_conflict_dialog;
 mod team_management;
 mod update;
 mod user_avatar;
-mod webdav_backup;
-mod webdav_backup_manager;
 
 use crate::onetcli_app::OnetCliApp;
 use gpui::*;

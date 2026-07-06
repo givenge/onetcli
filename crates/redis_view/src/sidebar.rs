@@ -8,7 +8,8 @@ use gpui::{
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Window, div,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex};
+use one_ui::workbench;
 use one_core::layout::TOOLBAR_WIDTH;
 use one_core::storage::StoredConnection;
 

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tracing::{debug, info};
 
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
@@ -335,19 +334,9 @@ impl SshBackend {
                                             let _ = event_tx.send(TerminalEvent::WorkingDirChanged(path.clone()));
                                         }
                                         OscEvent::PromptStart => {
-                                            debug!(
-                                                target: "terminal.agent.osc",
-                                                "ssh backend forwarding PromptStart"
-                                            );
                                             let _ = event_tx.send(TerminalEvent::PromptStart);
                                         }
                                         OscEvent::InputStart => {
-                                            debug!(
-                                                target: "terminal.agent.osc",
-                                                shell_ready,
-                                                init_sent,
-                                                "ssh backend forwarding InputStart"
-                                            );
                                             let _ = event_tx.send(TerminalEvent::InputStart);
                                             // 133;B: prompt 渲染完，用户可以输入了
                                             // 第一次收到时发送 init_commands
@@ -360,11 +349,6 @@ impl SshBackend {
                                         }
                                         OscEvent::CommandFinished { exit_code } => {
                                             // 133;D: 命令执行完毕
-                                            info!(
-                                                target: "terminal.agent.osc",
-                                                exit_code,
-                                                "ssh backend forwarding CommandFinished"
-                                            );
                                             let _ = event_tx.send(
                                                 TerminalEvent::CommandFinished { exit_code: *exit_code }
                                             );
@@ -706,28 +690,12 @@ impl SshBackend {
         channel.request_shell().await?;
         Ok(())
     }
-
-    async fn set_utf8_locale_env(channel: &mut dyn SshChannel) {
-        let locale = preferred_utf8_locale(&[]);
-        for key in ["LANG", "LC_CTYPE"] {
-            if let Err(err) = channel.set_env(key, &locale).await {
-                tracing::warn!(
-                    target: "terminal.ssh",
-                    key,
-                    locale,
-                    error = %err,
-                    "remote ssh server rejected UTF-8 locale env"
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::osc::parse_osc_payload;
-    use crate::preferred_utf8_locale;
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use ssh::SshConnectConfig;
@@ -1048,9 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_ssh_channel_falls_back_to_plain_shell_when_setup_fails() {
-        // setup 通道返回 exit 1，应该被降级路径捕获：interactive 通道只设置 UTF-8 locale，
-        // 然后走 pty+shell，不走 integration wrapper。
-        let locale = preferred_utf8_locale(&[]);
+        // setup 通道返回 exit 1，应该被降级路径捕获：interactive 通道不 set_env、只 pty+shell。
         let (setup_channel, setup_state) = MockChannel::new(
             [
                 ChannelEvent::ExtendedData {
@@ -1087,20 +1053,14 @@ mod tests {
         );
         assert_eq!(
             recorded_ops(&interactive_state),
-            vec![
-                ChannelOp::SetEnv("LANG".into(), locale.clone()),
-                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
-                ChannelOp::RequestPty,
-                ChannelOp::RequestShell,
-            ],
-            "降级路径只应设置 UTF-8 locale 后启动裸 shell，不能走 bash wrapper exec"
+            vec![ChannelOp::RequestPty, ChannelOp::RequestShell],
+            "降级路径绝对不能调 set_env，也不能走 bash wrapper exec"
         );
     }
 
     #[tokio::test]
     async fn prepare_ssh_channel_skips_setup_when_cache_hit() {
         // 命中缓存：只应打开 1 个 channel（interactive）。mock client 只提供 1 个 channel。
-        let locale = preferred_utf8_locale(&[]);
         let (interactive_channel, interactive_state) = MockChannel::new([], false);
         let mut client = MockClient::new([interactive_channel]);
 
@@ -1167,13 +1127,8 @@ mod tests {
         );
         assert_eq!(
             recorded_ops(&interactive_state),
-            vec![
-                ChannelOp::SetEnv("LANG".into(), locale.clone()),
-                ChannelOp::SetEnv("LC_CTYPE".into(), locale),
-                ChannelOp::RequestPty,
-                ChannelOp::RequestShell,
-            ],
-            "禁用路径只设置 UTF-8 locale 后启动 pty + shell，不跑 exec wrapper"
+            vec![ChannelOp::RequestPty, ChannelOp::RequestShell],
+            "禁用路径只跑 pty + shell,不调 set_env / exec wrapper"
         );
     }
 

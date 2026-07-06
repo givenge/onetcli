@@ -11,6 +11,7 @@ use gpui::{
     ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement, StyleRefinement,
     Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
+use rust_i18n::t;
 
 use crate::{
     ActiveTheme as _, Edges, Icon, IconName, Sizable as _, StyledExt, TITLE_BAR_HEIGHT,

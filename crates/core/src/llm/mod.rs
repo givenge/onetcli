@@ -10,9 +10,7 @@ pub use manager::{GlobalProviderState, ProviderManager};
 pub use onet_cli_provider::OnetCliLLMProvider;
 pub use types::{ProviderConfig, ProviderType};
 
-pub use llm_connector::types::{
-    ChatRequest, Message, MessageBlock, ReasoningEffort, Role, StreamingResponse,
-};
+pub use llm_connector::types::{ChatRequest, Message, MessageBlock, Role, StreamingResponse};
 
 use gpui::App;
 
@@ -27,17 +25,12 @@ pub struct StreamTextParts<'a> {
 /// 优先使用 provider 返回的正文内容；若正文为空，则回退到 reasoning/thinking，
 /// 以兼容 Ollama 下 Qwen 等只在 `thinking` 字段返回内容的模型。
 pub fn extract_stream_text(response: &StreamingResponse) -> Option<&str> {
-    extract_stream_content(response).or_else(|| extract_stream_reasoning(response))
-}
-
-/// 提取流式响应中的正常正文内容（不包含 thinking/reasoning）。
-pub fn extract_stream_content(response: &StreamingResponse) -> Option<&str> {
-    extract_stream_text_parts(response).content
-}
-
-/// 提取流式响应中的思考/推理内容。
-pub fn extract_stream_reasoning(response: &StreamingResponse) -> Option<&str> {
-    extract_stream_text_parts(response).reasoning
+    response.get_content().or_else(|| {
+        response
+            .choices
+            .iter()
+            .find_map(|choice| choice.delta.reasoning_any().filter(|text| !text.is_empty()))
+    })
 }
 
 /// 将流式响应中的正文和 reasoning/thinking 分开提取。

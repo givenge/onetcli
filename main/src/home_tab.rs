@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use db::ipc::IpcDriverRegistry;
@@ -6,22 +7,25 @@ use db_view::connection_form_window::{ConnectionFormWindow, ConnectionFormWindow
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions,
-    div, px,
+    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, ListSizingBehavior,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    UniformListScrollHandle, WeakEntity, Window, actions, div, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, Size, WindowExt,
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     list::{List, ListState},
+    popover::Popover,
+    tooltip::Tooltip,
     v_flex,
 };
 use mongodb_view::{MongoFormWindow, MongoFormWindowConfig};
 use one_core::cloud_sync::{
     CloudApiClient, CloudSyncService, ConflictResolution, SyncConflict, SyncEngine, UserInfo,
-    get_cached_team_options,
+    can_edit_connection, get_cached_team_options,
 };
 use one_core::config::{public_base_url, team_management_url_template};
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event, get_notifier};
@@ -34,7 +38,7 @@ use one_core::settings::{AppSettings, SyncProvider};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
     ActiveConnections, ConnectionRepository, ConnectionType, DatabaseType, GlobalStorageState,
-    PendingCloudDeletionRepository, RemoteDesktopParams,
+    PendingCloudDeletionRepository, RedisMode, RemoteDesktopParams,
     RemoteDesktopProtocol as StoredRemoteDesktopProtocol, StoredConnection, Workspace,
     WorkspaceRepository,
 };
@@ -54,8 +58,8 @@ use crate::external_driver_display::external_driver_icon_for_config_with_registr
 use crate::home::connection_import_window::show_connection_import_window;
 use crate::home::home_connection_quick_open::ConnectionQuickOpenDelegate;
 use crate::home::home_strategy::build_connection_open_strategy;
-use crate::home::home_workspace_filter::WorkspaceFilterDelegate;
-use crate::license::{get_license_service, is_feature_enabled};
+use crate::home::home_workspace_filter::{WorkspaceFilterDelegate, show_workspace_dialog};
+use crate::license::{get_license_service, is_feature_enabled, show_upgrade_dialog};
 use crate::new_connection::NewConnectionWindow;
 use crate::setting_tab::GlobalCurrentUser;
 use crate::team_management::{build_team_management_url, resolve_team_management_url};
@@ -274,36 +278,38 @@ impl DragConnection {
 
 pub struct HomePage {
     focus_handle: FocusHandle,
-    pub(crate) selected_filter: ConnectionType,
+    selected_filter: ConnectionType,
+    connection_layout: ConnectionLayout,
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) connections: Vec<StoredConnection>,
     pub(crate) tab_container: Entity<TabContainer>,
-    pub(crate) search_input: Entity<InputState>,
-    pub(crate) search_query: Entity<String>,
+    search_input: Entity<InputState>,
+    search_query: Entity<String>,
     pub(crate) editing_connection_id: Option<i64>,
-    pub(crate) selected_connection_id: Option<i64>,
+    selected_connection_id: Option<i64>,
+    connection_scroll_handle: UniformListScrollHandle,
     pub(crate) filtered_workspace_ids: HashSet<i64>,
     pub(crate) workspace_filter_open: bool,
-    pub(crate) workspace_filter_list: Option<Entity<ListState<WorkspaceFilterDelegate>>>,
+    workspace_filter_list: Option<Entity<ListState<WorkspaceFilterDelegate>>>,
     pub(crate) _subscriptions: Vec<Subscription>,
     /// 云同步服务
     cloud_sync_service: Arc<std::sync::RwLock<CloudSyncService>>,
     /// 云端加载错误信息
-    pub(crate) cloud_error: Option<String>,
+    cloud_error: Option<String>,
     /// 是否正在同步
-    pub(crate) syncing: bool,
+    syncing: bool,
     /// 同步期间收到的新同步请求
-    pub(crate) sync_requested: bool,
+    sync_requested: bool,
     /// 待处理的同步冲突
-    pub(crate) pending_conflicts: Vec<SyncConflict>,
+    pending_conflicts: Vec<SyncConflict>,
     /// 认证服务
     auth_service: Arc<AuthService>,
     /// 当前登录用户
-    pub(crate) current_user: Option<UserInfo>,
+    current_user: Option<UserInfo>,
     /// 是否正在登录
-    pub(crate) logging_in: bool,
+    logging_in: bool,
     /// 认证错误消息（登录/注册失败时设置）
-    pub(crate) auth_error: Option<String>,
+    auth_error: Option<String>,
     /// 启动恢复主密钥失败后，在首帧延迟弹出解锁对话框。
     master_key_unlock_prompt_pending: bool,
     /// 防止主密钥对话框被启动提示和用户点击重复打开。
@@ -637,6 +643,7 @@ impl HomePage {
         let mut page = Self {
             focus_handle: cx.focus_handle(),
             selected_filter: ConnectionType::All,
+            connection_layout: ConnectionLayout::Card,
             workspaces: Vec::new(),
             connections: Vec::new(),
             tab_container,
@@ -644,6 +651,7 @@ impl HomePage {
             search_query,
             editing_connection_id: None,
             selected_connection_id: None,
+            connection_scroll_handle: UniformListScrollHandle::new(),
             filtered_workspace_ids: HashSet::new(),
             workspace_filter_open: false,
             workspace_filter_list: None,
@@ -849,74 +857,26 @@ impl HomePage {
     #[allow(dead_code)]
     fn reorder_connection_by_id(
         &mut self,
-        from_id: i64,
-        workspace_id: Option<i64>,
-        to_id: i64,
+        source_id: Option<i64>,
+        target_id: Option<i64>,
         cx: &mut Context<Self>,
     ) {
-        if from_id == to_id {
+        let Some(source_id) = source_id else { return };
+        let Some(target_id) = target_id else { return };
+        if source_id == target_id {
             return;
         }
-
-        let mut ordered_ids: Vec<i64> = self
+        let from = self
             .connections
             .iter()
-            .filter(|conn| conn.workspace_id == workspace_id)
-            .filter_map(|conn| conn.id)
-            .collect();
-
-        let Some(from_index) = ordered_ids.iter().position(|id| *id == from_id) else {
-            return;
-        };
-        let Some(to_index) = ordered_ids.iter().position(|id| *id == to_id) else {
-            return;
-        };
-
-        let moved = ordered_ids.remove(from_index);
-        ordered_ids.insert(to_index, moved);
-
-        for (index, id) in ordered_ids.iter().enumerate() {
-            if let Some(conn) = self
-                .connections
-                .iter_mut()
-                .find(|conn| conn.id == Some(*id))
-            {
-                conn.sort_order = index as i32 + 1;
-            }
+            .position(|c| c.id == Some(source_id));
+        let to = self
+            .connections
+            .iter()
+            .position(|c| c.id == Some(target_id));
+        if let (Some(from), Some(to)) = (from, to) {
+            self.reorder_connections(from, to, cx);
         }
-
-        self.connections.sort_by(|a, b| {
-            a.sort_order
-                .cmp(&b.sort_order)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        cx.notify();
-
-        let storage = cx.global::<GlobalStorageState>().storage.clone();
-        let should_sync = self.current_user.is_some() && crypto::has_master_key();
-
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let result = (|| {
-                let repo = storage
-                    .get::<ConnectionRepository>()
-                    .ok_or_else(|| anyhow::anyhow!("ConnectionRepository not found"))?;
-                repo.reorder_in_workspace(workspace_id, &ordered_ids)
-            })();
-
-            _ = this.update(cx, |this, cx| match result {
-                Ok(()) => {
-                    if should_sync {
-                        tracing::info!("连接排序已更新，自动触发云同步");
-                        this.trigger_sync(cx);
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("保存连接排序失败: {}", err);
-                    this.load_connections(cx);
-                }
-            });
-        })
-        .detach();
     }
 
     pub(crate) fn reorder_workspace_by_id(
@@ -994,51 +954,6 @@ impl HomePage {
     fn refresh_local_home_data(&mut self, cx: &mut Context<Self>) {
         self.load_workspaces(cx);
         self.load_connections(cx);
-    }
-
-    /// 执行一次 WebDAV 备份。
-    pub(crate) fn backup_to_webdav(&mut self, cx: &mut Context<Self>) {
-        if self.backing_up {
-            return;
-        }
-
-        let settings = AppSettings::global(cx).webdav_backup.clone();
-        let http_client = cx.http_client();
-        let config_dir = match one_core::storage::manager::get_config_dir() {
-            Ok(dir) => dir,
-            Err(err) => {
-                self.backup_error = Some(err.to_string());
-                cx.notify();
-                return;
-            }
-        };
-
-        self.backing_up = true;
-        self.backup_error = None;
-        cx.notify();
-
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let result = webdav_backup::backup_to_webdav(settings, http_client, config_dir).await;
-            _ = this.update(cx, |this, cx| {
-                this.backing_up = false;
-                match result {
-                    Ok(result) => {
-                        tracing::info!(
-                            "WebDAV 备份完成：{} ({} bytes)",
-                            result.file_name,
-                            result.bytes
-                        );
-                        this.backup_error = None;
-                    }
-                    Err(err) => {
-                        tracing::error!("WebDAV 备份失败: {}", err);
-                        this.backup_error = Some(err);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     /// 触发云端同步
@@ -1176,7 +1091,7 @@ impl HomePage {
     }
 
     /// 显示冲突解决对话框
-    pub(crate) fn show_conflict_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_conflict_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_conflicts.is_empty() {
             return;
         }
@@ -1409,14 +1324,14 @@ impl HomePage {
     }
 
     /// 显示登录对话框（OTP 模式）
-    pub(crate) fn show_login_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_login_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         show_auth_dialog(window, cx, view, |this, email, otp, cx| {
             this.verify_otp(email, otp, cx);
         });
     }
 
-    pub(crate) fn confirm_edit_connection(
+    fn confirm_edit_connection(
         &mut self,
         conn_id: i64,
         conn_name: String,
@@ -1444,7 +1359,7 @@ impl HomePage {
     }
 
     /// 复制连接，创建一个副本
-    pub(crate) fn duplicate_connection(
+    fn duplicate_connection(
         &mut self,
         conn: StoredConnection,
         _window: &mut Window,
@@ -1504,7 +1419,7 @@ impl HomePage {
         .detach();
     }
 
-    pub(crate) fn confirm_delete_connection(
+    fn confirm_delete_connection(
         &mut self,
         conn_id: i64,
         conn_name: String,
@@ -1679,6 +1594,11 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) {
         self.editing_connection_id = None;
+
+        if !self.ensure_master_key_ready_for_new_connection(window, cx) {
+            return;
+        }
+
         let parent = cx.entity();
         let parent_window = window.window_handle();
         let external_driver_registry = self.external_driver_registry.clone();
@@ -1985,9 +1905,7 @@ impl HomePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing_connection_id.is_none()
-            && !self.ensure_master_key_ready_for_new_connection(window, cx)
-        {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
             return;
         }
 
@@ -2056,10 +1974,8 @@ impl HomePage {
         );
     }
 
-    pub(crate) fn show_ssh_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_connection_id.is_none()
-            && !self.ensure_master_key_ready_for_new_connection(window, cx)
-        {
+    pub(crate) fn show_ssh_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
             return;
         }
 
@@ -2096,10 +2012,8 @@ impl HomePage {
         );
     }
 
-    pub(crate) fn show_redis_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_connection_id.is_none()
-            && !self.ensure_master_key_ready_for_new_connection(window, cx)
-        {
+    pub(crate) fn show_redis_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
             return;
         }
 
@@ -2139,10 +2053,8 @@ impl HomePage {
         );
     }
 
-    pub(crate) fn show_mongodb_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_connection_id.is_none()
-            && !self.ensure_master_key_ready_for_new_connection(window, cx)
-        {
+    pub(crate) fn show_mongodb_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
             return;
         }
 
@@ -2176,10 +2088,8 @@ impl HomePage {
         );
     }
 
-    pub(crate) fn show_serial_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_connection_id.is_none()
-            && !self.ensure_master_key_ready_for_new_connection(window, cx)
-        {
+    pub(crate) fn show_serial_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_connection_id.is_none() && !self.is_master_key_ready_for_new_connection() {
             return;
         }
 
@@ -2433,7 +2343,7 @@ impl HomePage {
         crypto::has_master_key()
     }
 
-    pub(crate) fn ensure_master_key_ready_for_saved_connections(
+    fn ensure_master_key_ready_for_saved_connections(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2450,11 +2360,7 @@ impl HomePage {
         crypto::has_repo_password_set() && !crypto::has_master_key()
     }
 
-    pub(crate) fn show_encryption_key_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn show_encryption_key_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.master_key_dialog_open {
             return;
         }
@@ -3054,7 +2960,7 @@ impl HomePage {
         cx.notify();
     }
 
-    pub(crate) fn select_all_workspaces(&mut self, cx: &mut Context<Self>) {
+    fn select_all_workspaces(&mut self, cx: &mut Context<Self>) {
         self.filtered_workspace_ids.clear();
         for ws in &self.workspaces {
             if let Some(id) = ws.id {
@@ -3064,7 +2970,7 @@ impl HomePage {
         cx.notify();
     }
 
-    pub(crate) fn clear_workspace_filter(&mut self, cx: &mut Context<Self>) {
+    fn clear_workspace_filter(&mut self, cx: &mut Context<Self>) {
         self.filtered_workspace_ids.clear();
         cx.notify();
     }
@@ -3300,7 +3206,7 @@ impl HomePage {
         }
     }
 
-    pub(crate) fn match_connection(&self, conn: &StoredConnection, query: &str) -> bool {
+    fn match_connection(&self, conn: &StoredConnection, query: &str) -> bool {
         if query.is_empty() {
             return true;
         }
@@ -4715,6 +4621,30 @@ fn push_notification_on_active_window(message: String, cx: &mut AsyncApp) {
             });
         }
     });
+}
+
+/// 生成复制连接的唯一名称
+fn generate_duplicate_name(original_name: &str, existing_names: &HashSet<String>) -> String {
+    let base_name = t!("Home.duplicate_name", name = original_name).to_string();
+
+    if !existing_names.contains(&base_name) {
+        return base_name;
+    }
+
+    // 如果基础名称已存在，添加数字序号
+    for i in 2..100 {
+        let name = t!(
+            "Home.duplicate_name_numbered",
+            name = original_name,
+            index = i
+        )
+        .to_string();
+        if !existing_names.contains(&name) {
+            return name;
+        }
+    }
+
+    base_name
 }
 
 impl Focusable for HomePage {

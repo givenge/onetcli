@@ -11,12 +11,6 @@ pub(crate) mod connection_import_window;
 #[cfg(test)]
 mod connection_import_window_tests;
 pub(crate) mod home_connection_quick_open;
-pub(crate) mod home_content;
-pub(crate) mod home_layout;
-pub(crate) mod home_navigation;
-pub(crate) mod home_sections;
 pub(crate) mod home_strategy;
 pub(crate) mod home_tabs;
-pub(crate) mod home_toolbar;
-pub(crate) mod home_toolbar_filter;
 pub(crate) mod home_workspace_filter;

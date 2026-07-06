@@ -3,9 +3,7 @@ use gpui::{
     App, AppContext, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Styled,
     Window, actions, div,
 };
-use gpui_component::Sizable;
 use gpui_component::WindowExt;
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
 use raw_window_handle::HasWindowHandle;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -83,7 +81,7 @@ fn active_pinned_index_for_startup_default_page(startup_default_page: StartupDef
 use gpui::px;
 
 use gpui_component::dock::{ClosePanel, ToggleZoom};
-use gpui_component::{ActiveTheme, IconName, Root, Theme, ThemeMode};
+use gpui_component::{ActiveTheme, Root};
 use one_core::llm::manager::GlobalProviderState;
 use one_core::settings::{AppSettings, StartupDefaultPage};
 use one_core::split_tab_container::{SplitTabContainer, TabPaneFactory};
@@ -300,52 +298,6 @@ fn default_shortcut(macos: &'static str, other: &'static str) -> &'static str {
     }
 }
 
-fn toggle_theme_mode(cx: &mut App) {
-    let next_mode = if cx.theme().mode.is_dark() {
-        ThemeMode::Light
-    } else {
-        ThemeMode::Dark
-    };
-
-    Theme::global_mut(cx).mode = next_mode;
-    Theme::change(next_mode, None, cx);
-
-    let settings = AppSettings::global_mut(cx);
-    settings.theme_mode = next_mode.name().to_string();
-    settings.save();
-}
-
-fn theme_toggle_button(_window: &mut Window, cx: &mut App) -> impl IntoElement {
-    let is_dark = cx.theme().mode.is_dark();
-    let icon = if is_dark {
-        IconName::Sun
-    } else {
-        IconName::Moon
-    };
-    let label = if is_dark { "浅色" } else { "深色" };
-    let tooltip = if is_dark {
-        "切换到浅色模式"
-    } else {
-        "切换到深色模式"
-    };
-    let style = ButtonCustomVariant::new(cx)
-        .color(gpui::rgba(0xffffff18).into())
-        .foreground(gpui::white())
-        .border(gpui::rgba(0xffffff4d).into())
-        .hover(gpui::rgba(0xffffff26).into())
-        .active(gpui::rgba(0xffffff33).into());
-
-    Button::new("titlebar-theme-toggle")
-        .icon(icon)
-        .label(label)
-        .custom(style)
-        .small()
-        .tooltip(tooltip)
-        .on_click(move |_, _, cx| {
-            toggle_theme_mode(cx);
-        })
-}
-
 pub(crate) fn configured_log_file_path(value: &str) -> anyhow::Result<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -377,21 +329,6 @@ pub(crate) fn log_file_appender(path: &Path) -> std::io::Result<std::fs::File> {
 pub fn init(cx: &mut App) {
     gpui_component::init(cx);
     setting_tab::init_settings(cx);
-    if let Ok(config_dir) = get_config_dir() {
-        match crate::webdav_backup::apply_pending_restore(&config_dir) {
-            Ok(Some(result)) => {
-                tracing::info!(
-                    "已应用待恢复备份：{}，恢复文件 {} 个",
-                    result.file_name,
-                    result.restored_files
-                );
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::error!("应用待恢复 WebDAV 备份失败: {}", err);
-            }
-        }
-    }
     one_core::init(cx);
     ai_chat_view::init(cx);
     crate::public_mcp_approval::init(cx);

@@ -1,4 +1,3 @@
-use llm_connector::types::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,9 +116,6 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     pub max_tokens: Option<i32>,
     pub temperature: Option<f32>,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub history_count: Option<i32>,
-    pub context_window_size: Option<i32>,
     pub enabled: bool,
     pub is_default: bool,
     pub created_at: i64,
@@ -139,9 +135,6 @@ impl Default for ProviderConfig {
             models: Vec::new(),
             max_tokens: None,
             temperature: None,
-            reasoning_effort: None,
-            history_count: None,
-            context_window_size: None,
             enabled: true,
             is_default: false,
             created_at: 0,

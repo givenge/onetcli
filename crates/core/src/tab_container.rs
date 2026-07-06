@@ -16,7 +16,7 @@ use gpui::{
     Subscription, Task, Window, WindowControlArea, div, px, relative,
 };
 use gpui::{ScrollHandle, StatefulInteractiveElement as _};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::list::{List, ListDelegate, ListState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -3103,7 +3103,6 @@ impl TabContainer {
         let enable_titlebar_interactions = show_window_controls || is_macos;
         let allow_tab_drag = !is_macos;
         let trailing_controls = self.trailing_controls.clone();
-        let show_tab_dropdown = false;
 
         // 使用状态管理窗口拖动
         let drag_state = window.use_state(cx, |_, _| TabBarDragState { should_move: false });
@@ -3648,7 +3647,6 @@ impl TabContainer {
                                     ButtonCustomVariant::new(cx)
                                         .color(gpui::rgba(0xffffff18).into())
                                         .foreground(gpui::white())
-                                        .border(gpui::rgba(0xffffff4d).into())
                                         .hover(gpui::rgba(0xffffff2a).into())
                                         .active(gpui::rgba(0xffffff36).into()),
                                 ),
@@ -3664,7 +3662,6 @@ impl TabContainer {
                             )
                         }),
                 )
-            })
             .when_some(trailing_controls, |el, render_controls| {
                 el.child(
                     div()

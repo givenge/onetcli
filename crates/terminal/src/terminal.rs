@@ -89,8 +89,6 @@ pub enum TerminalModelEvent {
     ClipboardStore(String),
     /// 远程工作目录变更（OSC 7）
     WorkingDirChanged(String),
-    /// shell 命令执行完成（OSC 133;D）
-    CommandFinished(i32),
 }
 
 /// 终端连接状态
@@ -1780,25 +1778,6 @@ impl Terminal {
     /// 获取当前工作目录（由 OSC 7 更新，仅 SSH 终端）
     pub fn current_working_dir(&self) -> Option<&str> {
         self.current_working_dir.as_deref()
-    }
-
-    pub fn recent_output(&self, max_lines: usize) -> String {
-        let max_lines = max_lines.max(1);
-        let term = self.term.lock();
-        let history_size = term.history_size() as i32;
-        let screen_lines = term.screen_lines() as i32;
-        let start_line = (-history_size).max(screen_lines - max_lines as i32);
-        let grid = term.grid();
-
-        (start_line..screen_lines)
-            .map(|line_index| {
-                let line = &grid[Line(line_index)];
-                let text: String = line[..].iter().map(|cell| cell.c).collect();
-                text.trim_end_matches(|c: char| c == ' ' || c == '\0')
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     pub fn rows(&self) -> usize {

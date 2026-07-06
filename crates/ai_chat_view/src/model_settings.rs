@@ -3,10 +3,7 @@ use gpui::{
     ParentElement, Render, Styled, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size,
-    button::Button,
-    button::ButtonVariants,
-    h_flex,
+    ActiveTheme, Icon, IconName, Sizable, Size, h_flex,
     input::{Input, InputEvent, InputState},
     slider::{Slider, SliderEvent, SliderState},
     v_flex,
@@ -17,10 +14,6 @@ pub struct ModelSettings {
     pub temperature: f32,
     pub history_count: usize,
     pub max_tokens: usize,
-    /// 上下文窗口大小（近似 token）
-    pub context_window_size: usize,
-    /// 推理强度
-    pub reasoning_effort: ReasoningEffort,
 }
 
 impl Default for ModelSettings {
@@ -29,8 +22,6 @@ impl Default for ModelSettings {
             temperature: 0.7,
             history_count: 10,
             max_tokens: 2000,
-            context_window_size: 32000,
-            reasoning_effort: ReasoningEffort::Medium,
         }
     }
 }
@@ -51,36 +42,8 @@ impl ModelSettings {
     }
 
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
-        self.max_tokens = max_tokens.max(100);
+        self.max_tokens = max_tokens.clamp(100, 8000);
         self
-    }
-
-    pub fn with_context_window_size(mut self, context_window_size: usize) -> Self {
-        self.context_window_size = context_window_size.max(1024);
-        self
-    }
-
-    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
-        self.reasoning_effort = reasoning_effort;
-        self
-    }
-
-    pub fn from_provider_config(config: &ProviderConfig) -> Self {
-        Self {
-            temperature: config.temperature.unwrap_or(0.7),
-            history_count: config.history_count.unwrap_or(10).clamp(0, 50) as usize,
-            max_tokens: config.max_tokens.unwrap_or(2000).max(100) as usize,
-            context_window_size: config.context_window_size.unwrap_or(32_000).max(1024) as usize,
-            reasoning_effort: config.reasoning_effort.unwrap_or(ReasoningEffort::Medium),
-        }
-    }
-
-    pub fn apply_to_provider_config(&self, config: &mut ProviderConfig) {
-        config.temperature = Some(self.temperature);
-        config.max_tokens = Some(self.max_tokens as i32);
-        config.reasoning_effort = Some(self.reasoning_effort);
-        config.history_count = Some(self.history_count as i32);
-        config.context_window_size = Some(self.context_window_size as i32);
     }
 }
 
@@ -107,10 +70,6 @@ pub struct ModelSettingsLabels {
     pub history_desc: String,
     pub max_tokens_label: String,
     pub max_tokens_desc: String,
-    pub context_window_label: String,
-    pub context_window_desc: String,
-    pub reasoning_effort_label: String,
-    pub reasoning_effort_desc: String,
     pub footer_notice: String,
 }
 
@@ -183,22 +142,7 @@ impl ModelSettingsPanel {
                 if let InputEvent::Change = event {
                     let text = input.read(cx).text().to_string();
                     if let Ok(tokens) = text.parse::<usize>() {
-                        this.settings.max_tokens = tokens.max(100);
-                        this.emit_change(cx);
-                    }
-                }
-            },
-        )
-        .detach();
-
-        cx.subscribe_in(
-            &context_window_input,
-            window,
-            |this, input, event, _window, cx| {
-                if let InputEvent::Change = event {
-                    let text = input.read(cx).text().to_string();
-                    if let Ok(tokens) = text.parse::<usize>() {
-                        this.settings.context_window_size = tokens.max(1024);
+                        this.settings.max_tokens = tokens.clamp(100, 8000);
                         this.emit_change(cx);
                     }
                 }
@@ -212,7 +156,6 @@ impl ModelSettingsPanel {
             temperature_slider,
             history_input,
             max_tokens_input,
-            context_window_input,
             labels,
         }
     }
@@ -242,15 +185,6 @@ impl ModelSettingsPanel {
 
     fn emit_change(&self, cx: &mut Context<Self>) {
         cx.emit(ModelSettingsEvent::Changed(self.settings.clone()));
-    }
-
-    fn set_reasoning_effort(&mut self, effort: ReasoningEffort, cx: &mut Context<Self>) {
-        if self.settings.reasoning_effort == effort {
-            return;
-        }
-        self.settings.reasoning_effort = effort;
-        self.emit_change(cx);
-        cx.notify();
     }
 
     fn render_setting_row(

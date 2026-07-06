@@ -5,8 +5,8 @@ use ai_chat_view::{
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex, v_flex};
 use one_core::layout::TOOLBAR_WIDTH;
@@ -140,26 +140,49 @@ impl MongoSidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active = self.active_panel == Some(panel);
+        let accent_color = cx.theme().accent;
         let accent_fg = cx.theme().accent_foreground;
         let muted_fg = cx.theme().muted_foreground;
+        let muted_bg = cx.theme().muted;
 
-        workbench::side_toolbar_button(
-            SharedString::from(format!("mongodb-sidebar-btn-{:?}", panel)),
-            is_active,
-            cx,
-        )
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            this.toggle_panel(panel, cx);
-        }))
-        .child(
-            Icon::new(panel.icon())
-                .with_size(Size::Medium)
-                .text_color(if is_active { accent_fg } else { muted_fg }),
-        )
+        div()
+            .id(SharedString::from(format!(
+                "mongodb-sidebar-btn-{:?}",
+                panel
+            )))
+            .w(px(36.0))
+            .h(px(36.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_active, |this| this.bg(accent_color))
+            .when(!is_active, |this| this.hover(|s| s.bg(muted_bg)))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.toggle_panel(panel, cx);
+            }))
+            .child(
+                Icon::new(panel.icon())
+                    .with_size(Size::Medium)
+                    .text_color(if is_active { accent_fg } else { muted_fg }),
+            )
     }
 
     pub fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        workbench::side_toolbar(cx)
+        let border_color = cx.theme().border;
+        let muted_bg = cx.theme().muted;
+
+        v_flex()
+            .flex_shrink_0()
+            .w(TOOLBAR_WIDTH)
+            .h_full()
+            .bg(muted_bg)
+            .border_l_1()
+            .border_color(border_color)
+            .items_center()
+            .py_2()
+            .gap_1()
             .child(self.render_toolbar_button(SidebarPanel::AiChat, window, cx))
             .into_any_element()
     }

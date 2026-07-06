@@ -1,8 +1,9 @@
 use db::ipc::IpcDriverRegistry;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyView, AnyWindowHandle, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    ScrollHandle, Window, actions,
+    AnyView, AnyWindowHandle, App, Context, Entity, FocusHandle, Focusable, FontWeight,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, actions, div, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, InteractiveElementExt, Sizable, Size,
@@ -17,7 +18,7 @@ use crate::home_tab::HomePage;
 use crate::new_connection::connection_kind::{NewConnectionCategory, NewConnectionKind};
 use crate::new_connection::form_page::{NewConnectionFormPage, NewConnectionFormResult};
 
-pub(super) const KEY_CONTEXT: &str = "NewConnectionWindow";
+const KEY_CONTEXT: &str = "NewConnectionWindow";
 
 actions!(
     new_connection_window,
@@ -70,7 +71,6 @@ impl NewConnectionWindow {
             connection_kinds,
             external_driver_registry,
             form: None,
-            card_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -119,7 +119,7 @@ impl NewConnectionWindow {
         cx.notify();
     }
 
-    pub(super) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(kind) = self.selected_kind.clone() else {
             return;
         };
@@ -144,12 +144,12 @@ impl NewConnectionWindow {
         }
     }
 
-    pub(super) fn go_back_to_selection(&mut self, cx: &mut Context<Self>) {
+    fn go_back_to_selection(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         cx.notify();
     }
 
-    pub(super) fn on_action_select_previous(
+    fn on_action_select_previous(
         &mut self,
         _: &SelectPreviousConnectionKind,
         _: &mut Window,
@@ -158,7 +158,7 @@ impl NewConnectionWindow {
         self.select_visible_item(-1, cx);
     }
 
-    pub(super) fn on_action_select_next(
+    fn on_action_select_next(
         &mut self,
         _: &SelectNextConnectionKind,
         _: &mut Window,
@@ -167,7 +167,7 @@ impl NewConnectionWindow {
         self.select_visible_item(1, cx);
     }
 
-    pub(super) fn on_action_open_selected(
+    fn on_action_open_selected(
         &mut self,
         _: &OpenConnectionKind,
         window: &mut Window,

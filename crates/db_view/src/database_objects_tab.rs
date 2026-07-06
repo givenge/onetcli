@@ -17,17 +17,15 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
-use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     ActiveTheme, Icon, IconName, Sizable, Size, h_flex, table::Column, tooltip::Tooltip, v_flex,
 };
 use gpui_component::{InteractiveElementExt, WindowExt};
 use one_core::storage::manager::get_queries_dir;
 use one_core::storage::{
-    ActiveConnections, ConnectionRepository, DatabaseType, DbConnectionConfig, GlobalStorageState,
-    StorageManager, Workspace,
+    ConnectionRepository, DatabaseType, DbConnectionConfig, GlobalStorageState, StorageManager,
+    Workspace,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::debouncer::Debouncer;
@@ -59,14 +57,8 @@ pub enum DatabaseObjectsEvent {
     /// 新建数据库
     CreateDatabase { node: DbNode },
 
-    /// 打开数据库或 Schema 的 ER 图
-    OpenErDiagram { node: DbNode },
-
     /// 编辑数据库
     EditDatabase { node: DbNode },
-
-    /// 关闭数据库
-    CloseDatabase { node: DbNode },
 
     /// 删除数据库
     DeleteDatabase { node: DbNode },
@@ -83,26 +75,8 @@ pub enum DatabaseObjectsEvent {
     /// 设计表（新建或编辑）
     DesignTable { node: DbNode },
 
-    /// 重命名表
-    RenameTable { node: DbNode },
-
-    /// 创建备份表
-    CopyTable { node: DbNode },
-
-    /// 清空表
-    TruncateTable { node: DbNode },
-
     /// 删除表
     DeleteTable { node: DbNode },
-
-    /// 导入数据
-    ImportData { node: DbNode },
-
-    /// 导出表
-    ExportData { node: DbNode },
-
-    /// 转储 SQL 文件
-    DumpSqlFile { node: DbNode, mode: SqlDumpMode },
 
     /// 打开视图数据
     OpenViewData { node: DbNode },
@@ -121,9 +95,6 @@ pub enum DatabaseObjectsEvent {
 
     /// 删除查询
     DeleteQuery { node: DbNode },
-
-    /// 运行 SQL 文件
-    RunSqlFile { node: DbNode },
 
     /// 删除模式/Schema
     DeleteSchema { node: DbNode },
@@ -163,11 +134,6 @@ pub struct DatabaseObjects {
     search_debouncer: Arc<Debouncer>,
     current_node: Option<DbNode>,
     selected_indices: HashSet<usize>,
-    ddl_preview_content: SharedString,
-    ddl_preview_loading: bool,
-    ddl_preview_table_name: Option<String>,
-    ddl_preview_request_seq: u64,
-    resizing_column: Option<ColumnResizeState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -196,18 +162,6 @@ impl DatabaseObjects {
         let node = nodes[0].clone();
         if matches!(node.node_type, DbNodeType::Table | DbNodeType::View) {
             cx.emit(DatabaseObjectsEvent::CreateNewQuery { node });
-        }
-    }
-
-    fn stop_vertical_scroll_bubble(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let delta = event.delta.pixel_delta(window.line_height());
-        if delta.y != Pixels::ZERO && delta.y.abs() >= delta.x.abs() {
-            cx.stop_propagation();
         }
     }
 
@@ -293,11 +247,6 @@ impl DatabaseObjects {
             search_debouncer,
             current_node: None,
             selected_indices: HashSet::new(),
-            ddl_preview_content: SharedString::new_static(""),
-            ddl_preview_loading: false,
-            ddl_preview_table_name: None,
-            ddl_preview_request_seq: 0,
-            resizing_column: None,
             _subscriptions: vec![search_sub],
         }
     }
@@ -351,7 +300,6 @@ impl DatabaseObjects {
 
         self.current_node = Some(node.clone());
         self.selected_indices.clear();
-        self.clear_ddl_preview(cx);
         let node_clone = node.clone();
         let storage_manager = cx.global::<GlobalStorageState>().storage.clone();
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -411,107 +359,6 @@ impl DatabaseObjects {
             self.selected_indices.clear();
             self.selected_indices.insert(row_ix);
         }
-    }
-
-    fn select_context_row(&mut self, row_ix: usize) {
-        let is_single_selected =
-            self.selected_indices.len() == 1 && self.selected_indices.contains(&row_ix);
-        if !is_single_selected {
-            self.selected_indices.clear();
-            self.selected_indices.insert(row_ix);
-        }
-    }
-
-    fn clear_ddl_preview(&mut self, cx: &mut Context<Self>) {
-        self.ddl_preview_loading = false;
-        self.ddl_preview_table_name = None;
-        self.ddl_preview_request_seq = self.ddl_preview_request_seq.saturating_add(1);
-        self.ddl_preview_content = SharedString::new_static("");
-        cx.notify();
-    }
-
-    fn set_ddl_preview_content(
-        &mut self,
-        table_name: Option<String>,
-        content: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.ddl_preview_table_name = table_name;
-        self.ddl_preview_content = content.into().into();
-        cx.notify();
-    }
-
-    fn refresh_ddl_preview_for_selection(&mut self, cx: &mut Context<Self>) {
-        if self.selected_indices.len() != 1 {
-            self.clear_ddl_preview(cx);
-            return;
-        }
-
-        let Some(row_ix) = self.selected_indices.iter().next().copied() else {
-            self.clear_ddl_preview(cx);
-            return;
-        };
-        let Some(node) = self.build_node_for_row(row_ix) else {
-            self.clear_ddl_preview(cx);
-            return;
-        };
-        if node.node_type != DbNodeType::Table {
-            self.clear_ddl_preview(cx);
-            return;
-        }
-
-        let Some(database) = node.get_database_name() else {
-            self.clear_ddl_preview(cx);
-            return;
-        };
-        let Some(table) = node.get_table_name() else {
-            self.clear_ddl_preview(cx);
-            return;
-        };
-
-        self.ddl_preview_request_seq = self.ddl_preview_request_seq.saturating_add(1);
-        let request_seq = self.ddl_preview_request_seq;
-        let schema = node.get_schema_name();
-        let connection_id = node.connection_id.clone();
-        let table_name = table.clone();
-        let global_state = cx.global::<GlobalDbState>().clone();
-        self.ddl_preview_loading = true;
-        self.ddl_preview_table_name = Some(table_name.clone());
-        self.ddl_preview_content = "Loading DDL...".into();
-
-        cx.spawn(async move |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = global_state
-                .export_table_create_sql(cx, connection_id, database, schema, table)
-                .await;
-
-            let _ = entity.update(cx, |this, cx| {
-                if this.ddl_preview_request_seq != request_seq {
-                    return;
-                }
-                this.ddl_preview_loading = false;
-                match result {
-                    Ok(ddl) if !ddl.trim().is_empty() => {
-                        this.set_ddl_preview_content(Some(table_name), ddl, cx);
-                    }
-                    Ok(_) => {
-                        this.set_ddl_preview_content(
-                            Some(table_name),
-                            "DDL preview is not available for this table.",
-                            cx,
-                        );
-                    }
-                    Err(err) => {
-                        this.set_ddl_preview_content(
-                            Some(table_name),
-                            format!("Failed to load DDL:\n{err}"),
-                            cx,
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn apply_filter(&mut self) {
@@ -822,246 +669,6 @@ impl DatabaseObjects {
             .collect()
     }
 
-    fn event_for_tree_event(event: &DbTreeViewEvent, node: DbNode) -> Option<DatabaseObjectsEvent> {
-        match event {
-            DbTreeViewEvent::OpenTableData { .. } => {
-                Some(DatabaseObjectsEvent::OpenTableData { node })
-            }
-            DbTreeViewEvent::DesignTable { .. } => Some(DatabaseObjectsEvent::DesignTable { node }),
-            DbTreeViewEvent::RenameTable { .. } => Some(DatabaseObjectsEvent::RenameTable { node }),
-            DbTreeViewEvent::CopyTable { .. } => Some(DatabaseObjectsEvent::CopyTable { node }),
-            DbTreeViewEvent::TruncateTable { .. } => {
-                Some(DatabaseObjectsEvent::TruncateTable { node })
-            }
-            DbTreeViewEvent::DeleteTable { .. } => Some(DatabaseObjectsEvent::DeleteTable { node }),
-            DbTreeViewEvent::ImportData { .. } => Some(DatabaseObjectsEvent::ImportData { node }),
-            DbTreeViewEvent::ExportData { .. } => Some(DatabaseObjectsEvent::ExportData { node }),
-            DbTreeViewEvent::DumpSqlFile { mode, .. } => {
-                Some(DatabaseObjectsEvent::DumpSqlFile { node, mode: *mode })
-            }
-            DbTreeViewEvent::OpenViewData { .. } => {
-                Some(DatabaseObjectsEvent::OpenViewData { node })
-            }
-            DbTreeViewEvent::DeleteView { .. } => Some(DatabaseObjectsEvent::DeleteView { node }),
-            DbTreeViewEvent::CreateNewQuery { .. } => {
-                Some(DatabaseObjectsEvent::CreateNewQuery { node })
-            }
-            DbTreeViewEvent::OpenNamedQuery { .. } => {
-                Some(DatabaseObjectsEvent::OpenNamedQuery { node })
-            }
-            DbTreeViewEvent::RenameQuery { .. } => Some(DatabaseObjectsEvent::RenameQuery { node }),
-            DbTreeViewEvent::DeleteQuery { .. } => Some(DatabaseObjectsEvent::DeleteQuery { node }),
-            DbTreeViewEvent::CloseConnection { .. } => {
-                Some(DatabaseObjectsEvent::CloseConnection { node })
-            }
-            DbTreeViewEvent::DeleteConnection { .. } => {
-                Some(DatabaseObjectsEvent::DeleteConnection { node })
-            }
-            DbTreeViewEvent::CreateDatabase { .. } => {
-                Some(DatabaseObjectsEvent::CreateDatabase { node })
-            }
-            DbTreeViewEvent::OpenErDiagram { .. } => {
-                Some(DatabaseObjectsEvent::OpenErDiagram { node })
-            }
-            DbTreeViewEvent::EditDatabase { .. } => {
-                Some(DatabaseObjectsEvent::EditDatabase { node })
-            }
-            DbTreeViewEvent::CloseDatabase { .. } => {
-                Some(DatabaseObjectsEvent::CloseDatabase { node })
-            }
-            DbTreeViewEvent::DeleteDatabase { .. } => {
-                Some(DatabaseObjectsEvent::DeleteDatabase { node })
-            }
-            DbTreeViewEvent::CreateSchema { .. } => {
-                Some(DatabaseObjectsEvent::CreateSchema { node })
-            }
-            DbTreeViewEvent::DeleteSchema { .. } => {
-                Some(DatabaseObjectsEvent::DeleteSchema { node })
-            }
-            DbTreeViewEvent::RunSqlFile { .. } => Some(DatabaseObjectsEvent::RunSqlFile { node }),
-            _ => None,
-        }
-    }
-
-    fn context_menu_has_action(items: &[ContextMenuItem], node: &DbNode) -> bool {
-        items.iter().any(|item| match item {
-            ContextMenuItem::Item { event, .. } => match event {
-                ContextMenuEvent::TreeEvent(tree_event) => {
-                    Self::event_for_tree_event(tree_event, node.clone()).is_some()
-                }
-                ContextMenuEvent::Custom(_) => false,
-            },
-            ContextMenuItem::Submenu { items, .. } => Self::context_menu_has_action(items, node),
-            ContextMenuItem::Separator => false,
-        })
-    }
-
-    fn push_context_menu_item(
-        menu: PopupMenu,
-        item: PopupMenuItem,
-        pending_separator: &mut bool,
-    ) -> PopupMenu {
-        let menu = if *pending_separator {
-            *pending_separator = false;
-            menu.separator()
-        } else {
-            menu
-        };
-        menu.item(item)
-    }
-
-    fn context_menu_action_item(
-        label: String,
-        tree_event: DbTreeViewEvent,
-        requires_active: bool,
-        is_active: bool,
-        node: &DbNode,
-        view: &Entity<Self>,
-        window: &mut Window,
-    ) -> Option<PopupMenuItem> {
-        let objects_event = Self::event_for_tree_event(&tree_event, node.clone())?;
-        let view_ref = view.clone();
-        Some(
-            PopupMenuItem::new(label)
-                .disabled(requires_active && !is_active)
-                .on_click(window.listener_for(&view_ref, move |_this, _, _, cx| {
-                    cx.emit(objects_event.clone());
-                })),
-        )
-    }
-
-    fn context_menu_submenu_item(
-        label: String,
-        items: Vec<ContextMenuItem>,
-        is_active: bool,
-        node: DbNode,
-        view: &Entity<Self>,
-        window: &mut Window,
-        cx: &mut Context<PopupMenu>,
-        requires_active: bool,
-    ) -> Option<PopupMenuItem> {
-        if !Self::context_menu_has_action(&items, &node) {
-            return None;
-        }
-        let view_submenu = view.clone();
-        let submenu_node = node.clone();
-        let submenu_entity = PopupMenu::build(window, cx, move |submenu, window, cx| {
-            Self::render_context_menu_items(
-                submenu,
-                items.clone(),
-                is_active,
-                submenu_node.clone(),
-                &view_submenu,
-                window,
-                cx,
-            )
-        });
-        Some(PopupMenuItem::submenu(label, submenu_entity).disabled(requires_active && !is_active))
-    }
-
-    fn render_context_menu_items(
-        mut menu: PopupMenu,
-        items: Vec<ContextMenuItem>,
-        is_active: bool,
-        node: DbNode,
-        view: &Entity<Self>,
-        window: &mut Window,
-        cx: &mut Context<PopupMenu>,
-    ) -> PopupMenu {
-        let mut has_item = false;
-        let mut pending_separator = false;
-
-        for item in items {
-            let menu_item = match item {
-                ContextMenuItem::Item {
-                    label,
-                    event: ContextMenuEvent::TreeEvent(tree_event),
-                    requires_active,
-                } => Self::context_menu_action_item(
-                    label,
-                    tree_event,
-                    requires_active,
-                    is_active,
-                    &node,
-                    view,
-                    window,
-                ),
-                ContextMenuItem::Item { .. } => None,
-                ContextMenuItem::Separator => {
-                    if has_item {
-                        pending_separator = true;
-                    }
-                    continue;
-                }
-                ContextMenuItem::Submenu {
-                    label,
-                    items: sub_items,
-                    requires_active,
-                } => Self::context_menu_submenu_item(
-                    label,
-                    sub_items,
-                    is_active,
-                    node.clone(),
-                    view,
-                    window,
-                    cx,
-                    requires_active,
-                ),
-            };
-
-            let Some(menu_item) = menu_item else { continue };
-            menu = Self::push_context_menu_item(menu, menu_item, &mut pending_separator);
-            has_item = true;
-        }
-
-        menu
-    }
-
-    fn build_context_menu_for_row(
-        mut menu: PopupMenu,
-        row_ix: usize,
-        view: &Entity<Self>,
-        window: &mut Window,
-        cx: &mut Context<PopupMenu>,
-    ) -> PopupMenu {
-        let Some(node) = view.read(cx).build_node_for_row(row_ix) else {
-            return menu;
-        };
-        let refresh_node = view
-            .read(cx)
-            .current_node
-            .clone()
-            .unwrap_or_else(|| node.clone());
-        let is_active = node
-            .connection_id
-            .parse::<i64>()
-            .ok()
-            .map(|conn_id| cx.global::<ActiveConnections>().is_active(conn_id))
-            .unwrap_or(false);
-
-        let _ = view.update(cx, |this, cx| {
-            this.select_context_row(row_ix);
-            this.refresh_ddl_preview_for_selection(cx);
-            cx.notify();
-        });
-
-        let menu_items =
-            build_context_menu_for(node.database_type.clone(), &node.id, node.node_type, cx);
-        menu = Self::render_context_menu_items(menu, menu_items, is_active, node, view, window, cx);
-
-        let view_ref = view.clone();
-        menu.item(
-            PopupMenuItem::new(t!("Common.refresh")).on_click(window.listener_for(
-                &view_ref,
-                move |_this, _, _, cx| {
-                    cx.emit(DatabaseObjectsEvent::Refresh {
-                        node: refresh_node.clone(),
-                    });
-                },
-            )),
-        )
-    }
-
     fn batch_action_for_event(event: &DatabaseObjectsEvent) -> Option<DatabaseObjectsBatchAction> {
         match event {
             DatabaseObjectsEvent::DeleteConnection { .. } => {
@@ -1095,141 +702,6 @@ impl DatabaseObjects {
         )
     }
 
-    fn begin_column_resize(&mut self, col_ix: usize, start_x: Pixels) {
-        let Some(column) = self.columns.get(col_ix) else {
-            return;
-        };
-        if !column.resizable {
-            return;
-        }
-
-        self.resizing_column = Some(ColumnResizeState {
-            col_ix,
-            start_x,
-            start_width: column.width,
-        });
-    }
-
-    fn resize_active_column(&mut self, col_ix: usize, pointer_x: Pixels, cx: &mut Context<Self>) {
-        let Some(resizing) = self.resizing_column else {
-            return;
-        };
-        if resizing.col_ix != col_ix {
-            return;
-        }
-
-        let Some(column) = self.columns.get_mut(col_ix) else {
-            return;
-        };
-
-        let min_width = column.min_width.max(DB_OBJECTS_MIN_COLUMN_WIDTH);
-        let mut next_width = resizing.start_width + pointer_x - resizing.start_x;
-        if next_width < min_width {
-            next_width = min_width;
-        }
-        if next_width > column.max_width {
-            next_width = column.max_width;
-        }
-
-        if column.width != next_width {
-            column.width = next_width;
-            cx.notify();
-        }
-    }
-
-    fn finish_column_resize(&mut self, cx: &mut Context<Self>) {
-        if self.resizing_column.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    fn drag_resize_column(
-        &mut self,
-        col_ix: usize,
-        event: &DragMoveEvent<ResizeObjectColumn>,
-        cx: &mut Context<Self>,
-    ) {
-        let drag = event.drag(cx);
-        if drag.entity_id != cx.entity_id() || drag.col_ix != col_ix {
-            return;
-        }
-        self.resize_active_column(col_ix, event.event.position.x, cx);
-    }
-
-    fn render_column_resize_indicator(
-        &self,
-        group_id: &SharedString,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .w(px(1.0))
-            .h_full()
-            .bg(cx.theme().table_row_border)
-            .group_hover(group_id, |this| this.bg(cx.theme().border))
-            .into_any_element()
-    }
-
-    fn render_column_resize_handle(
-        &self,
-        col_ix: usize,
-        column: &Column,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if !column.resizable {
-            return div().into_any_element();
-        }
-
-        let group_id = SharedString::from(format!("database-object-column-resize-{col_ix}"));
-
-        h_flex()
-            .id(("database-object-column-resize", col_ix))
-            .group(group_id.clone())
-            .occlude()
-            .cursor_col_resize()
-            .h_full()
-            .w(DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH)
-            .ml(-(DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH))
-            .items_center()
-            .justify_center()
-            .child(self.render_column_resize_indicator(&group_id, cx))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    this.begin_column_resize(col_ix, event.position.x);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<ResizeObjectColumn>, _window, cx| {
-                    this.drag_resize_column(col_ix, event, cx);
-                },
-            ))
-            .on_drag(
-                ResizeObjectColumn {
-                    entity_id: cx.entity_id(),
-                    col_ix,
-                },
-                |drag, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| drag.clone())
-                },
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    this.finish_column_resize(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    this.finish_column_resize(cx);
-                }),
-            )
-            .into_any_element()
-    }
-
     fn render_header(
         &self,
         columns: &[Column],
@@ -1249,7 +721,7 @@ impl DatabaseObjects {
         if show_row_number {
             header = header.child(
                 div()
-                    .w(DB_OBJECTS_ROW_NUMBER_WIDTH)
+                    .w(px(48.))
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().table_head_foreground)
@@ -1270,21 +742,14 @@ impl DatabaseObjects {
                     .relative()
                     .w(column.width)
                     .h_full()
-                    .flex()
-                    .items_center()
+                    .px_2()
                     .text_sm()
                     .text_color(cx.theme().table_head_foreground)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .px_2()
+                            .size_full()
                             .flex()
                             .items_center()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
                             .child(column.name.clone()),
                     )
                     .child(self.render_column_resize_handle(col_ix, column, cx)),
@@ -1324,7 +789,7 @@ impl DatabaseObjects {
         if args.show_row_number {
             row = row.child(
                 div()
-                    .w(DB_OBJECTS_ROW_NUMBER_WIDTH)
+                    .w(px(48.))
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
@@ -1476,18 +941,6 @@ impl DatabaseObjects {
 
         buttons
     }
-
-    fn table_content_width(&self, columns: &[Column], show_row_number: bool) -> Pixels {
-        let row_number_width = if show_row_number {
-            DB_OBJECTS_ROW_NUMBER_WIDTH
-        } else {
-            px(0.0)
-        };
-        let columns_width = columns
-            .iter()
-            .fold(px(0.0), |acc, column| acc + column.width);
-        row_number_width + columns_width + px(16.0)
-    }
 }
 
 struct ObjectRowRenderArgs<'a> {
@@ -1512,8 +965,6 @@ impl Render for DatabaseObjects {
         let header = self.render_header(&columns, show_row_number, cx);
         let list_columns = columns.clone();
         let list_search_query = search_query.clone();
-        let table_width = self.table_content_width(&columns, show_row_number);
-        let view = cx.entity();
 
         v_flex()
             .size_full()
@@ -1531,8 +982,9 @@ impl Render for DatabaseObjects {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .children(toolbar_buttons)
+                    .child(div().flex_1())
                     .child({
-                        div().flex_1().min_w(px(220.0)).child(
+                        div().flex_1().child(
                             Input::new(&self.search_input)
                                 .prefix(
                                     Icon::new(IconName::Search)
@@ -1546,29 +998,14 @@ impl Render for DatabaseObjects {
                     .into_any_element(),
             )
             .child(
-                div()
-                    .size_full()
-                    .overflow_x_scrollbar_masked()
-                    .child(
-                        v_flex()
-                            .w(table_width)
-                            .min_w(table_width)
-                            .h_full()
-                            .flex_shrink_0()
-                            .gap_2()
-                            .child(header)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_y_scrollbar()
-                                    .on_scroll_wheel(cx.listener(Self::stop_vertical_scroll_bubble))
-                                    .child(
-                                        uniform_list("database-objects-list", row_count, {
-                                            cx.processor(
-                                                move |state: &mut Self, range: Range<usize>, _window, cx| {
-                                                    let db_node_type = state.db_node_type;
-                                                    let show_row_number = true;
-                                                    range
+                v_flex().size_full().gap_2().child(header).child(
+                    div().flex_1().overflow_hidden().child(
+                        uniform_list("database-objects-list", row_count, {
+                            cx.processor(
+                                move |state: &mut Self, range: Range<usize>, _window, cx| {
+                                    let db_node_type = state.db_node_type;
+                                    let show_row_number = true;
+                                    range
                                         .map(|list_ix| {
                                             let Some(original_row) =
                                                 state.filtered_rows.get(list_ix).copied()
@@ -1580,72 +1017,59 @@ impl Render for DatabaseObjects {
                                                 return div().id(list_ix).into_any_element();
                                             };
 
-                                                            let is_selected = state
-                                                                .selected_indices
-                                                                .contains(&list_ix);
-                                                            let row_ix = list_ix;
-                                                            let row_view = view.clone();
-                                                            div()
-                                                                .id(list_ix)
-                                                                .cursor_pointer()
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    cx.listener(
-                                                                        move |this,
-                                                                              event: &MouseDownEvent,
-                                                                              _window,
-                                                                              cx| {
-                                                                            let multi_select =
-                                                                                event.modifiers.secondary();
-                                                                            this.toggle_selection(
-                                                                                row_ix,
-                                                                                multi_select,
-                                                                            );
-                                                                            this.refresh_ddl_preview_for_selection(cx);
-                                                                            cx.notify();
-                                                                        },
-                                                                    ),
-                                                                )
-                                                                .on_double_click(cx.listener(
-                                                                    move |this, _, _window, cx| {
-                                                                        this.handle_row_double_click(row_ix, cx);
-                                                                    },
-                                                                ))
-                                                                .context_menu(
-                                                                    move |menu, window, cx| {
-                                                                        Self::build_context_menu_for_row(
-                                                                            menu,
-                                                                            row_ix,
-                                                                            &row_view,
-                                                                            window,
-                                                                            cx,
-                                                                        )
-                                                                    },
-                                                                )
-                                                                .child(state.render_row(
-                                                                    ObjectRowRenderArgs {
-                                                                        row_ix,
-                                                                        row_values,
-                                                                        columns: &list_columns,
-                                                                        show_row_number,
-                                                                        is_selected,
-                                                                        search_query: &list_search_query,
-                                                                        db_node_type,
-                                                                    },
-                                                                    cx,
-                                                                ))
-                                                                .into_any_element()
-                                                        })
-                                                        .collect()
-                                                },
-                                            )
+                                            let is_selected =
+                                                state.selected_indices.contains(&list_ix);
+                                            let row_ix = list_ix;
+                                            div()
+                                                    .id(list_ix)
+                                                    .cursor_pointer()
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  event: &MouseDownEvent,
+                                                                  _window,
+                                                                  cx| {
+                                                                let multi_select =
+                                                                    event.modifiers.secondary();
+                                                                this.toggle_selection(
+                                                                    row_ix,
+                                                                    multi_select,
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        ),
+                                                    )
+                                                    .on_double_click(cx.listener(
+                                                        move |this, _, _window, cx| {
+                                                            this.handle_row_double_click(
+                                                                row_ix, cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                    .child(state.render_row(
+                                                        ObjectRowRenderArgs {
+                                                            row_ix,
+                                                            row_values,
+                                                            columns: &list_columns,
+                                                            show_row_number,
+                                                            is_selected,
+                                                            search_query: &list_search_query,
+                                                            db_node_type,
+                                                        },
+                                                        cx,
+                                                    ))
+                                                    .into_any_element()
                                         })
-                                        .flex_grow()
-                                        .size_full()
-                                        .with_sizing_behavior(ListSizingBehavior::Auto),
-                                    ),
-                            ),
+                                        .collect()
+                                },
+                            )
+                        })
+                        .flex_grow()
+                        .size_full()
+                        .with_sizing_behavior(ListSizingBehavior::Auto),
                     ),
+                ),
             )
             .child(div().p_2().text_sm().child(title))
     }
@@ -1667,31 +1091,12 @@ impl Clone for DatabaseObjects {
             search_debouncer: self.search_debouncer.clone(),
             current_node: self.current_node.clone(),
             selected_indices: self.selected_indices.clone(),
-            ddl_preview_content: self.ddl_preview_content.clone(),
-            ddl_preview_loading: self.ddl_preview_loading,
-            ddl_preview_table_name: self.ddl_preview_table_name.clone(),
-            ddl_preview_request_seq: self.ddl_preview_request_seq,
-            resizing_column: self.resizing_column,
             _subscriptions: vec![],
         }
     }
 }
 
 impl EventEmitter<DatabaseObjectsEvent> for DatabaseObjects {}
-
-impl DatabaseObjects {
-    pub fn ddl_preview_content(&self) -> &SharedString {
-        &self.ddl_preview_content
-    }
-
-    pub fn ddl_preview_table_name(&self) -> Option<&str> {
-        self.ddl_preview_table_name.as_deref()
-    }
-
-    pub fn ddl_preview_loading(&self) -> bool {
-        self.ddl_preview_loading
-    }
-}
 
 impl Focusable for DatabaseObjects {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1706,6 +1111,7 @@ pub struct DatabaseObjectsPanel {
 impl DatabaseObjectsPanel {
     pub fn new(workspace: Option<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let database_objects = cx.new(|cx| DatabaseObjects::new(workspace, window, cx));
+
         Self { database_objects }
     }
 

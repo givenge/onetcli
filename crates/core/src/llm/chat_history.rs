@@ -8,28 +8,6 @@ use crate::storage::now;
 use crate::storage::row_mapping::FromSqliteRow;
 use crate::storage::traits::Repository;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ChatSessionKind {
-    Ai,
-    Sql,
-}
-
-impl ChatSessionKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ai => "ai",
-            Self::Sql => "sql",
-        }
-    }
-
-    pub fn from_str(value: &str) -> Self {
-        match value {
-            "sql" => Self::Sql,
-            _ => Self::Ai,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSession {
     pub id: i64,
@@ -90,7 +68,6 @@ pub struct ChatSession {
     pub id: i64,
     pub name: String,
     pub provider_id: String,
-    pub session_kind: ChatSessionKind,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -101,7 +78,6 @@ impl FromSqliteRow for ChatSession {
             id: row.get("id")?,
             name: row.get("name")?,
             provider_id: row.get("provider_id")?,
-            session_kind: ChatSessionKind::from_str(&row.get::<_, String>("session_kind")?),
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -123,13 +99,12 @@ impl crate::storage::traits::Entity for ChatSession {
 }
 
 impl ChatSession {
-    pub fn new(name: String, provider_id: String, session_kind: ChatSessionKind) -> Self {
+    pub fn new(name: String, provider_id: String) -> Self {
         let now = now();
         Self {
             id: 0,
             name,
             provider_id,
-            session_kind,
             created_at: now,
             updated_at: now,
         }
@@ -216,14 +191,13 @@ impl Repository for SessionRepository {
     fn insert(&self, item: &mut Self::Entity) -> Result<i64> {
         let name = item.name.clone();
         let provider_id = item.provider_id.clone();
-        let session_kind = item.session_kind.as_str();
         let created_at = item.created_at;
         let updated_at = item.updated_at;
 
         let id = self.conn.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO chat_sessions (name, provider_id, session_kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, provider_id, session_kind, created_at, updated_at],
+                "INSERT INTO chat_sessions (name, provider_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![name, provider_id, created_at, updated_at],
             )?;
             Ok(conn.last_insert_rowid())
         })?;
@@ -236,13 +210,12 @@ impl Repository for SessionRepository {
         let id = item.id;
         let name = item.name.clone();
         let provider_id = item.provider_id.clone();
-        let session_kind = item.session_kind.as_str();
         let updated_at = now();
 
         self.conn.with_connection(|conn| {
             conn.execute(
-                "UPDATE chat_sessions SET name = ?1, provider_id = ?2, session_kind = ?3, updated_at = ?4 WHERE id = ?5",
-                params![name, provider_id, session_kind, updated_at, id],
+                "UPDATE chat_sessions SET name = ?1, provider_id = ?2, updated_at = ?3 WHERE id = ?4",
+                params![name, provider_id, updated_at, id],
             )?;
             Ok(())
         })
@@ -257,7 +230,7 @@ impl Repository for SessionRepository {
 
     fn get(&self, id: i64) -> Result<Option<Self::Entity>> {
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, provider_id, session_kind, created_at, updated_at FROM chat_sessions WHERE id = ?1")?;
+            let mut stmt = conn.prepare("SELECT id, name, provider_id, created_at, updated_at FROM chat_sessions WHERE id = ?1")?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
                 Ok(Some(ChatSession::from_row(row)?))
@@ -269,7 +242,7 @@ impl Repository for SessionRepository {
 
     fn list(&self) -> Result<Vec<Self::Entity>> {
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, provider_id, session_kind, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC")?;
+            let mut stmt = conn.prepare("SELECT id, name, provider_id, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC")?;
             let rows = stmt.query_map([], |row| ChatSession::from_row(row))?;
             let mut results = Vec::new();
             for row in rows {
@@ -303,21 +276,8 @@ impl SessionRepository {
     pub fn list_by_provider(&self, provider_id: &str) -> Result<Vec<ChatSession>> {
         let provider_id = provider_id.to_string();
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, provider_id, session_kind, created_at, updated_at FROM chat_sessions WHERE provider_id = ?1 ORDER BY updated_at DESC")?;
+            let mut stmt = conn.prepare("SELECT id, name, provider_id, created_at, updated_at FROM chat_sessions WHERE provider_id = ?1 ORDER BY updated_at DESC")?;
             let rows = stmt.query_map(params![provider_id], |row| ChatSession::from_row(row))?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            Ok(results)
-        })
-    }
-
-    pub fn list_by_kind(&self, session_kind: ChatSessionKind) -> Result<Vec<ChatSession>> {
-        let session_kind = session_kind.as_str();
-        self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, provider_id, session_kind, created_at, updated_at FROM chat_sessions WHERE session_kind = ?1 ORDER BY updated_at DESC")?;
-            let rows = stmt.query_map(params![session_kind], |row| ChatSession::from_row(row))?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);

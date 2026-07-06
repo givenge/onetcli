@@ -14,7 +14,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Axis, Bounds, Context, Element, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Style, Styled, Subscription, Task, Window, px,
+    Render, SharedString, Style, Styled, Subscription, Task, Window, div, px,
 };
 use gpui_component::{Icon, IconName, Sizable, Size};
 use one_core::gpui_tokio::Tokio;
