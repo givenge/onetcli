@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use std::sync::LazyLock;
 
+use crate::types::ObjectViewColumn as Column;
 use anyhow::Result;
 use async_trait::async_trait;
-use gpui_component::table::Column;
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 
 use crate::connection::{DbConnection, DbError};
@@ -14,16 +14,18 @@ use crate::import_export::{
     ImportResult,
 };
 use crate::manifest_helpers::{
-    DatabaseActionDescriptorExt, action, action_with_scope, field, option, ssh_auth_rules,
-    ssh_enabled_rules, ssh_field, ssh_number_field, ssh_password_field, tab, yes_no_options,
+    DatabaseActionDescriptorExt, action, action_with_scope, field, option,
+    schema_preference_fields, ssh_auth_rules, ssh_enabled_rules, ssh_field, ssh_number_field,
+    ssh_password_field, tab, yes_no_options,
 };
-use crate::plugin::{DatabasePlugin, SqlCompletionInfo};
+use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
     DatabaseUiCapabilities, DatabaseUiManifest,
 };
 use crate::postgresql::connection::PostgresDbConnection;
+use crate::schema_preferences::{SchemaFilterProfile, filter_schemas};
 use crate::types::*;
 
 /// PostgreSQL data types (name, description)
@@ -88,6 +90,39 @@ impl PostgresPlugin {
         Self
     }
 
+    fn database_node(node: &DbNode, database: String) -> DbNode {
+        DbNode::new(
+            format!("{}:{}", node.id, database),
+            database,
+            DbNodeType::Database,
+            node.connection_id.clone(),
+            node.database_type.clone(),
+        )
+        .with_parent_context(&node.id)
+    }
+
+    fn database_tree_from_list_result(
+        node: &DbNode,
+        configured_database: Option<&str>,
+        result: Result<Vec<String>>,
+    ) -> Result<Vec<DbNode>> {
+        match result {
+            Ok(databases) => Ok(databases
+                .into_iter()
+                .map(|database| Self::database_node(node, database))
+                .collect()),
+            Err(error) => {
+                let Some(database) = configured_database
+                    .map(str::trim)
+                    .filter(|db| !db.is_empty())
+                else {
+                    return Err(error);
+                };
+                Ok(vec![Self::database_node(node, database.to_string())])
+            }
+        }
+    }
+
     fn normalize_type_name(type_name: &str) -> String {
         let type_lower = type_name.to_lowercase();
 
@@ -116,9 +151,22 @@ impl PostgresPlugin {
 }
 
 fn build_postgresql_ui_manifest() -> DatabaseUiManifest {
+    let mut forms = vec![
+        postgresql_connection_form(),
+        postgresql_database_form(false),
+        postgresql_database_form(true),
+        postgresql_schema_form(),
+    ];
+    forms.extend(postgres_user_forms());
+
     DatabaseUiManifest {
         capabilities: DatabaseUiCapabilities {
             supports_schema: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_sequences: true,
             supports_functions: true,
             supports_procedures: true,
@@ -128,14 +176,97 @@ fn build_postgresql_ui_manifest() -> DatabaseUiManifest {
             supports_tablespace: true,
             ..DatabaseUiCapabilities::default()
         },
-        forms: vec![
-            postgresql_connection_form(),
-            postgresql_database_form(false),
-            postgresql_database_form(true),
-            postgresql_schema_form(),
-        ],
+        forms,
         actions: postgresql_action_manifest(),
         ..DatabaseUiManifest::default()
+    }
+}
+
+fn postgres_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn postgres_user_password(request: &DatabaseUserOperationRequest) -> &str {
+    request
+        .field_values
+        .get("password")
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .unwrap_or("change_me")
+}
+
+fn postgres_user_privileges(request: &DatabaseUserOperationRequest) -> &str {
+    match request.field_values.get("privileges").map(String::as_str) {
+        Some("CONNECT") => "CONNECT",
+        Some("CREATE") => "CREATE",
+        Some("TEMPORARY") => "TEMPORARY",
+        Some("ALL PRIVILEGES") => "ALL PRIVILEGES",
+        _ => "CONNECT",
+    }
+}
+
+fn postgres_user_forms() -> Vec<DatabaseFormManifest> {
+    vec![
+        postgres_user_form(DatabaseFormKind::CreateUser, true, false),
+        postgres_user_form(DatabaseFormKind::EditUser, true, false),
+        postgres_user_form(DatabaseFormKind::DeleteUser, false, false),
+        postgres_user_form(DatabaseFormKind::UserPrivileges, false, true),
+    ]
+}
+
+fn postgres_user_form(
+    kind: DatabaseFormKind,
+    include_password: bool,
+    include_privileges: bool,
+) -> DatabaseFormManifest {
+    let mut fields = vec![field(
+        "name",
+        "DatabaseUser.name",
+        DatabaseFormFieldType::Text,
+    )];
+    if include_password {
+        fields.push(field(
+            "password",
+            "DatabaseUser.password",
+            DatabaseFormFieldType::Password,
+        ));
+    }
+    if include_privileges {
+        fields.push(field(
+            "database",
+            "DatabaseUser.database",
+            DatabaseFormFieldType::Text,
+        ));
+        fields.push(
+            field(
+                "privileges",
+                "DatabaseUser.privileges",
+                DatabaseFormFieldType::Select,
+            )
+            .with_default("CONNECT")
+            .with_options(vec![
+                option("CONNECT", "DatabaseUser.privilege_connect"),
+                option("CREATE", "DatabaseUser.privilege_create"),
+                option("TEMPORARY", "DatabaseUser.privilege_temporary"),
+                option("ALL PRIVILEGES", "DatabaseUser.privilege_all"),
+            ]),
+        );
+    }
+    DatabaseFormManifest {
+        kind,
+        title_i18n_key: user_form_title_key(kind).into(),
+        submit_i18n_key: "Common.save".into(),
+        tabs: vec![tab("user", "DatabaseUser.user_tab", fields)],
+    }
+}
+
+fn user_form_title_key(kind: DatabaseFormKind) -> &'static str {
+    match kind {
+        DatabaseFormKind::CreateUser => "DatabaseUser.create_title",
+        DatabaseFormKind::EditUser => "DatabaseUser.edit_title",
+        DatabaseFormKind::DeleteUser => "DatabaseUser.delete_title",
+        DatabaseFormKind::UserPrivileges => "DatabaseUser.privileges_title",
+        _ => "DatabaseUser.user_title",
     }
 }
 
@@ -184,10 +315,8 @@ fn postgresql_connection_form() -> DatabaseFormManifest {
                     .with_placeholder("database name (optional)"),
                 ],
             ),
-            tab(
-                "advanced",
-                "ConnectionForm.advanced",
-                vec![
+            {
+                let mut fields = vec![
                     field(
                         "connect_timeout",
                         "ConnectionForm.connect_timeout",
@@ -203,8 +332,10 @@ fn postgresql_connection_form() -> DatabaseFormManifest {
                     )
                     .optional()
                     .with_placeholder("Application Name"),
-                ],
-            ),
+                ];
+                fields.extend(schema_preference_fields());
+                tab("advanced", "ConnectionForm.advanced", fields)
+            },
             tab(
                 "ssl",
                 "ConnectionForm.ssl",
@@ -688,6 +819,11 @@ impl DatabasePlugin for PostgresPlugin {
             supports_functions: true,
             supports_procedures: true,
             supports_triggers: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_table_charset: true,
             supports_table_collation: true,
             supports_tablespace: true,
@@ -922,18 +1058,25 @@ impl DatabasePlugin for PostgresPlugin {
         }
     }
 
-    async fn list_databases_view(&self, connection: &dyn DbConnection) -> Result<ObjectView> {
-        use gpui::px;
+    async fn build_database_tree(
+        &self,
+        connection: &dyn DbConnection,
+        node: &DbNode,
+    ) -> Result<Vec<DbNode>> {
+        let result = self.list_databases(connection).await;
+        Self::database_tree_from_list_result(node, connection.config().database.as_deref(), result)
+    }
 
+    async fn list_databases_view(&self, connection: &dyn DbConnection) -> Result<ObjectView> {
         let databases = self.list_databases_detailed(connection).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("charset", "Encoding").width(px(120.0)),
-            Column::new("collation", "Collation").width(px(180.0)),
-            Column::new("size", "Size").width(px(100.0)).text_right(),
-            Column::new("tables", "Tables").width(px(80.0)).text_right(),
-            Column::new("comment", "Comment").width(px(250.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("charset", "Encoding").width(120.0),
+            Column::new("collation", "Collation").width(180.0),
+            Column::new("size", "Size").width(100.0).text_right(),
+            Column::new("tables", "Tables").width(80.0).text_right(),
+            Column::new("comment", "Comment").width(250.0),
         ];
 
         let rows: Vec<Vec<String>> = databases
@@ -1025,18 +1168,22 @@ impl DatabasePlugin for PostgresPlugin {
         let result = connection
             .query(
                 "SELECT schema_name FROM information_schema.schemata \
-             WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
              ORDER BY schema_name",
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list schemas: {}", e))?;
 
         if let SqlResult::Query(query_result) = result {
-            Ok(query_result
+            let schemas = query_result
                 .rows
                 .iter()
                 .filter_map(|row| row.first().and_then(|v| v.clone()))
-                .collect())
+                .collect();
+            Ok(filter_schemas(
+                connection.config(),
+                SchemaFilterProfile::PostgreSql,
+                schemas,
+            ))
         } else {
             Err(anyhow::anyhow!("Unexpected result type"))
         }
@@ -1047,8 +1194,6 @@ impl DatabasePlugin for PostgresPlugin {
         connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = "SELECT
                 n.nspname AS schema_name,
                 pg_catalog.pg_get_userbyid(n.nspowner) AS owner,
@@ -1066,10 +1211,10 @@ impl DatabasePlugin for PostgresPlugin {
 
         if let SqlResult::Query(query_result) = result {
             let columns = vec![
-                Column::new("name", "Name").width(px(180.0)),
-                Column::new("owner", "Owner").width(px(120.0)),
-                Column::new("tables", "Tables").width(px(80.0)).text_right(),
-                Column::new("description", "Description").width(px(300.0)),
+                Column::new("name", "Name").width(180.0),
+                Column::new("owner", "Owner").width(120.0),
+                Column::new("tables", "Tables").width(80.0).text_right(),
+                Column::new("description", "Description").width(300.0),
             ];
 
             let rows: Vec<Vec<String>> = query_result
@@ -1107,15 +1252,17 @@ impl DatabasePlugin for PostgresPlugin {
         let schema_val = schema.unwrap_or_else(|| "public".to_string());
         let sql = format!(
             "SELECT
-                t.tablename,
-                t.schemaname,
-                t.tableowner,
-                obj_description((quote_ident(t.schemaname) || '.' || quote_ident(t.tablename))::regclass) AS table_comment,
-                (SELECT reltuples::bigint FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid WHERE c.relname = t.tablename AND n.nspname = t.schemaname) AS row_count,
-                pg_size_pretty(pg_total_relation_size((quote_ident(t.schemaname) || '.' || quote_ident(t.tablename))::regclass)) AS total_size
-             FROM pg_tables t
-             WHERE t.schemaname = '{}'
-             ORDER BY t.tablename",
+                c.relname AS tablename,
+                n.nspname AS schemaname,
+                pg_catalog.pg_get_userbyid(c.relowner) AS tableowner,
+                obj_description(c.oid, 'pg_class') AS table_comment,
+                c.reltuples::bigint AS row_count,
+                pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+             FROM pg_class c
+             JOIN pg_namespace n ON c.relnamespace = n.oid
+             WHERE n.nspname = '{}'
+               AND c.relkind IN ('r', 'p')
+             ORDER BY c.relname",
             schema_val.replace("'", "''")
         );
 
@@ -1161,16 +1308,14 @@ impl DatabasePlugin for PostgresPlugin {
         database: &str,
         schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let tables = self.list_tables(connection, database, schema).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("owner", "Owner").width(px(100.0)),
-            Column::new("rows", "Rows").width(px(100.0)).text_right(),
-            Column::new("size", "Size").width(px(100.0)).text_right(),
-            Column::new("comment", "Comment").width(px(300.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("owner", "Owner").width(100.0),
+            Column::new("rows", "Rows").width(100.0).text_right(),
+            Column::new("size", "Size").width(100.0).text_right(),
+            Column::new("comment", "Comment").width(300.0),
         ];
 
         let rows: Vec<Vec<String>> = tables
@@ -1216,7 +1361,8 @@ impl DatabasePlugin for PostgresPlugin {
                     WHERE c.conrelid = a.attrelid \
                     AND a.attnum = ANY(c.conkey) \
                     AND c.contype = 'p' \
-                ) AS is_primary \
+                ) AS is_primary, \
+                col_description(a.attrelid, a.attnum) AS column_comment \
             FROM pg_attribute a \
             LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
             JOIN pg_class t ON a.attrelid = t.oid \
@@ -1255,7 +1401,7 @@ impl DatabasePlugin for PostgresPlugin {
                             .map(|v| v == "t" || v == "true" || v == "1")
                             .unwrap_or(false),
                         default_value: row.get(3).and_then(|v| v.clone()),
-                        comment: None,
+                        comment: row.get(5).and_then(|v| v.clone()),
                         charset: None,
                         collation: None,
                     }
@@ -1273,18 +1419,17 @@ impl DatabasePlugin for PostgresPlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns_data = self
             .list_columns(connection, database, schema, table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("nullable", "Nullable").width(px(80.0)),
-            Column::new("key", "Key").width(px(80.0)),
-            Column::new("default", "Default").width(px(200.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("nullable", "Nullable").width(80.0),
+            Column::new("key", "Key").width(80.0),
+            Column::new("default", "Default").width(200.0),
+            Column::new("comment", "Comment").width(250.0),
         ];
 
         let rows: Vec<Vec<String>> = columns_data
@@ -1296,6 +1441,7 @@ impl DatabasePlugin for PostgresPlugin {
                     if col.is_nullable { "YES" } else { "NO" }.to_string(),
                     if col.is_primary_key { "PRI" } else { "" }.to_string(),
                     col.default_value.as_deref().unwrap_or("").to_string(),
+                    col.comment.as_deref().unwrap_or("").to_string(),
                 ]
             })
             .collect();
@@ -1375,17 +1521,15 @@ impl DatabasePlugin for PostgresPlugin {
         schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self
             .list_indexes(connection, database, schema.map(|s| s.to_string()), table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("columns", "Columns").width(px(250.0)),
-            Column::new("unique", "Unique").width(px(80.0)),
-            Column::new("type", "Type").width(px(120.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("columns", "Columns").width(250.0),
+            Column::new("unique", "Unique").width(80.0),
+            Column::new("type", "Type").width(120.0),
         ];
 
         let rows: Vec<Vec<String>> = indexes
@@ -1493,13 +1637,11 @@ impl DatabasePlugin for PostgresPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let views = self.list_views(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("definition", "Definition").width(px(400.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("definition", "Definition").width(400.0),
         ];
 
         let rows: Vec<Vec<String>> = views
@@ -1556,13 +1698,11 @@ impl DatabasePlugin for PostgresPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let functions = self.list_functions(connection, database).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("return_type", "Return Type").width(px(150.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("return_type", "Return Type").width(150.0),
         ];
 
         let rows: Vec<Vec<String>> = functions
@@ -1619,11 +1759,9 @@ impl DatabasePlugin for PostgresPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let procedures = self.list_procedures(connection, database).await?;
 
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         let rows: Vec<Vec<String>> = procedures
             .iter()
@@ -1677,15 +1815,13 @@ impl DatabasePlugin for PostgresPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let triggers = self.list_triggers(connection, database).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("table", "Table").width(px(150.0)),
-            Column::new("event", "Event").width(px(100.0)),
-            Column::new("timing", "Timing").width(px(100.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("table", "Table").width(150.0),
+            Column::new("event", "Event").width(100.0),
+            Column::new("timing", "Timing").width(100.0),
         ];
 
         let rows: Vec<Vec<String>> = triggers
@@ -1764,18 +1900,16 @@ impl DatabasePlugin for PostgresPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sequences = self.list_sequences(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("start", "Start").width(px(100.0)).text_right(),
+            Column::new("name", "Name").width(180.0),
+            Column::new("start", "Start").width(100.0).text_right(),
             Column::new("increment", "Increment")
-                .width(px(100.0))
+                .width(100.0)
                 .text_right(),
-            Column::new("min", "Min").width(px(120.0)).text_right(),
-            Column::new("max", "Max").width(px(120.0)).text_right(),
+            Column::new("min", "Min").width(120.0).text_right(),
+            Column::new("max", "Max").width(120.0).text_right(),
         ];
 
         let rows: Vec<Vec<String>> = sequences
@@ -1830,6 +1964,74 @@ impl DatabasePlugin for PostgresPlugin {
         }
 
         def
+    }
+
+    fn build_list_users_sql(&self, _database: Option<&str>) -> Option<String> {
+        Some(
+            r#"SELECT
+  rolname,
+  rolcanlogin,
+  rolsuper,
+  rolcreatedb,
+  rolcreaterole,
+  rolreplication,
+  rolbypassrls,
+  rolvaliduntil
+FROM pg_catalog.pg_roles
+ORDER BY rolname;"#
+                .to_string(),
+        )
+    }
+
+    fn user_list_columns(&self) -> Vec<Column> {
+        vec![
+            Column::localized("rolname", "DatabaseUser.columns.role_name").width(180.0),
+            Column::localized("rolcanlogin", "DatabaseUser.columns.can_login").width(120.0),
+            Column::localized("rolsuper", "DatabaseUser.columns.superuser").width(120.0),
+            Column::localized("rolcreatedb", "DatabaseUser.columns.create_database").width(140.0),
+            Column::localized("rolcreaterole", "DatabaseUser.columns.create_role").width(130.0),
+            Column::localized("rolreplication", "DatabaseUser.columns.replication").width(130.0),
+            Column::localized("rolbypassrls", "DatabaseUser.columns.bypass_rls").width(130.0),
+            Column::localized("rolvaliduntil", "DatabaseUser.columns.valid_until").width(180.0),
+        ]
+    }
+
+    fn build_create_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "CREATE ROLE {} LOGIN PASSWORD {};",
+            self.quote_identifier(&request.user_name),
+            postgres_string_literal(postgres_user_password(request))
+        ))
+    }
+
+    fn build_modify_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "ALTER ROLE {} WITH PASSWORD {};",
+            self.quote_identifier(&request.user_name),
+            postgres_string_literal(postgres_user_password(request))
+        ))
+    }
+
+    fn build_drop_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "DROP ROLE {};",
+            self.quote_identifier(&request.user_name)
+        ))
+    }
+
+    fn build_user_privileges_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        let database = request
+            .field_values
+            .get("database")
+            .map(String::as_str)
+            .or(request.database.as_deref())
+            .filter(|database| !database.trim().is_empty())?;
+        Some(format!(
+            "GRANT {} ON DATABASE {} TO {};",
+            postgres_user_privileges(request),
+            self.quote_identifier(database),
+            self.quote_identifier(&request.user_name)
+        ))
     }
 
     fn build_create_database_sql(
@@ -1916,6 +2118,22 @@ impl DatabasePlugin for PostgresPlugin {
         } else {
             format!("DROP TABLE IF EXISTS {}", self.quote_identifier(table))
         }
+    }
+
+    fn truncate_table_with_schema(
+        &self,
+        _database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> String {
+        if let Some(schema) = schema {
+            return format!(
+                "TRUNCATE TABLE {}.{}",
+                self.quote_identifier(schema),
+                self.quote_identifier(table)
+            );
+        }
+        format!("TRUNCATE TABLE {}", self.quote_identifier(table))
     }
 
     fn rename_table(&self, _database: &str, old_name: &str, new_name: &str) -> String {
@@ -2007,6 +2225,10 @@ impl DatabasePlugin for PostgresPlugin {
             definitions.push(format!("  PRIMARY KEY ({})", pk_cols.join(", ")));
         }
 
+        for foreign_key in &design.foreign_keys {
+            definitions.push(format!("  {}", self.build_foreign_key_def(foreign_key)));
+        }
+
         sql.push_str(&definitions.join(",\n"));
         sql.push_str("\n);");
 
@@ -2043,6 +2265,25 @@ impl DatabasePlugin for PostgresPlugin {
             .collect();
         let new_cols: std::collections::HashMap<&str, &ColumnDefinition> =
             new.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+        let original_foreign_keys: std::collections::HashMap<&str, &ForeignKeyDefinition> =
+            original
+                .foreign_keys
+                .iter()
+                .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+                .collect();
+        let new_foreign_keys: std::collections::HashMap<&str, &ForeignKeyDefinition> = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+
+        for (name, original_foreign_key) in &original_foreign_keys {
+            match new_foreign_keys.get(name) {
+                Some(new_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements.push(self.build_drop_foreign_key_sql(&new.table_name, name)),
+            }
+        }
 
         for name in original_cols.keys() {
             if !new_cols.contains_key(name) {
@@ -2152,6 +2393,15 @@ impl DatabasePlugin for PostgresPlugin {
             }
         }
 
+        for (name, new_foreign_key) in &new_foreign_keys {
+            match original_foreign_keys.get(name) {
+                Some(original_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements
+                    .push(self.build_add_foreign_key_sql(&new.table_name, new_foreign_key)),
+            }
+        }
+
         if statements.is_empty() {
             "-- No changes detected".to_string()
         } else {
@@ -2198,16 +2448,163 @@ impl Default for PostgresPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QueryResult;
+    use crate::connection::StreamingProgress;
+    use crate::executor::{ExecOptions, SqlSource};
     use crate::plugin::DatabasePlugin;
     use crate::plugin_manifest::{DatabaseActionId, DatabaseFormKind};
     use crate::types::{
-        ColumnDefinition, ColumnInfo, IndexDefinition, TableDesign, TableOptions, TableRowChange,
-        TableSaveRequest,
+        ColumnDefinition, ColumnInfo, ForeignKeyDefinition, IndexDefinition, TableDesign,
+        TableOptions, TableRowChange, TableSaveRequest,
     };
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
 
     fn create_plugin() -> PostgresPlugin {
         PostgresPlugin::new()
+    }
+
+    fn user_request(
+        user_name: &str,
+        database: Option<&str>,
+        values: &[(&str, &str)],
+    ) -> crate::plugin::DatabaseUserOperationRequest {
+        crate::plugin::DatabaseUserOperationRequest {
+            user_name: user_name.to_string(),
+            host: None,
+            database: database.map(str::to_string),
+            field_values: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    fn connection_root_node() -> DbNode {
+        DbNode::new(
+            "conn-1",
+            "Local PostgreSQL",
+            DbNodeType::Connection,
+            "conn-1".to_string(),
+            DatabaseType::PostgreSQL,
+        )
+    }
+
+    struct CommentMetadataConnection {
+        config: DbConnectionConfig,
+        queries: Mutex<Vec<String>>,
+    }
+
+    impl CommentMetadataConnection {
+        fn new() -> Self {
+            Self {
+                config: DbConnectionConfig {
+                    id: "comment-metadata".to_string(),
+                    name: "Comment metadata".to_string(),
+                    database_type: DatabaseType::PostgreSQL,
+                    host: "localhost".to_string(),
+                    port: 5432,
+                    username: "postgres".to_string(),
+                    password: String::new(),
+                    database: Some("app".to_string()),
+                    service_name: None,
+                    sid: None,
+                    workspace_id: None,
+                    extra_params: Default::default(),
+                },
+                queries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.queries.lock().expect("queries mutex poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl DbConnection for CommentMetadataConnection {
+        fn config(&self) -> &DbConnectionConfig {
+            &self.config
+        }
+
+        fn set_config_database(&mut self, database: Option<String>) {
+            self.config.database = database;
+        }
+
+        async fn connect(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _plugin: &dyn DatabasePlugin,
+            _script: &str,
+            _options: ExecOptions,
+        ) -> Result<Vec<SqlResult>, DbError> {
+            Err(DbError::query(
+                "execute should not be used by metadata tests",
+            ))
+        }
+
+        async fn query(&self, query: &str) -> Result<SqlResult, DbError> {
+            self.queries
+                .lock()
+                .expect("queries mutex poisoned")
+                .push(query.to_string());
+
+            let rows = if query.contains("table_comment") {
+                vec![vec![
+                    Some("users".to_string()),
+                    Some("public".to_string()),
+                    Some("postgres".to_string()),
+                    Some("Application users".to_string()),
+                    Some("42".to_string()),
+                    Some("16 kB".to_string()),
+                ]]
+            } else if query.contains("column_name") {
+                vec![vec![
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    Some("NO".to_string()),
+                    Some("nextval('users_id_seq'::regclass)".to_string()),
+                    Some("t".to_string()),
+                    Some("User identifier".to_string()),
+                ]]
+            } else {
+                vec![]
+            };
+
+            Ok(SqlResult::Query(QueryResult {
+                sql: query.to_string(),
+                columns: vec![],
+                column_meta: vec![],
+                rows,
+                elapsed_ms: 0,
+            }))
+        }
+
+        async fn current_database(&self) -> Result<Option<String>, DbError> {
+            Ok(self.config.database.clone())
+        }
+
+        async fn switch_database(&self, _database: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn execute_streaming(
+            &self,
+            _plugin: &dyn DatabasePlugin,
+            _source: SqlSource,
+            _options: ExecOptions,
+            _sender: mpsc::Sender<StreamingProgress>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
     }
 
     // ==================== Basic Plugin Info Tests ====================
@@ -2247,6 +2644,65 @@ mod tests {
         assert!(plugin.capabilities().supports_sequences);
     }
 
+    #[tokio::test]
+    async fn test_postgres_table_metadata_reads_comments_from_pg_class() {
+        let plugin = create_plugin();
+        let connection = CommentMetadataConnection::new();
+
+        let tables = plugin
+            .list_tables(&connection, "app", Some("public".to_string()))
+            .await
+            .expect("list tables");
+
+        assert_eq!(Some("Application users"), tables[0].comment.as_deref());
+        let queries = connection.queries();
+        let table_query = queries
+            .iter()
+            .find(|query| query.contains("table_comment"))
+            .expect("table metadata query");
+        assert!(table_query.contains("obj_description(c.oid, 'pg_class')"));
+    }
+
+    #[tokio::test]
+    async fn test_postgres_column_metadata_and_view_include_comments() {
+        let plugin = create_plugin();
+        let connection = CommentMetadataConnection::new();
+
+        let columns = plugin
+            .list_columns(&connection, "app", Some("public".to_string()), "users")
+            .await
+            .expect("list columns");
+
+        assert_eq!(Some("User identifier"), columns[0].comment.as_deref());
+        let view = plugin
+            .list_columns_view(&connection, "app", Some("public".to_string()), "users")
+            .await
+            .expect("list columns view");
+        assert_eq!(
+            Some("comment"),
+            view.columns.last().map(|column| column.key.as_str())
+        );
+        assert_eq!("User identifier", view.rows[0][5]);
+
+        let queries = connection.queries();
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.contains("col_description(a.attrelid, a.attnum)"))
+        );
+    }
+
+    #[test]
+    fn test_capabilities_support_users() {
+        let capabilities = create_plugin().capabilities();
+
+        assert!(capabilities.supports_users);
+        assert!(capabilities.supports_user_create);
+        assert!(capabilities.supports_user_edit);
+        assert!(capabilities.supports_user_delete);
+        assert!(capabilities.supports_user_privileges);
+    }
+
     #[test]
     fn test_ui_manifest_smoke() {
         let manifest = create_plugin().ui_manifest();
@@ -2260,6 +2716,10 @@ mod tests {
                 DatabaseFormKind::CreateDatabase,
                 DatabaseFormKind::EditDatabase,
                 DatabaseFormKind::CreateSchema,
+                DatabaseFormKind::CreateUser,
+                DatabaseFormKind::EditUser,
+                DatabaseFormKind::DeleteUser,
+                DatabaseFormKind::UserPrivileges,
             ]
         );
         assert!(
@@ -2268,6 +2728,43 @@ mod tests {
                 .actions
                 .iter()
                 .any(|action| action.id == DatabaseActionId::CreateSchema)
+        );
+    }
+
+    #[test]
+    fn test_build_database_tree_uses_configured_database_when_listing_fails() {
+        let node = connection_root_node();
+
+        let children = PostgresPlugin::database_tree_from_list_result(
+            &node,
+            Some("app_db"),
+            Err(anyhow::anyhow!("permission denied for table pg_database")),
+        )
+        .unwrap();
+
+        assert_eq!(1, children.len());
+        assert_eq!("conn-1:app_db", children[0].id);
+        assert_eq!("app_db", children[0].name);
+        assert_eq!(DbNodeType::Database, children[0].node_type);
+        assert_eq!("conn-1", children[0].connection_id);
+        assert_eq!(Some("conn-1"), children[0].parent_context.as_deref());
+    }
+
+    #[test]
+    fn test_build_database_tree_keeps_listing_error_without_configured_database() {
+        let node = connection_root_node();
+
+        let error = PostgresPlugin::database_tree_from_list_result(
+            &node,
+            None,
+            Err(anyhow::anyhow!("permission denied for table pg_database")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("permission denied for table pg_database")
         );
     }
 
@@ -2308,6 +2805,14 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_table_with_schema() {
+        let plugin = create_plugin();
+        let sql = plugin.truncate_table_with_schema("test_db", Some("app"), "users");
+        assert_eq!(sql, "TRUNCATE TABLE \"app\".\"users\"");
+        assert!(!sql.contains("test_db"));
+    }
+
+    #[test]
     fn test_rename_table() {
         let plugin = create_plugin();
         let sql = plugin.rename_table("test_db", "old_name", "new_name");
@@ -2335,6 +2840,45 @@ mod tests {
         let sql = plugin.drop_view("test_db", "my_view");
         assert!(sql.contains("DROP VIEW"));
         assert!(sql.contains("\"my_view\""));
+    }
+
+    #[test]
+    fn test_build_list_users_sql() {
+        let plugin = create_plugin();
+        let sql = plugin
+            .build_list_users_sql(Some("appdb"))
+            .expect("PostgreSQL supports user listing");
+
+        assert!(sql.contains("FROM pg_catalog.pg_roles"));
+        assert!(sql.contains("rolname"));
+        assert!(sql.contains("rolcanlogin"));
+    }
+
+    #[test]
+    fn test_build_postgres_user_operation_sql_escapes_role_and_password() {
+        let plugin = create_plugin();
+        let request = user_request(
+            "app\"user",
+            Some("app\"db"),
+            &[("password", "pa'ss"), ("privileges", "CONNECT")],
+        );
+
+        assert_eq!(
+            Some("CREATE ROLE \"app\"\"user\" LOGIN PASSWORD 'pa''ss';".to_string()),
+            plugin.build_create_user_sql(&request)
+        );
+        assert_eq!(
+            Some("ALTER ROLE \"app\"\"user\" WITH PASSWORD 'pa''ss';".to_string()),
+            plugin.build_modify_user_sql(&request)
+        );
+        assert_eq!(
+            Some("DROP ROLE \"app\"\"user\";".to_string()),
+            plugin.build_drop_user_sql(&request)
+        );
+        assert_eq!(
+            Some("GRANT CONNECT ON DATABASE \"app\"\"db\" TO \"app\"\"user\";".to_string()),
+            plugin.build_user_privileges_sql(&request)
+        );
     }
 
     // ==================== Database Operations Tests ====================
@@ -2554,6 +3098,39 @@ mod tests {
         assert!(sql.contains("UNIQUE INDEX \"idx_email\""));
     }
 
+    #[test]
+    fn test_build_create_table_sql_with_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id")
+                    .data_type("INTEGER")
+                    .nullable(false),
+                ColumnDefinition::new("order_id")
+                    .data_type("INTEGER")
+                    .nullable(false),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "RESTRICT".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE RESTRICT"
+        ));
+    }
+
     // ==================== ALTER TABLE Tests ====================
 
     #[test]
@@ -2727,6 +3304,63 @@ mod tests {
         let sql = plugin.build_alter_table_sql(&original, &new);
         assert!(sql.contains("SET NOT NULL"));
         assert!(sql.contains("SET DEFAULT 'guest'"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_add_and_drop_foreign_keys() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INTEGER"),
+                ColumnDefinition::new("order_id").data_type("INTEGER"),
+                ColumnDefinition::new("legacy_order_id").data_type("INTEGER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_legacy".to_string(),
+                columns: vec!["legacy_order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: String::new(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INTEGER"),
+                ColumnDefinition::new("order_id").data_type("INTEGER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "RESTRICT".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert!(
+            sql.contains("ALTER TABLE \"order_items\" DROP CONSTRAINT \"fk_order_items_legacy\";")
+        );
+        assert!(
+            sql.find("DROP CONSTRAINT \"fk_order_items_legacy\"")
+                .unwrap()
+                < sql.find("DROP COLUMN \"legacy_order_id\"").unwrap()
+        );
+        assert!(sql.contains(
+            "ALTER TABLE \"order_items\" ADD CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE RESTRICT;"
+        ));
     }
 
     #[test]

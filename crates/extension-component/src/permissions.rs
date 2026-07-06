@@ -5,6 +5,8 @@ use crate::SqlAccess;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionSet {
     db: BTreeSet<DbPermission>,
+    fs_read: BTreeSet<String>,
+    secret_read: BTreeSet<(String, String)>,
     ui: BTreeSet<String>,
     connection_list: bool,
 }
@@ -36,11 +38,30 @@ impl PermissionSet {
         self.connection_list
     }
 
+    pub fn allows_fs_read(&self, path: &str) -> bool {
+        self.fs_read.contains(path)
+    }
+
+    pub fn allows_secret_read(&self, namespace: &str, key: &str) -> bool {
+        self.secret_read
+            .contains(&(namespace.to_string(), key.to_string()))
+            || self
+                .secret_read
+                .contains(&(namespace.to_string(), "*".to_string()))
+    }
+
     fn add(&mut self, permission: &str) {
         if permission == "db:connections:list" {
             self.connection_list = true;
         } else if let Some(db) = DbPermission::parse(permission) {
             self.db.insert(db);
+        } else if let Some(path) = permission.strip_prefix("fs:read:") {
+            self.fs_read.insert(path.to_string());
+        } else if let Some(scope) = permission.strip_prefix("secrets:read:") {
+            if let Some((namespace, key)) = scope.split_once('.') {
+                self.secret_read
+                    .insert((namespace.to_string(), key.to_string()));
+            }
         } else if permission.starts_with("ui:") {
             self.ui.insert(permission.to_string());
         }
@@ -138,5 +159,24 @@ mod tests {
 
         assert!(permissions.allows_connection_list());
         assert!(!PermissionSet::new(["db:read:conn1"]).allows_connection_list());
+    }
+
+    #[test]
+    fn fs_read_permission_is_explicit() {
+        let permissions = PermissionSet::new([
+            "fs:read:~/Library/Application Support/Navicat/conn.plist",
+            "db:read:conn1",
+        ]);
+
+        assert!(permissions.allows_fs_read("~/Library/Application Support/Navicat/conn.plist"));
+        assert!(!permissions.allows_fs_read("~/Library/Application Support/Navicat/other.plist"));
+    }
+
+    #[test]
+    fn secret_read_permission_matches_namespace_and_key() {
+        let permissions = PermissionSet::new(["secrets:read:termius.localkey"]);
+
+        assert!(permissions.allows_secret_read("termius", "localkey"));
+        assert!(!permissions.allows_secret_read("termius", "other"));
     }
 }

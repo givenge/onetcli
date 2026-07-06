@@ -9,11 +9,13 @@ terminal = { workspace = true }
 public_mcp = { workspace = true }
 ssh = { workspace = true }
 sftp = { workspace = true }
-remote_file_editor = { workspace = true, features = ["ui"] }
+remote_file_editor = { workspace = true }
 
 # GPUI
 gpui = { workspace = true }
 gpui-component = { workspace = true }
+ai_chat_view = { workspace = true }
+agent_runtime = { workspace = true }
 one-core = { workspace = true }
 one-ui = { workspace = true }
 # Terminal emulation

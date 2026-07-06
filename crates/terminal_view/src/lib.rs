@@ -1,7 +1,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod addon;
-mod ai_context;
+pub mod broadcast_input;
 pub mod cd_completion;
 pub mod highlight_presets;
 pub mod history_prompt;
@@ -26,7 +26,7 @@ pub use settings::{
     TerminalHighlightRule, TerminalSettings, current_settings, init_settings, update_settings,
 };
 pub use sidebar::{SettingsPanel, SidebarPanel, TerminalSidebar, TerminalSidebarEvent};
-pub use ssh_form_window::{SshFormWindow, SshFormWindowConfig};
+pub use ssh_form_window::{SshFormPostSaveAction, SshFormWindow, SshFormWindowConfig};
 pub use terminal::terminal::{
     ConnectionState, SshTerminalConfig, Terminal, TerminalConnectionKind, TerminalModelEvent,
 };

@@ -1,4 +1,4 @@
-use crate::{ActiveTheme, PixelsExt as _};
+use crate::ActiveTheme;
 use gpui::{
     App, BoxShadow, Corners, DefiniteLength, Div, Edges, FocusHandle, Hsla, ParentElement, Pixels,
     Refineable, StyleRefinement, Styled, Window, div, point, px,
@@ -365,9 +365,10 @@ impl From<Pixels> for Size {
 }
 
 /// A trait for defining element that can be selected.
+#[allow(patterns_in_fns_without_body)]
 pub trait Selectable: Sized {
     /// Set the selected state of the element.
-    fn selected(self, selected: bool) -> Self;
+    fn selected(mut self, selected: bool) -> Self;
 
     /// Returns true if the element is selected.
     fn is_selected(&self) -> bool;
@@ -379,19 +380,21 @@ pub trait Selectable: Sized {
 }
 
 /// A trait for defining element that can be disabled.
+#[allow(patterns_in_fns_without_body)]
 pub trait Disableable {
     /// Set the disabled state of the element.
-    fn disabled(self, disabled: bool) -> Self;
+    fn disabled(mut self, disabled: bool) -> Self;
 }
 
 /// A trait for setting the size of an element.
 /// Size::Medium is use by default.
+#[allow(patterns_in_fns_without_body)]
 pub trait Sizable: Sized {
     /// Set the ui::Size of this element.
     ///
     /// Also can receive a `ButtonSize` to convert to `IconSize`,
     /// Or a `Pixels` to set a custom size: `px(30.)`
-    fn with_size(self, size: impl Into<Size>) -> Self;
+    fn with_size(mut self, size: impl Into<Size>) -> Self;
 
     /// Set to Size::XSmall
     #[inline(always)]

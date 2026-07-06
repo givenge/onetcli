@@ -1,34 +1,126 @@
+use crate::layout::TOOLBAR_WIDTH;
+use crate::sidebar_contribution::{
+    SidebarContribution, SidebarPanelChrome, SidebarPanelId, SidebarPanelPolicy, SidebarPlacement,
+    sidebar_panel_renders_header,
+};
+use crate::tab_actions::{
+    TAB_TITLE_METADATA_KEY, clear_tab_activity, duplicate_tab_id, mark_tab_activity,
+    normalize_title, resolve_tab_title,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AnyView, App, AppContext as _, Context, Corner, Decorations, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, RenderOnce, SharedString, Styled, Task, Window, WindowControlArea, div,
-    px,
+    Anchor, AnyElement, AnyView, App, AppContext as _, Bounds, Context, Decorations, DragMoveEvent,
+    Element, ElementId, Entity, EntityId, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderOnce, SharedString, Style, Styled,
+    Subscription, Task, Window, WindowControlArea, div, px, relative,
 };
 use gpui::{ScrollHandle, StatefulInteractiveElement as _};
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::list::{List, ListDelegate, ListState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::{
-    ActiveTheme, Icon, IconName, IndexPath, InteractiveElementExt as _, Selectable, Sizable, Size,
-    h_flex, v_flex,
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, InteractiveElementExt as _, Placement,
+    Selectable, Sizable, Size, h_flex, v_flex,
 };
+use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+const SIDEBAR_PANEL_MIN_SIZE: Pixels = px(120.0);
+const SIDEBAR_CENTER_MIN_SIZE: Pixels = px(160.0);
+const SIDEBAR_SIDE_DEFAULT_WIDTH: Pixels = px(320.0);
+const SIDEBAR_BOTTOM_DEFAULT_HEIGHT: Pixels = px(260.0);
+const SIDEBAR_HANDLE_PADDING: Pixels = px(4.0);
+const SIDEBAR_HANDLE_SIZE: Pixels = px(1.0);
+
 // ============================================================================
 // TabContainer Events
 // ============================================================================
+
+pub(crate) fn split_command_enabled(
+    container_split_enabled: bool,
+    tab_can_split: bool,
+    source_tab_count: usize,
+) -> bool {
+    container_split_enabled && tab_can_split && source_tab_count > 1
+}
+
+pub(crate) fn active_content_can_split_for_layout(
+    pinned_tab_active: bool,
+    pinned_tab_can_split: Option<bool>,
+    active_tab_can_split: Option<bool>,
+) -> bool {
+    if pinned_tab_active {
+        pinned_tab_can_split.unwrap_or(false)
+    } else {
+        active_tab_can_split.unwrap_or(false)
+    }
+}
+
+pub(crate) fn sidebar_panel_initial_visibility(policy: SidebarPanelPolicy) -> bool {
+    policy.initially_visible || !policy.hideable
+}
+
+pub(crate) fn sidebar_panel_uses_exclusive_slot(chrome: SidebarPanelChrome) -> bool {
+    chrome != SidebarPanelChrome::None
+}
+
+pub(crate) fn sidebar_panel_allows_resize(
+    chrome: SidebarPanelChrome,
+    side_width: Option<Pixels>,
+    bottom_height: Option<Pixels>,
+) -> bool {
+    if chrome == SidebarPanelChrome::None {
+        return false;
+    }
+
+    side_width.is_some_and(|width| width > TOOLBAR_WIDTH)
+        || bottom_height.is_some_and(|height| height > TOOLBAR_WIDTH)
+}
+
+pub(crate) fn sidebar_panel_allows_size_override(base_size: Option<Pixels>) -> bool {
+    base_size.is_none_or(|size| size > TOOLBAR_WIDTH)
+}
+
+pub(crate) fn sidebar_panel_should_hide_for_exclusive_target(
+    visible: bool,
+    placement: SidebarPlacement,
+    hideable: bool,
+    chrome: SidebarPanelChrome,
+    target_placement: SidebarPlacement,
+) -> bool {
+    visible
+        && placement == target_placement
+        && hideable
+        && sidebar_panel_uses_exclusive_slot(chrome)
+}
+
+pub(crate) fn sidebar_panel_blocks_exclusive_target(
+    visible: bool,
+    placement: SidebarPlacement,
+    hideable: bool,
+    chrome: SidebarPanelChrome,
+    target_placement: SidebarPlacement,
+) -> bool {
+    visible
+        && placement == target_placement
+        && !hideable
+        && sidebar_panel_uses_exclusive_slot(chrome)
+}
 
 /// Events emitted by TabContent
 #[derive(Debug, Clone)]
 pub enum TabContentEvent {
     /// Tab state changed
     StateChanged,
+    /// Tab content changed while it may be inactive.
+    ContentChanged,
 }
 
 /// Events emitted by TabContainer
@@ -40,6 +132,44 @@ pub enum TabContainerEvent {
     TabActivated { index: usize, id: String },
     /// A tab was closed
     TabClosed { id: String },
+    /// 请求分屏：将 `source` pane 中 `tab_index` 处的 tab
+    /// 移动到当前 pane 的 `placement` 方向新建的 pane 中（由上层 SplitTabContainer 处理）
+    SplitRequested {
+        placement: Placement,
+        source: Entity<TabContainer>,
+        tab_index: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidebarPanelOverride {
+    visible: bool,
+    placement: SidebarPlacement,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SidebarPanelSizeOverride {
+    side_width: Option<Pixels>,
+    bottom_height: Option<Pixels>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarResizeTarget {
+    id: SidebarPanelId,
+    placement: SidebarPlacement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedSidebarPanelState {
+    visible: bool,
+    placement: SidebarPlacement,
+}
+
+#[derive(Clone)]
+struct ResolvedSidebarContribution {
+    contribution: SidebarContribution,
+    placement: SidebarPlacement,
+    visible: bool,
 }
 
 // ============================================================================
@@ -128,6 +258,30 @@ pub trait TabContent: EventEmitter<TabContentEvent> + Render + Focusable {
         true
     }
 
+    /// Whether this tab can be renamed from the tab bar.
+    fn can_rename(&self, cx: &App) -> bool {
+        true
+    }
+
+    /// Called when the tab bar applies a custom title.
+    fn rename(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        true
+    }
+
+    /// Whether this tab can be duplicated from the tab bar menu.
+    fn can_duplicate(&self, cx: &App) -> bool {
+        false
+    }
+
+    /// Build a new content view for a duplicated tab.
+    fn duplicate(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn TabContentView>> {
+        None
+    }
+
     /// Called when tab becomes active
     fn on_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {}
 
@@ -153,6 +307,16 @@ pub trait TabContent: EventEmitter<TabContentEvent> + Render + Focusable {
     fn dump(&self, cx: &App) -> serde_json::Value {
         serde_json::Value::Null
     }
+
+    /// Sidebar panels contributed by this tab when it is the active tab.
+    fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution> {
+        Vec::new()
+    }
+
+    /// Whether this tab may be split into a new pane.
+    fn can_split(&self, cx: &App) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -168,6 +332,10 @@ pub trait TabContentView: 'static + Send + Sync {
     fn title(&self, cx: &App) -> SharedString;
     fn icon(&self, cx: &App) -> Option<Icon>;
     fn closeable(&self, cx: &App) -> bool;
+    fn can_rename(&self, cx: &App) -> bool;
+    fn rename(&self, title: &str, window: &mut Window, cx: &mut App) -> bool;
+    fn can_duplicate(&self, cx: &App) -> bool;
+    fn duplicate(&self, window: &mut Window, cx: &mut App) -> Option<Arc<dyn TabContentView>>;
     fn on_activate(&self, window: &mut Window, cx: &mut App);
     fn on_deactivate(&self, window: &mut Window, cx: &mut App);
     fn try_close(&self, tab_id: &str, window: &mut Window, cx: &mut App) -> Task<bool>;
@@ -175,6 +343,10 @@ pub trait TabContentView: 'static + Send + Sync {
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn view(&self) -> AnyView;
     fn dump(&self, cx: &App) -> serde_json::Value;
+    fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution>;
+    fn can_split(&self, cx: &App) -> bool;
+    fn subscribe_events(&self, window: &mut Window, cx: &mut Context<TabContainer>)
+    -> Subscription;
 }
 
 /// Blanket implementation: Entity<T: TabContent> automatically implements TabContentView
@@ -197,6 +369,22 @@ impl<T: TabContent> TabContentView for Entity<T> {
 
     fn closeable(&self, cx: &App) -> bool {
         self.read(cx).closeable(cx)
+    }
+
+    fn can_rename(&self, cx: &App) -> bool {
+        self.read(cx).can_rename(cx)
+    }
+
+    fn rename(&self, title: &str, window: &mut Window, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| this.rename(title, window, cx))
+    }
+
+    fn can_duplicate(&self, cx: &App) -> bool {
+        self.read(cx).can_duplicate(cx)
+    }
+
+    fn duplicate(&self, window: &mut Window, cx: &mut App) -> Option<Arc<dyn TabContentView>> {
+        self.update(cx, |this, cx| this.duplicate(window, cx))
     }
 
     fn on_activate(&self, window: &mut Window, cx: &mut App) {
@@ -226,6 +414,28 @@ impl<T: TabContent> TabContentView for Entity<T> {
 
     fn dump(&self, cx: &App) -> serde_json::Value {
         self.read(cx).dump(cx)
+    }
+
+    fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution> {
+        self.read(cx).sidebar_contributions(cx)
+    }
+
+    fn can_split(&self, cx: &App) -> bool {
+        self.read(cx).can_split(cx)
+    }
+
+    fn subscribe_events(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<TabContainer>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            self,
+            window,
+            |container, content, event: &TabContentEvent, _window, cx| {
+                container.handle_tab_content_event(content.entity_id(), event, cx);
+            },
+        )
     }
 }
 
@@ -285,6 +495,33 @@ impl TabItem {
 
     pub fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
+    }
+
+    pub fn title(&self, cx: &App) -> SharedString {
+        resolve_tab_title(
+            self.metadata
+                .get(TAB_TITLE_METADATA_KEY)
+                .map(String::as_str),
+            self.content().title(cx),
+        )
+    }
+
+    fn set_title_override(&mut self, title: &str) -> bool {
+        match normalize_title(title) {
+            Some(title) => {
+                if self
+                    .metadata
+                    .get(TAB_TITLE_METADATA_KEY)
+                    .is_some_and(|current| current == &title)
+                {
+                    return false;
+                }
+                self.metadata
+                    .insert(TAB_TITLE_METADATA_KEY.to_string(), title);
+                true
+            }
+            None => self.metadata.remove(TAB_TITLE_METADATA_KEY).is_some(),
+        }
     }
 }
 
@@ -406,11 +643,22 @@ impl Render for TabBarDragState {
 pub struct DragTab {
     pub tab_index: usize,
     pub title: SharedString,
+    /// 拖拽来源 pane（split 场景下用于跨 pane 移动 tab）
+    pub source_pane: Option<Entity<TabContainer>>,
 }
 
 impl DragTab {
     pub fn new(tab_index: usize, title: SharedString) -> Self {
-        Self { tab_index, title }
+        Self {
+            tab_index,
+            title,
+            source_pane: None,
+        }
+    }
+
+    pub fn with_source_pane(mut self, pane: Entity<TabContainer>) -> Self {
+        self.source_pane = Some(pane);
+        self
     }
 }
 
@@ -531,7 +779,7 @@ impl RenderOnce for TabListItem {
                             .map(|(idx, tab)| {
                                 (
                                     idx,
-                                    tab.content().title(cx),
+                                    tab.title(cx),
                                     tab.content().icon(cx),
                                     tab.content().closeable(cx),
                                 )
@@ -702,16 +950,27 @@ pub struct TabContainer {
     list_popover_open: bool,
     tab_list: Option<Entity<ListState<TabListDelegate>>>,
     closing_tabs: HashSet<SharedString>,
+    activity_tabs: HashSet<String>,
+    tab_content_subscriptions: Vec<Subscription>,
+    renaming_tab_id: Option<SharedString>,
+    rename_input: Option<Entity<InputState>>,
+    rename_input_subscription: Option<Subscription>,
     show_window_controls: bool,
     trailing_controls: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     /// 窗口置顶切换回调，由上层注入；为 None 时不渲染置顶按钮
     on_toggle_always_on_top: Option<Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
     /// 当前窗口置顶状态读取器，由上层注入
     is_always_on_top: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    /// Pinned tab that stays fixed before the scrollable tab list
-    pinned_tab: Option<TabItem>,
-    /// Whether the pinned tab is currently active (showing its content)
-    pinned_tab_active: bool,
+    /// Pinned tabs that stay fixed before the scrollable tab list.
+    pinned_tabs: Vec<TabItem>,
+    /// Active pinned tab index. When `None`, a regular tab is active.
+    active_pinned_index: Option<usize>,
+    split_enabled: bool,
+    will_split_placement: Option<Placement>,
+    sidebar_overrides: HashMap<SidebarPanelId, SidebarPanelOverride>,
+    sidebar_size_overrides: HashMap<SidebarPanelId, SidebarPanelSizeOverride>,
+    sidebar_resizing: Option<SidebarResizeTarget>,
+    sidebar_bounds: Bounds<Pixels>,
 }
 
 impl EventEmitter<TabContainerEvent> for TabContainer {}
@@ -738,12 +997,23 @@ impl TabContainer {
             list_popover_open: false,
             tab_list: None,
             closing_tabs: HashSet::new(),
+            activity_tabs: HashSet::new(),
+            tab_content_subscriptions: Vec::new(),
+            renaming_tab_id: None,
+            rename_input: None,
+            rename_input_subscription: None,
             show_window_controls: false,
             trailing_controls: None,
             on_toggle_always_on_top: None,
             is_always_on_top: None,
-            pinned_tab: None,
-            pinned_tab_active: false,
+            pinned_tabs: Vec::new(),
+            active_pinned_index: None,
+            split_enabled: false,
+            will_split_placement: None,
+            sidebar_overrides: HashMap::new(),
+            sidebar_size_overrides: HashMap::new(),
+            sidebar_resizing: None,
+            sidebar_bounds: Bounds::default(),
         }
     }
 
@@ -797,11 +1067,8 @@ impl TabContainer {
         self
     }
 
-    pub fn with_trailing_controls(
-        mut self,
-        render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
-    ) -> Self {
-        self.trailing_controls = Some(Rc::new(render));
+    pub fn with_split_enabled(mut self, enabled: bool) -> Self {
+        self.split_enabled = enabled;
         self
     }
 
@@ -819,31 +1086,63 @@ impl TabContainer {
 
     /// Set a pinned tab that stays fixed before the scrollable tab list.
     /// The pinned tab is always visible and cannot be scrolled away.
+    ///
+    /// This compatibility API replaces any existing pinned tabs with one tab.
     pub fn set_pinned_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
-        self.pinned_tab = Some(tab);
-        self.pinned_tab_active = self.tabs.is_empty();
+        self.pinned_tabs.clear();
+        self.pinned_tabs.push(tab);
+        self.active_pinned_index = self.tabs.is_empty().then_some(0);
         cx.notify();
     }
 
-    /// Returns whether the pinned tab is currently active.
-    pub fn is_pinned_tab_active(&self) -> bool {
-        self.pinned_tab_active
-    }
-
-    /// Returns whether a pinned tab exists.
-    pub fn has_pinned_tab(&self) -> bool {
-        self.pinned_tab.is_some()
-    }
-
-    /// Activate the pinned tab (deactivate regular tabs visually).
-    pub fn activate_pinned_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pinned_tab.is_some() {
-            self.pinned_tab_active = true;
-            if let Some(pinned) = &self.pinned_tab {
-                pinned.content().focus_handle(cx).focus(window, cx);
-            }
-            cx.notify();
+    /// Add a pinned tab that stays fixed before the scrollable tab list.
+    pub fn add_pinned_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
+        self.pinned_tabs.push(tab);
+        if self.tabs.is_empty() && self.active_pinned_index.is_none() {
+            self.active_pinned_index = Some(0);
         }
+        cx.notify();
+    }
+
+    /// Returns whether any pinned tab is currently active.
+    pub fn is_pinned_tab_active(&self) -> bool {
+        self.active_pinned_index.is_some()
+    }
+
+    /// Returns the active pinned tab index, if any.
+    pub fn active_pinned_index(&self) -> Option<usize> {
+        self.active_pinned_index
+    }
+
+    /// Returns whether at least one pinned tab exists.
+    pub fn has_pinned_tab(&self) -> bool {
+        !self.pinned_tabs.is_empty()
+    }
+
+    /// Returns the number of pinned tabs.
+    pub fn pinned_tab_count(&self) -> usize {
+        self.pinned_tabs.len()
+    }
+
+    /// Activate the first pinned tab (deactivate regular tabs visually).
+    pub fn activate_pinned_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_pinned_tab_at(0, window, cx);
+    }
+
+    /// Activate a pinned tab by index.
+    pub fn activate_pinned_tab_at(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pinned) = self.pinned_tabs.get(index) else {
+            return;
+        };
+        self.active_pinned_index = Some(index);
+        pinned.content().focus_handle(cx).focus(window, cx);
+        cx.emit(TabContainerEvent::LayoutChanged);
+        cx.notify();
     }
 
     pub fn set_tab_bar_bg_color(
@@ -889,12 +1188,63 @@ impl TabContainer {
         cx.notify();
     }
 
+    fn subscribe_tab_content(
+        &mut self,
+        tab: &TabItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_content_subscriptions
+            .push(tab.content().subscribe_events(window, cx));
+    }
+
+    fn handle_tab_content_event(
+        &mut self,
+        content_id: EntityId,
+        event: &TabContentEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TabContentEvent::StateChanged => {
+                cx.emit(TabContainerEvent::LayoutChanged);
+                cx.notify();
+            }
+            TabContentEvent::ContentChanged => {
+                if self.mark_content_activity(content_id, cx) {
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn mark_content_activity(&mut self, content_id: EntityId, cx: &App) -> bool {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.content().content_id(cx) == content_id)
+        else {
+            return false;
+        };
+        let tab_id = self.tabs[index].id().to_string();
+        let tab_is_active = self.regular_tab_is_active(index);
+        mark_tab_activity(&mut self.activity_tabs, &tab_id, tab_is_active)
+    }
+
+    fn regular_tab_is_active(&self, index: usize) -> bool {
+        self.active_pinned_index.is_none() && index == self.active_index
+    }
+
+    fn active_pinned_tab(&self) -> Option<&TabItem> {
+        self.active_pinned_index
+            .and_then(|index| self.pinned_tabs.get(index))
+    }
+
     /// Add a new tab and activate it
     pub fn add_and_activate_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
         let id = tab.id().to_string();
         self.tabs.push(tab);
         self.active_index = self.tabs.len() - 1;
-        self.pinned_tab_active = false;
+        self.active_pinned_index = None;
         self.tab_bar_scroll_handle
             .scroll_to_item(self.tabs.len() - 1);
         cx.emit(TabContainerEvent::TabActivated {
@@ -936,9 +1286,10 @@ impl TabContainer {
     ) {
         let id = tab.id().to_string();
         let focus_handle = tab.content.focus_handle(cx);
+        self.subscribe_tab_content(&tab, window, cx);
         self.tabs.push(tab);
         self.active_index = self.tabs.len() - 1;
-        self.pinned_tab_active = false;
+        self.active_pinned_index = None;
         self.tab_bar_scroll_handle
             .scroll_to_item(self.tabs.len() - 1);
 
@@ -1003,13 +1354,12 @@ impl TabContainer {
             let removed_tab_id = self.tabs[index].id();
             self.tabs.remove(index);
             self.closing_tabs.remove(&removed_tab_id);
+            clear_tab_activity(&mut self.activity_tabs, removed_tab_id.as_ref());
 
             if self.tabs.is_empty() {
                 // All regular tabs closed, activate pinned tab if present
                 self.active_index = 0;
-                if self.pinned_tab.is_some() {
-                    self.pinned_tab_active = true;
-                }
+                self.active_pinned_index = (!self.pinned_tabs.is_empty()).then_some(0);
             } else if index < self.active_index {
                 self.active_index -= 1;
             } else if index == self.active_index {
@@ -1327,13 +1677,15 @@ impl TabContainer {
 
     /// Set the active tab by index
     pub fn set_active_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.tabs.len() && (index != self.active_index || self.pinned_tab_active) {
-            if self.pinned_tab_active {
+        if index < self.tabs.len()
+            && (index != self.active_index || self.active_pinned_index.is_some())
+        {
+            if self.active_pinned_index.is_some() {
                 // Deactivate pinned tab
-                if let Some(pinned) = &self.pinned_tab {
+                if let Some(pinned) = self.active_pinned_tab() {
                     pinned.content().on_deactivate(window, cx);
                 }
-                self.pinned_tab_active = false;
+                self.active_pinned_index = None;
             } else if let Some(old_tab) = self.tabs.get(self.active_index) {
                 old_tab.content().on_deactivate(window, cx);
             }
@@ -1348,6 +1700,7 @@ impl TabContainer {
             } else {
                 String::new()
             };
+            clear_tab_activity(&mut self.activity_tabs, &tab_id);
 
             cx.emit(TabContainerEvent::TabActivated { index, id: tab_id });
             cx.emit(TabContainerEvent::LayoutChanged);
@@ -1367,6 +1720,15 @@ impl TabContainer {
         self.tabs.get(self.active_index)
     }
 
+    pub fn active_content_can_split(&self, cx: &App) -> bool {
+        let active_pinned_tab = self.active_pinned_tab();
+        active_content_can_split_for_layout(
+            active_pinned_tab.is_some(),
+            active_pinned_tab.map(|tab| tab.content().can_split(cx)),
+            self.active_tab().map(|tab| tab.content().can_split(cx)),
+        )
+    }
+
     pub fn set_size(&mut self, size: Size, cx: &mut Context<Self>) {
         self.size = size;
         cx.notify();
@@ -1381,8 +1743,111 @@ impl TabContainer {
         &self.tabs
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
     pub fn active_index(&self) -> usize {
         self.active_index
+    }
+
+    fn start_rename_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !tab.content().can_rename(cx) {
+            return;
+        }
+
+        let tab_id = tab.id();
+        let current_title = tab.title(cx).to_string();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(current_title)
+                .placeholder(t!("TabContextMenu.tab_name_placeholder").to_string())
+        });
+        let input_for_focus = input.clone();
+        let rename_tab_id = tab_id.clone();
+
+        self.renaming_tab_id = Some(tab_id);
+        self.rename_input = Some(input.clone());
+        self.rename_input_subscription = Some(cx.subscribe_in(
+            &input,
+            window,
+            move |container, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    let title = input.read(cx).value().to_string();
+                    container.commit_rename_tab_by_id(&rename_tab_id, title, window, cx);
+                }
+                InputEvent::Change | InputEvent::Focus => {}
+            },
+        ));
+        input_for_focus.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn commit_rename_tab_by_id(
+        &mut self,
+        tab_id: &str,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.renaming_tab_id.as_ref().map(SharedString::as_ref) != Some(tab_id) {
+            return;
+        }
+        self.renaming_tab_id = None;
+        self.rename_input = None;
+        self.rename_input_subscription = None;
+
+        let Some(index) = self.tabs.iter().position(|tab| tab.id() == tab_id) else {
+            cx.notify();
+            return;
+        };
+        if !self.tabs[index].content().rename(&title, window, cx) {
+            cx.notify();
+            return;
+        }
+        if self.tabs[index].set_title_override(&title) {
+            cx.emit(TabContainerEvent::LayoutChanged);
+        }
+        cx.notify();
+    }
+
+    fn duplicate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+
+        let content = self.tabs[index].content().clone();
+        if !content.can_duplicate(cx) {
+            return;
+        }
+
+        let Some(duplicate_content) = content.duplicate(window, cx) else {
+            return;
+        };
+
+        let source_id = self.tabs[index].id();
+        let duplicate_id = duplicate_tab_id(source_id.as_ref(), |candidate| {
+            self.tabs.iter().any(|tab| tab.id() == candidate)
+        });
+        let from = self.tabs[index].from();
+        let metadata = self.tabs[index].metadata().clone();
+        let duplicate = TabItem {
+            id: SharedString::from(duplicate_id.clone()),
+            from,
+            metadata,
+            content: duplicate_content,
+        };
+        self.subscribe_tab_content(&duplicate, window, cx);
+
+        let insert_index = (index + 1).min(self.tabs.len());
+        if insert_index <= self.active_index {
+            self.active_index += 1;
+        }
+        self.tabs.insert(insert_index, duplicate);
+        self.set_active_index(insert_index, window, cx);
     }
 
     pub fn dump(&self, cx: &App) -> TabContainerState {
@@ -1447,6 +1912,7 @@ impl TabContainer {
         cx: &mut App,
     ) {
         self.tabs.clear();
+        self.activity_tabs.clear();
 
         for tab_state in &state.tabs {
             if let Some(content) = registry.build(tab_state, window, cx) {
@@ -1511,6 +1977,53 @@ impl TabContainer {
         cx.notify();
     }
 
+    pub fn take_tab(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TabItem> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+
+        let was_active = self.active_pinned_index.is_none() && index == self.active_index;
+        let tab = self.tabs.remove(index);
+        clear_tab_activity(&mut self.activity_tabs, tab.id().as_ref());
+
+        if self.tabs.is_empty() {
+            self.active_index = 0;
+            self.active_pinned_index = (!self.pinned_tabs.is_empty()).then_some(0);
+            if let Some(pinned) = self.active_pinned_tab() {
+                pinned.content().on_activate(window, cx);
+            }
+        } else {
+            if index < self.active_index {
+                self.active_index -= 1;
+            } else if self.active_index >= self.tabs.len() {
+                self.active_index = self.tabs.len() - 1;
+            }
+            if was_active {
+                self.tabs[self.active_index]
+                    .content()
+                    .on_activate(window, cx);
+            }
+        }
+
+        cx.emit(TabContainerEvent::LayoutChanged);
+        cx.notify();
+        Some(tab)
+    }
+
+    pub fn insert_tab_at_end_and_activate(
+        &mut self,
+        tab: TabItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_and_activate_tab_with_focus(tab, window, cx);
+    }
+
     fn get_tab_width(&self, tab: &TabItem, cx: &App) -> gpui::Pixels {
         let size = tab.content().width_size(cx).unwrap_or(self.size);
         self.size_to_pixels(size)
@@ -1526,18 +2039,1033 @@ impl TabContainer {
         }
     }
 
-    pub fn render_tab_content(&self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let active_view = if self.pinned_tab_active {
-            self.pinned_tab.as_ref().map(|tab| tab.content().view())
-        } else {
-            self.active_tab().map(|tab| tab.content().view())
+    fn active_sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution> {
+        if let Some(tab) = self.active_pinned_tab() {
+            return tab.content().sidebar_contributions(cx);
+        }
+
+        self.active_tab()
+            .map(|tab| tab.content().sidebar_contributions(cx))
+            .unwrap_or_default()
+    }
+
+    fn resolve_sidebar_panel_state(
+        &self,
+        id: &SidebarPanelId,
+        default_placement: SidebarPlacement,
+        policy: SidebarPanelPolicy,
+    ) -> ResolvedSidebarPanelState {
+        let default_placement = normalize_sidebar_placement(default_placement, policy);
+        let Some(override_state) = self.sidebar_overrides.get(id).copied() else {
+            return ResolvedSidebarPanelState {
+                visible: sidebar_panel_initial_visibility(policy),
+                placement: default_placement,
+            };
         };
 
+        let placement =
+            if policy.movable && policy.allowed_placements.contains(override_state.placement) {
+                override_state.placement
+            } else {
+                default_placement
+            };
+        let visible = if policy.hideable {
+            override_state.visible
+        } else {
+            true
+        };
+
+        ResolvedSidebarPanelState { visible, placement }
+    }
+
+    fn valid_sidebar_override_placement(
+        &self,
+        id: &SidebarPanelId,
+        default_placement: SidebarPlacement,
+        policy: SidebarPanelPolicy,
+    ) -> SidebarPlacement {
+        self.sidebar_overrides
+            .get(id)
+            .map(|override_state| override_state.placement)
+            .filter(|placement| policy.movable && policy.allowed_placements.contains(*placement))
+            .unwrap_or_else(|| normalize_sidebar_placement(default_placement, policy))
+    }
+
+    fn sidebar_target_blocked(
+        &self,
+        id: &SidebarPanelId,
+        placement: SidebarPlacement,
+        cx: &App,
+    ) -> bool {
+        self.active_sidebar_contributions(cx)
+            .into_iter()
+            .filter(|contribution| contribution.id != *id)
+            .any(|contribution| {
+                let state = self.resolve_sidebar_panel_state(
+                    &contribution.id,
+                    contribution.default_placement,
+                    contribution.policy,
+                );
+                sidebar_panel_blocks_exclusive_target(
+                    state.visible,
+                    state.placement,
+                    contribution.policy.hideable,
+                    contribution.chrome,
+                    placement,
+                )
+            })
+    }
+
+    fn hide_sidebar_peers_at_placement(
+        &mut self,
+        id: &SidebarPanelId,
+        placement: SidebarPlacement,
+        cx: &App,
+    ) {
+        let peers = self
+            .active_sidebar_contributions(cx)
+            .into_iter()
+            .filter(|contribution| contribution.id != *id)
+            .filter_map(|contribution| {
+                let state = self.resolve_sidebar_panel_state(
+                    &contribution.id,
+                    contribution.default_placement,
+                    contribution.policy,
+                );
+                sidebar_panel_should_hide_for_exclusive_target(
+                    state.visible,
+                    state.placement,
+                    contribution.policy.hideable,
+                    contribution.chrome,
+                    placement,
+                )
+                .then_some((contribution.id, state.placement))
+            })
+            .collect::<Vec<_>>();
+
+        for (id, placement) in peers {
+            self.sidebar_overrides.insert(
+                id,
+                SidebarPanelOverride {
+                    visible: false,
+                    placement,
+                },
+            );
+        }
+    }
+
+    fn move_sidebar_panel(
+        &mut self,
+        id: SidebarPanelId,
+        placement: SidebarPlacement,
+        policy: SidebarPanelPolicy,
+        cx: &App,
+    ) {
+        if !policy.movable || !policy.allowed_placements.contains(placement) {
+            return;
+        }
+        if self.sidebar_target_blocked(&id, placement, cx) {
+            return;
+        }
+        self.hide_sidebar_peers_at_placement(&id, placement, cx);
+        let visible = self
+            .sidebar_overrides
+            .get(&id)
+            .map(|override_state| override_state.visible || !policy.hideable)
+            .unwrap_or(true);
+        self.sidebar_overrides
+            .insert(id, SidebarPanelOverride { visible, placement });
+    }
+
+    fn hide_sidebar_panel(
+        &mut self,
+        id: SidebarPanelId,
+        default_placement: SidebarPlacement,
+        policy: SidebarPanelPolicy,
+    ) {
+        if !policy.hideable {
+            return;
+        }
+        let placement = self.valid_sidebar_override_placement(&id, default_placement, policy);
+        self.sidebar_overrides.insert(
+            id,
+            SidebarPanelOverride {
+                visible: false,
+                placement,
+            },
+        );
+    }
+
+    fn show_sidebar_panel(
+        &mut self,
+        id: SidebarPanelId,
+        default_placement: SidebarPlacement,
+        policy: SidebarPanelPolicy,
+        cx: &App,
+    ) {
+        let placement = self.valid_sidebar_override_placement(&id, default_placement, policy);
+        if self.sidebar_target_blocked(&id, placement, cx) {
+            return;
+        }
+        self.hide_sidebar_peers_at_placement(&id, placement, cx);
+        self.sidebar_overrides.insert(
+            id,
+            SidebarPanelOverride {
+                visible: true,
+                placement,
+            },
+        );
+    }
+
+    fn resolved_sidebar_panels(&self, cx: &App) -> Vec<ResolvedSidebarContribution> {
+        self.active_sidebar_contributions(cx)
+            .into_iter()
+            .map(|contribution| {
+                let state = self.resolve_sidebar_panel_state(
+                    &contribution.id,
+                    contribution.default_placement,
+                    contribution.policy,
+                );
+                ResolvedSidebarContribution {
+                    contribution,
+                    placement: state.placement,
+                    visible: state.visible,
+                }
+            })
+            .collect()
+    }
+
+    fn sidebar_panels_for(
+        panels: &[ResolvedSidebarContribution],
+        placement: SidebarPlacement,
+    ) -> Vec<ResolvedSidebarContribution> {
+        let mut exclusive_slot_taken = false;
+        panels
+            .iter()
+            .filter_map(|panel| {
+                if !panel.visible || panel.placement != placement {
+                    return None;
+                }
+                if !sidebar_panel_uses_exclusive_slot(panel.contribution.chrome) {
+                    return Some(panel.clone());
+                }
+                if exclusive_slot_taken {
+                    return None;
+                }
+                exclusive_slot_taken = true;
+                Some(panel.clone())
+            })
+            .collect()
+    }
+
+    fn hidden_sidebar_panels(
+        panels: &[ResolvedSidebarContribution],
+    ) -> Vec<ResolvedSidebarContribution> {
+        panels
+            .iter()
+            .filter(|panel| !panel.visible && panel.contribution.policy.hideable)
+            .cloned()
+            .collect()
+    }
+
+    fn sidebar_panel_side_width(&self, contribution: &SidebarContribution) -> Pixels {
+        if !sidebar_panel_allows_size_override(contribution.size.side_width) {
+            return contribution.size.side_width.unwrap_or(TOOLBAR_WIDTH);
+        }
+
+        self.sidebar_size_overrides
+            .get(&contribution.id)
+            .and_then(|size| size.side_width)
+            .or(contribution.size.side_width)
+            .unwrap_or(SIDEBAR_SIDE_DEFAULT_WIDTH)
+    }
+
+    fn sidebar_panel_bottom_height(&self, contribution: &SidebarContribution) -> Pixels {
+        if !sidebar_panel_allows_size_override(contribution.size.bottom_height) {
+            return contribution.size.bottom_height.unwrap_or(TOOLBAR_WIDTH);
+        }
+
+        self.sidebar_size_overrides
+            .get(&contribution.id)
+            .and_then(|size| size.bottom_height)
+            .or(contribution.size.bottom_height)
+            .unwrap_or(SIDEBAR_BOTTOM_DEFAULT_HEIGHT)
+    }
+
+    fn sidebar_side_width(&self, panels: &[ResolvedSidebarContribution]) -> Pixels {
+        panels
+            .iter()
+            .map(|panel| self.sidebar_panel_side_width(&panel.contribution))
+            .fold(px(0.0), |total, width| total + width)
+    }
+
+    fn sidebar_bottom_height(&self, panels: &[ResolvedSidebarContribution]) -> Pixels {
+        panels
+            .iter()
+            .map(|panel| self.sidebar_panel_bottom_height(&panel.contribution))
+            .max_by(|left, right| f32::from(*left).total_cmp(&f32::from(*right)))
+            .unwrap_or(SIDEBAR_BOTTOM_DEFAULT_HEIGHT)
+    }
+
+    fn render_sidebar_dock(
+        &self,
+        placement: SidebarPlacement,
+        panels: Vec<ResolvedSidebarContribution>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if panels.is_empty() {
+            return div().size_full().into_any_element();
+        }
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "tab-sidebar-dock-{placement:?}"
+            )))
+            .size_full()
+            .overflow_hidden()
+            .children(
+                panels
+                    .into_iter()
+                    .map(|panel| self.render_sidebar_panel_slot(panel, placement, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar_panel_slot(
+        &self,
+        panel: ResolvedSidebarContribution,
+        placement: SidebarPlacement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let contribution = panel.contribution;
+        let side_width = self.sidebar_panel_side_width(&contribution);
+        let bottom_height = self.sidebar_panel_bottom_height(&contribution);
+        let can_resize = match placement {
+            SidebarPlacement::Left | SidebarPlacement::Right => {
+                sidebar_panel_allows_resize(contribution.chrome, Some(side_width), None)
+            }
+            SidebarPlacement::Bottom => {
+                sidebar_panel_allows_resize(contribution.chrome, None, Some(bottom_height))
+            }
+        };
         div()
+            .relative()
+            .h_full()
+            .overflow_hidden()
+            .flex_shrink_0()
+            .map(|this| match placement {
+                SidebarPlacement::Left | SidebarPlacement::Right => this.w(side_width),
+                SidebarPlacement::Bottom => this.flex_1().min_w(SIDEBAR_PANEL_MIN_SIZE),
+            })
+            .child(self.render_sidebar_panel_frame(contribution.clone(), cx))
+            .when(can_resize, |this| {
+                this.child(self.render_sidebar_resize_handle(contribution.id, placement, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_sidebar_resize_handle(
+        &self,
+        id: SidebarPanelId,
+        placement: SidebarPlacement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let container = cx.entity();
+        let handle_id = SharedString::from(format!(
+            "tab-sidebar-resize-{placement:?}-{}-{}",
+            id.owner, id.local_id
+        ));
+        let neg_offset = -SIDEBAR_HANDLE_PADDING;
+        let drag_border = cx.theme().drag_border;
+        let border = cx.theme().border;
+
+        div()
+            .id(handle_id)
+            .occlude()
+            .absolute()
+            .flex_shrink_0()
+            .group("tab-sidebar-resize-handle")
+            .map(|this| match placement {
+                SidebarPlacement::Left => this
+                    .cursor_col_resize()
+                    .top_0()
+                    .right(px(1.0))
+                    .h_full()
+                    .w(SIDEBAR_HANDLE_SIZE)
+                    .pl(SIDEBAR_HANDLE_PADDING),
+                SidebarPlacement::Right => this
+                    .cursor_col_resize()
+                    .top_0()
+                    .left(px(1.0))
+                    .h_full()
+                    .w(SIDEBAR_HANDLE_SIZE)
+                    .pr(SIDEBAR_HANDLE_PADDING),
+                SidebarPlacement::Bottom => this
+                    .cursor_row_resize()
+                    .top(neg_offset)
+                    .left_0()
+                    .w_full()
+                    .h(SIDEBAR_HANDLE_SIZE)
+                    .py(SIDEBAR_HANDLE_PADDING),
+            })
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+                container.update(cx, |container, cx| {
+                    container.sidebar_resizing = Some(SidebarResizeTarget {
+                        id: id.clone(),
+                        placement,
+                    });
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .bg(border)
+                    .group_hover("tab-sidebar-resize-handle", move |this| {
+                        this.bg(drag_border)
+                    })
+                    .map(|this| match placement {
+                        SidebarPlacement::Left | SidebarPlacement::Right => {
+                            this.h_full().w(SIDEBAR_HANDLE_SIZE)
+                        }
+                        SidebarPlacement::Bottom => this.w_full().h(SIDEBAR_HANDLE_SIZE),
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar_panel_frame(
+        &self,
+        contribution: SidebarContribution,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if contribution.chrome == SidebarPanelChrome::None {
+            return div()
+                .id(SharedString::from(format!(
+                    "tab-sidebar-panel-{}-{}",
+                    contribution.id.owner, contribution.id.local_id
+                )))
+                .size_full()
+                .overflow_hidden()
+                .child(contribution.view)
+                .into_any_element();
+        }
+
+        let background = contribution
+            .style
+            .background
+            .unwrap_or(cx.theme().background);
+        let border = contribution.style.border.unwrap_or(cx.theme().border);
+        v_flex()
+            .id(SharedString::from(format!(
+                "tab-sidebar-panel-{}-{}",
+                contribution.id.owner, contribution.id.local_id
+            )))
+            .size_full()
+            .overflow_hidden()
+            .bg(background)
+            .border_1()
+            .border_color(border)
+            .when(sidebar_panel_renders_header(contribution.chrome), |this| {
+                this.child(self.render_sidebar_panel_header(contribution.clone(), cx))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(contribution.view),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar_panel_header(
+        &self,
+        contribution: SidebarContribution,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border = contribution.style.border.unwrap_or(cx.theme().border);
+        let header_background = contribution.style.header_background.unwrap_or_else(|| {
+            contribution
+                .style
+                .background
+                .unwrap_or(cx.theme().background)
+        });
+        let text_color = contribution.style.text.unwrap_or(cx.theme().foreground);
+        h_flex()
+            .id(SharedString::from(format!(
+                "tab-sidebar-header-{}-{}",
+                contribution.id.owner, contribution.id.local_id
+            )))
+            .h(px(34.0))
+            .px_2()
+            .gap_2()
+            .items_center()
+            .bg(header_background)
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Icon::new(contribution.icon.clone())
+                    .with_size(Size::Small)
+                    .text_color(text_color),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_sm()
+                    .text_color(text_color)
+                    .child(contribution.title.clone()),
+            )
+            .children(self.render_sidebar_panel_controls(contribution, cx))
+            .into_any_element()
+    }
+
+    fn render_sidebar_panel_controls(
+        &self,
+        contribution: SidebarContribution,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut controls = Vec::new();
+        if contribution.policy.movable {
+            controls.push(self.render_sidebar_move_button(
+                contribution.clone(),
+                SidebarPlacement::Left,
+                "Move left",
+                cx,
+            ));
+            controls.push(self.render_sidebar_move_button(
+                contribution.clone(),
+                SidebarPlacement::Right,
+                "Move right",
+                cx,
+            ));
+            controls.push(self.render_sidebar_move_button(
+                contribution.clone(),
+                SidebarPlacement::Bottom,
+                "Move bottom",
+                cx,
+            ));
+        }
+        if contribution.policy.hideable {
+            controls.push(self.render_sidebar_hide_button(contribution, cx));
+        }
+        controls
+    }
+
+    fn render_sidebar_move_button(
+        &self,
+        contribution: SidebarContribution,
+        placement: SidebarPlacement,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let enabled = contribution.policy.allowed_placements.contains(placement);
+        let icon = match placement {
+            SidebarPlacement::Left => IconName::PanelLeft,
+            SidebarPlacement::Right => IconName::PanelRight,
+            SidebarPlacement::Bottom => IconName::PanelBottom,
+        };
+        let container = cx.entity();
+        Button::new(SharedString::from(format!(
+            "tab-sidebar-move-{placement:?}-{}-{}",
+            contribution.id.owner, contribution.id.local_id
+        )))
+        .icon(icon)
+        .ghost()
+        .compact()
+        .tooltip(tooltip)
+        .disabled(!enabled)
+        .on_click(move |_, window, cx| {
+            if let Some(move_to) = contribution.actions.move_to.as_ref() {
+                move_to(placement, window, cx);
+            } else {
+                container.update(cx, |container, cx| {
+                    container.move_sidebar_panel(
+                        contribution.id.clone(),
+                        placement,
+                        contribution.policy,
+                        cx,
+                    );
+                    cx.notify();
+                });
+            }
+        })
+        .into_any_element()
+    }
+
+    fn render_sidebar_hide_button(
+        &self,
+        contribution: SidebarContribution,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let container = cx.entity();
+        Button::new(SharedString::from(format!(
+            "tab-sidebar-hide-{}-{}",
+            contribution.id.owner, contribution.id.local_id
+        )))
+        .icon(IconName::EyeOff)
+        .ghost()
+        .compact()
+        .tooltip("Hide panel")
+        .on_click(move |_, window, cx| {
+            if let Some(close) = contribution.actions.close.as_ref() {
+                close(window, cx);
+            } else {
+                container.update(cx, |container, cx| {
+                    container.hide_sidebar_panel(
+                        contribution.id.clone(),
+                        contribution.default_placement,
+                        contribution.policy,
+                    );
+                    cx.notify();
+                });
+            }
+        })
+        .into_any_element()
+    }
+
+    fn render_hidden_sidebar_launcher(
+        &self,
+        panels: Vec<ResolvedSidebarContribution>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if panels.is_empty() {
+            return div().into_any_element();
+        }
+        let container = cx.entity();
+        let background = panels
+            .first()
+            .and_then(|panel| panel.contribution.style.background)
+            .unwrap_or(cx.theme().background);
+        let border = panels
+            .first()
+            .and_then(|panel| panel.contribution.style.border)
+            .unwrap_or(cx.theme().border);
+        h_flex()
+            .id("tab-sidebar-hidden-panels")
+            .absolute()
+            .top_1()
+            .right_1()
+            .gap_1()
+            .p_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .children(panels.into_iter().map(|panel| {
+                let contribution = panel.contribution;
+                let id = contribution.id.clone();
+                let text_color = contribution.style.text.unwrap_or(cx.theme().foreground);
+                Button::new(SharedString::from(format!(
+                    "tab-sidebar-show-{}-{}",
+                    id.owner, id.local_id
+                )))
+                .icon(Icon::new(contribution.icon.clone()).text_color(text_color))
+                .ghost()
+                .compact()
+                .tooltip("Show panel")
+                .on_click({
+                    let container = container.clone();
+                    move |_, _, cx| {
+                        container.update(cx, |container, cx| {
+                            container.show_sidebar_panel(
+                                id.clone(),
+                                contribution.default_placement,
+                                contribution.policy,
+                                cx,
+                            );
+                            cx.notify();
+                        });
+                    }
+                })
+            }))
+            .into_any_element()
+    }
+
+    fn set_sidebar_side_width(&mut self, id: SidebarPanelId, width: Pixels) {
+        self.sidebar_size_overrides
+            .entry(id)
+            .or_default()
+            .side_width = Some(width);
+    }
+
+    fn set_sidebar_bottom_height(&mut self, id: SidebarPanelId, height: Pixels) {
+        self.sidebar_size_overrides
+            .entry(id)
+            .or_default()
+            .bottom_height = Some(height);
+    }
+
+    fn resize_sidebar_panel(
+        &mut self,
+        mouse_position: Point<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.sidebar_resizing.clone() else {
+            return;
+        };
+
+        if !self.sidebar_resize_target_active(&target, cx) {
+            self.sidebar_resizing = None;
+            cx.notify();
+            return;
+        }
+
+        match target.placement {
+            SidebarPlacement::Left | SidebarPlacement::Right => {
+                self.resize_side_sidebar_panel(target, mouse_position, cx);
+            }
+            SidebarPlacement::Bottom => {
+                self.resize_bottom_sidebar_panel(target, mouse_position);
+            }
+        }
+        cx.notify();
+    }
+
+    fn sidebar_resize_target_active(&self, target: &SidebarResizeTarget, cx: &App) -> bool {
+        self.resolved_sidebar_panels(cx)
+            .into_iter()
+            .find(|panel| panel.visible && panel.contribution.id == target.id)
+            .is_some_and(|panel| {
+                if panel.placement != target.placement {
+                    return false;
+                }
+
+                match target.placement {
+                    SidebarPlacement::Left | SidebarPlacement::Right => {
+                        sidebar_panel_allows_resize(
+                            panel.contribution.chrome,
+                            Some(self.sidebar_panel_side_width(&panel.contribution)),
+                            None,
+                        )
+                    }
+                    SidebarPlacement::Bottom => sidebar_panel_allows_resize(
+                        panel.contribution.chrome,
+                        None,
+                        Some(self.sidebar_panel_bottom_height(&panel.contribution)),
+                    ),
+                }
+            })
+    }
+
+    fn resize_side_sidebar_panel(
+        &mut self,
+        target: SidebarResizeTarget,
+        mouse_position: Point<Pixels>,
+        cx: &App,
+    ) {
+        let panels = self.resolved_sidebar_panels(cx);
+        let same_side = Self::sidebar_panels_for(&panels, target.placement);
+        let Some(target_ix) = same_side
+            .iter()
+            .position(|panel| panel.contribution.id == target.id)
+        else {
+            return;
+        };
+
+        let widths = same_side
+            .iter()
+            .map(|panel| self.sidebar_panel_side_width(&panel.contribution))
+            .collect::<Vec<_>>();
+        let before = widths
+            .iter()
+            .take(target_ix)
+            .fold(px(0.0), |total, width| total + *width);
+        let after = widths
+            .iter()
+            .skip(target_ix + 1)
+            .fold(px(0.0), |total, width| total + *width);
+        let after_min = same_side
+            .iter()
+            .skip(target_ix + 1)
+            .fold(px(0.0), |total, _| total + SIDEBAR_PANEL_MIN_SIZE);
+        let opposite_width = match target.placement {
+            SidebarPlacement::Left => {
+                let right = Self::sidebar_panels_for(&panels, SidebarPlacement::Right);
+                self.sidebar_side_width(&right)
+            }
+            SidebarPlacement::Right => {
+                let left = Self::sidebar_panels_for(&panels, SidebarPlacement::Left);
+                self.sidebar_side_width(&left)
+            }
+            SidebarPlacement::Bottom => px(0.0),
+        };
+        let max_dock_width =
+            (self.sidebar_bounds.size.width - SIDEBAR_CENTER_MIN_SIZE - opposite_width)
+                .max(SIDEBAR_PANEL_MIN_SIZE);
+        let max_width = (max_dock_width - before - after_min).max(SIDEBAR_PANEL_MIN_SIZE);
+        let raw_width = match target.placement {
+            SidebarPlacement::Left => mouse_position.x - self.sidebar_bounds.left() - before,
+            SidebarPlacement::Right => self.sidebar_bounds.right() - after - mouse_position.x,
+            SidebarPlacement::Bottom => unreachable!(),
+        };
+        let width = raw_width.clamp(SIDEBAR_PANEL_MIN_SIZE, max_width);
+        self.set_sidebar_side_width(target.id, width);
+    }
+
+    fn resize_bottom_sidebar_panel(
+        &mut self,
+        target: SidebarResizeTarget,
+        mouse_position: Point<Pixels>,
+    ) {
+        let max_height =
+            (self.sidebar_bounds.size.height - SIDEBAR_CENTER_MIN_SIZE).max(SIDEBAR_PANEL_MIN_SIZE);
+        let height = (self.sidebar_bounds.bottom() - mouse_position.y)
+            .clamp(SIDEBAR_PANEL_MIN_SIZE, max_height);
+        self.set_sidebar_bottom_height(target.id, height);
+    }
+
+    fn finish_sidebar_resize(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_resizing = None;
+        cx.notify();
+    }
+
+    fn render_content_with_sidebars(
+        &self,
+        content: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panels = self.resolved_sidebar_panels(cx);
+        let left = Self::sidebar_panels_for(&panels, SidebarPlacement::Left);
+        let right = Self::sidebar_panels_for(&panels, SidebarPlacement::Right);
+        let bottom = Self::sidebar_panels_for(&panels, SidebarPlacement::Bottom);
+        let hidden = Self::hidden_sidebar_panels(&panels);
+
+        if left.is_empty() && right.is_empty() && bottom.is_empty() && hidden.is_empty() {
+            return content;
+        }
+
+        let center_content = div()
+            .relative()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .child(content)
+            .child(self.render_hidden_sidebar_launcher(hidden, cx));
+        let center = if bottom.is_empty() {
+            center_content.into_any_element()
+        } else {
+            v_flex()
+                .id("tab-sidebar-center")
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(center_content),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(self.sidebar_bottom_height(&bottom))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(self.render_sidebar_dock(SidebarPlacement::Bottom, bottom, cx)),
+                )
+                .into_any_element()
+        };
+
+        let mut root = h_flex()
+            .id("tab-sidebar-root")
+            .relative()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden();
+        if !left.is_empty() {
+            root = root.child(
+                div()
+                    .relative()
+                    .h_full()
+                    .w(self.sidebar_side_width(&left))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(self.render_sidebar_dock(SidebarPlacement::Left, left, cx)),
+            );
+        }
+        root = root.child(
+            div()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .child(center),
+        );
+        if !right.is_empty() {
+            root = root.child(
+                div()
+                    .relative()
+                    .h_full()
+                    .w(self.sidebar_side_width(&right))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(self.render_sidebar_dock(SidebarPlacement::Right, right, cx)),
+            );
+        }
+
+        root.child(SidebarResizeEventHandler {
+            container: cx.entity(),
+        })
+        .into_any_element()
+    }
+
+    pub fn render_tab_content(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active_tab = self.active_pinned_tab().or_else(|| self.active_tab());
+        let split_enabled = self.split_enabled
+            && active_tab
+                .map(|tab| tab.content().can_split(cx))
+                .unwrap_or(false);
+        let sidebar_panels = self.resolved_sidebar_panels(cx);
+        let has_sidebar_layout = sidebar_panels
+            .iter()
+            .any(|panel| panel.visible || (!panel.visible && panel.contribution.policy.hideable));
+
+        div()
+            .id("tab-content")
             .flex_1()
             .w_full()
             .overflow_hidden()
-            .when_some(active_view, |el, view| el.child(view))
+            .when(!has_sidebar_layout, |el| {
+                let active_view = active_tab.map(|tab| tab.content().view());
+                el.when_some(active_view, |el, view| el.child(view))
+                    .when(split_enabled, |el| {
+                        el.relative()
+                            .on_drag_move(cx.listener(Self::on_tab_content_drag_move))
+                            .child(
+                                div()
+                                    .invisible()
+                                    .absolute()
+                                    .bg(cx.theme().drop_target)
+                                    .map(|this| match self.will_split_placement {
+                                        Some(Placement::Right) => {
+                                            this.right_0().top_0().bottom_0().w(relative(0.5))
+                                        }
+                                        Some(Placement::Bottom) => {
+                                            this.bottom_0().left_0().right_0().h(relative(0.5))
+                                        }
+                                        _ => this.top_0().left_0().size_full(),
+                                    })
+                                    .group_drag_over::<DragTab>("", |this| this.visible())
+                                    .on_drop(cx.listener(|this, drag: &DragTab, window, cx| {
+                                        this.drop_tab_on_content(drag, window, cx);
+                                    })),
+                            )
+                    })
+            })
+            .when(has_sidebar_layout, |el| {
+                let active_view = active_tab.map(|tab| tab.content().view());
+                let content = div()
+                    .size_full()
+                    .overflow_hidden()
+                    .when_some(active_view, |el, view| el.child(view))
+                    .when(split_enabled, |el| {
+                        el.relative()
+                            .on_drag_move(cx.listener(Self::on_tab_content_drag_move))
+                            .child(
+                                div()
+                                    .invisible()
+                                    .absolute()
+                                    .bg(cx.theme().drop_target)
+                                    .map(|this| match self.will_split_placement {
+                                        Some(Placement::Right) => {
+                                            this.right_0().top_0().bottom_0().w(relative(0.5))
+                                        }
+                                        Some(Placement::Bottom) => {
+                                            this.bottom_0().left_0().right_0().h(relative(0.5))
+                                        }
+                                        _ => this.top_0().left_0().size_full(),
+                                    })
+                                    .group_drag_over::<DragTab>("", |this| this.visible())
+                                    .on_drop(cx.listener(|this, drag: &DragTab, window, cx| {
+                                        this.drop_tab_on_content(drag, window, cx);
+                                    })),
+                            )
+                    })
+                    .into_any_element();
+                el.child(self.render_content_with_sidebars(content, cx))
+            })
+    }
+
+    fn on_tab_content_drag_move(
+        &mut self,
+        drag: &DragMoveEvent<DragTab>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = drag.bounds;
+        let position = drag.event.position;
+
+        self.will_split_placement = if position.x > bounds.left() + bounds.size.width * 0.75 {
+            Some(Placement::Right)
+        } else if position.y > bounds.top() + bounds.size.height * 0.75 {
+            Some(Placement::Bottom)
+        } else {
+            None
+        };
+        cx.notify();
+    }
+
+    fn drop_tab_on_content(&mut self, drag: &DragTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = drag.source_pane.clone() else {
+            return;
+        };
+        let Some(placement) = self.will_split_placement.take() else {
+            self.move_dragged_tab_into_pane(drag, window, cx);
+            return;
+        };
+        if !matches!(placement, Placement::Right | Placement::Bottom) {
+            return;
+        }
+        let tab_can_split = source
+            .read(cx)
+            .tabs()
+            .get(drag.tab_index)
+            .map(|tab| tab.content().can_split(cx))
+            .unwrap_or(false);
+        let source_tab_count = source.read(cx).tabs().len();
+        if !split_command_enabled(self.split_enabled, tab_can_split, source_tab_count) {
+            return;
+        }
+        cx.emit(TabContainerEvent::SplitRequested {
+            placement,
+            source,
+            tab_index: drag.tab_index,
+        });
+    }
+
+    fn move_dragged_tab_into_pane(
+        &mut self,
+        drag: &DragTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = drag.source_pane.clone() else {
+            return;
+        };
+        if source == cx.entity() {
+            self.set_active_index(drag.tab_index, window, cx);
+            return;
+        }
+        let moved = source.update(cx, |source, cx| source.take_tab(drag.tab_index, window, cx));
+        if let Some(tab) = moved {
+            self.insert_tab_at_end_and_activate(tab, window, cx);
+        }
     }
 
     pub fn render_tab_bar(
@@ -1563,6 +3091,7 @@ impl TabContainer {
         let drag_border_color = theme.drag_border;
         let active_index = self.active_index;
         let left_padding = self.left_padding.unwrap_or(px(8.0));
+        let pinned_tab_count = self.pinned_tabs.len();
 
         let tab_list = self.tab_list.clone();
 
@@ -1629,57 +3158,61 @@ impl TabContainer {
                         .when_some(self.top_padding, |div, padding| div.pt(padding)),
                 )
             })
-            // Pinned tab (fixed, not scrollable)
-            .when_some(self.pinned_tab.as_ref(), |this, pinned| {
-                let pinned_title = pinned.content().title(cx);
-                let pinned_icon = pinned.content().icon(cx);
-                let is_pinned_active = self.pinned_tab_active;
-                let view_for_pinned = view.clone();
-                let top_padding = self.top_padding;
+            .children(
+                self.pinned_tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(pinned_index, pinned)| {
+                        let pinned_title = pinned.title(cx);
+                        let pinned_icon = pinned.content().icon(cx);
+                        let is_pinned_active = self.active_pinned_index == Some(pinned_index);
+                        let view_for_pinned = view.clone();
+                        let top_padding = self.top_padding;
 
+                        div()
+                            .id(SharedString::from(format!("pinned-tab-{pinned_index}")))
+                            .flex()
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .items_center()
+                            .gap_2()
+                            .h(px(32.0))
+                            .px_3()
+                            .when(!is_macos && pinned_index == 0, |el| el.ml(left_padding))
+                            .when(pinned_index + 1 < pinned_tab_count, |el| el.mr_1())
+                            .when_some(top_padding, |el, padding| el.mt(padding))
+                            .rounded(px(6.0))
+                            .when(is_pinned_active, |el| el.bg(active_tab_color))
+                            .when(!is_pinned_active, |el| {
+                                el.hover(move |style| style.bg(hover_tab_color))
+                                    .bg(inactive_tab_color)
+                            })
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                view_for_pinned.update(cx, |this, cx| {
+                                    this.activate_pinned_tab_at(pinned_index, window, cx);
+                                });
+                            })
+                            .when_some(pinned_icon, |el, icon| {
+                                el.child(div().flex_shrink_0().flex().items_center().child(icon))
+                            })
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_sm()
+                                    .text_color(text_color)
+                                    .text_ellipsis()
+                                    .child(pinned_title.to_string()),
+                            )
+                    }),
+            )
+            .when(!self.pinned_tabs.is_empty(), |this| {
                 this.child(
-                    div()
-                        .id("pinned-tab")
-                        .flex()
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .items_center()
-                        .gap_2()
-                        .h(px(32.0))
-                        .px_3()
-                        .when(!is_macos, |el| el.ml(left_padding))
-                        .when_some(top_padding, |el, padding| el.mt(padding))
-                        .rounded(px(6.0))
-                        .when(is_pinned_active, |el| el.bg(active_tab_color))
-                        .when(!is_pinned_active, |el| {
-                            el.hover(move |style| style.bg(hover_tab_color))
-                                .bg(inactive_tab_color)
-                        })
-                        .cursor_pointer()
-                        .on_click(move |_, window, cx| {
-                            view_for_pinned.update(cx, |this, cx| {
-                                this.activate_pinned_tab(window, cx);
-                            });
-                        })
-                        .when_some(pinned_icon, |el, icon| {
-                            el.child(div().flex_shrink_0().flex().items_center().child(icon))
-                        })
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_sm()
-                                .text_color(text_color)
-                                .text_ellipsis()
-                                .child(pinned_title.to_string()),
-                        ),
-                )
-                // Separator between pinned tab and scrollable tabs
-                .child(
                     div()
                         .flex_shrink_0()
                         .mx_1()
-                        .when_some(top_padding, |el, padding| el.mt(padding))
+                        .when_some(self.top_padding, |el, padding| el.mt(padding))
                         .w(px(1.0))
                         .h(px(16.0))
                         .bg(border_color),
@@ -1723,7 +3256,7 @@ impl TabContainer {
                             ))
                     })
                     .overflow_x_scroll()
-                    .when(!is_macos && self.pinned_tab.is_none(), |this| {
+                    .when(!is_macos && self.pinned_tabs.is_empty(), |this| {
                         this.pl(left_padding)
                     })
                     .when_some(self.top_padding, |div, padding| div.pt(padding))
@@ -1748,17 +3281,26 @@ impl TabContainer {
                         },
                     )
                     .children(self.tabs.iter().enumerate().map(|(idx, tab)| {
-                        let title = tab.content().title(cx);
+                        let title = tab.title(cx);
                         let icon = tab.content().icon(cx);
                         let closeable = tab.content().closeable(cx);
-                        let is_active = idx == active_index;
+                        let is_active = self.active_pinned_index.is_none() && idx == active_index;
                         let view_clone = view.clone();
                         let title_clone = title.clone();
                         let tab_width = self.get_tab_width(tab, cx);
+                        let tab_id = tab.id();
+                        let has_activity =
+                            !is_active && self.activity_tabs.contains(tab_id.as_ref());
+                        let rename_input_for_tab = self
+                            .renaming_tab_id
+                            .as_ref()
+                            .filter(|renaming_id| *renaming_id == &tab_id)
+                            .and_then(|_| self.rename_input.clone());
 
                         div()
                             .id(idx)
                             .flex()
+                            .relative()
                             .flex_shrink_0()
                             .overflow_hidden()
                             .items_center()
@@ -1772,6 +3314,18 @@ impl TabContainer {
                             .when(!is_active, |el| {
                                 el.hover(move |style| style.bg(hover_tab_color))
                                     .bg(inactive_tab_color)
+                            })
+                            .when(has_activity, |el| {
+                                el.child(
+                                    div()
+                                        .id(SharedString::from(format!("tab-activity-{idx}")))
+                                        .absolute()
+                                        .top(px(5.0))
+                                        .left(px(6.0))
+                                        .size(px(7.0))
+                                        .rounded_full()
+                                        .bg(gpui::rgb(0x22c55e)),
+                                )
                             })
                             .when(allow_tab_drag, |el| {
                                 el.cursor_grab()
@@ -1787,7 +3341,8 @@ impl TabContainer {
                                         cx.stop_propagation();
                                     })
                                     .on_drag(
-                                        DragTab::new(idx, title.clone()),
+                                        DragTab::new(idx, title.clone())
+                                            .with_source_pane(view.clone()),
                                         |drag, _, window, cx| {
                                             window.prevent_default();
                                             cx.stop_propagation();
@@ -1801,10 +3356,27 @@ impl TabContainer {
                                         move |this, drag: &DragTab, window, cx| {
                                             let from_idx = drag.tab_index;
                                             let to_idx = idx;
-                                            if from_idx != to_idx {
+                                            let source = drag
+                                                .source_pane
+                                                .clone()
+                                                .unwrap_or_else(|| cx.entity());
+
+                                            if source != cx.entity() {
+                                                let moved = source.update(cx, |source, cx| {
+                                                    source.take_tab(from_idx, window, cx)
+                                                });
+                                                if let Some(tab) = moved {
+                                                    this.tabs.insert(to_idx, tab);
+                                                    this.set_active_index(to_idx, window, cx);
+                                                    cx.emit(TabContainerEvent::LayoutChanged);
+                                                    cx.notify();
+                                                }
+                                            } else if from_idx != to_idx {
                                                 this.move_tab(from_idx, to_idx, cx);
+                                                this.set_active_index(to_idx, window, cx);
+                                            } else {
+                                                this.set_active_index(to_idx, window, cx);
                                             }
-                                            this.set_active_index(to_idx, window, cx);
                                         },
                                     ))
                             })
@@ -1815,16 +3387,22 @@ impl TabContainer {
                             .when_some(icon, |el, icon| {
                                 el.child(div().flex_shrink_0().flex().items_center().child(icon))
                             })
-                            .child(
-                                div()
+                            .child(match rename_input_for_tab {
+                                Some(input) => div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&input).small().w_full())
+                                    .into_any_element(),
+                                None => div()
                                     .flex_1()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_sm()
                                     .text_color(text_color)
                                     .text_ellipsis()
-                                    .child(title_clone.to_string()),
-                            )
+                                    .child(title_clone.to_string())
+                                    .into_any_element(),
+                            })
                             .when(closeable, |el| {
                                 let view_clone = view_clone.clone();
                                 el.child(
@@ -1858,6 +3436,29 @@ impl TabContainer {
                                 let tab_count = view_for_menu.read(cx).tabs.len();
                                 let has_tabs_left = idx > 0;
                                 let has_tabs_right = idx < tab_count - 1;
+                                let can_rename = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().can_rename(cx))
+                                    .unwrap_or(false);
+                                let can_duplicate = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().can_duplicate(cx))
+                                    .unwrap_or(false);
+                                let can_split = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().can_split(cx))
+                                    .unwrap_or(false);
+                                let split_enabled = split_command_enabled(
+                                    view_for_menu.read(cx).split_enabled,
+                                    can_split,
+                                    tab_count,
+                                );
                                 let closeable = view_for_menu
                                     .read(cx)
                                     .tabs
@@ -1866,79 +3467,151 @@ impl TabContainer {
                                     .unwrap_or(false);
 
                                 menu.item(
-                                    PopupMenuItem::new("Close").disabled(!closeable).on_click(
+                                    PopupMenuItem::new(t!("TabContextMenu.rename_tab").to_string())
+                                        .disabled(!can_rename)
+                                        .on_click(window.listener_for(
+                                            &view_for_menu,
+                                            move |this, _, window, cx| {
+                                                this.start_rename_tab(idx, window, cx);
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.duplicate_tab").to_string(),
+                                    )
+                                    .disabled(!can_duplicate)
+                                    .on_click(
                                         window.listener_for(
                                             &view_for_menu,
                                             move |this, _, window, cx| {
-                                                this.close_tab(idx, window, cx).detach();
+                                                this.duplicate_tab(idx, window, cx);
                                             },
                                         ),
                                     ),
                                 )
-                                .item(PopupMenuItem::new("Close All").on_click(
-                                    window.listener_for(
-                                        &view_for_menu,
-                                        move |this, _, window, cx| {
-                                            this.close_all_tabs(window, cx).detach();
-                                        },
-                                    ),
-                                ))
                                 .item(
-                                    PopupMenuItem::new("Close Others")
-                                        .disabled(tab_count <= 1)
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.split_right").to_string(),
+                                    )
+                                    .disabled(!split_enabled)
+                                    .on_click(
+                                        window.listener_for(
+                                            &view_for_menu,
+                                            move |_this, _, _window, cx| {
+                                                cx.emit(TabContainerEvent::SplitRequested {
+                                                    placement: Placement::Right,
+                                                    source: cx.entity(),
+                                                    tab_index: idx,
+                                                });
+                                            },
+                                        ),
+                                    ),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t!("TabContextMenu.split_down").to_string())
+                                        .disabled(!split_enabled)
                                         .on_click(window.listener_for(
+                                            &view_for_menu,
+                                            move |_this, _, _window, cx| {
+                                                cx.emit(TabContainerEvent::SplitRequested {
+                                                    placement: Placement::Bottom,
+                                                    source: cx.entity(),
+                                                    tab_index: idx,
+                                                });
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t!("TabContextMenu.close_tab").to_string())
+                                        .disabled(!closeable)
+                                        .on_click(window.listener_for(
+                                            &view_for_menu,
+                                            move |this, _, window, cx| {
+                                                this.close_tab(idx, window, cx).detach();
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.close_all_tabs").to_string(),
+                                    )
+                                    .on_click(
+                                        window.listener_for(
+                                            &view_for_menu,
+                                            move |this, _, window, cx| {
+                                                this.close_all_tabs(window, cx).detach();
+                                            },
+                                        ),
+                                    ),
+                                )
+                                .item(
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.close_other_tabs").to_string(),
+                                    )
+                                    .disabled(tab_count <= 1)
+                                    .on_click(
+                                        window.listener_for(
                                             &view_for_menu,
                                             move |this, _, window, cx| {
                                                 this.close_other_tabs(idx, window, cx).detach();
                                             },
-                                        )),
+                                        ),
+                                    ),
                                 )
                                 .item(
-                                    PopupMenuItem::new("Close Tabs To The Left")
-                                        .disabled(!has_tabs_left)
-                                        .on_click(window.listener_for(
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.close_tabs_to_left").to_string(),
+                                    )
+                                    .disabled(!has_tabs_left)
+                                    .on_click(
+                                        window.listener_for(
                                             &view_for_menu,
                                             move |this, _, window, cx| {
                                                 this.close_tabs_to_left(idx, window, cx).detach();
                                             },
-                                        )),
+                                        ),
+                                    ),
                                 )
                                 .item(
-                                    PopupMenuItem::new("Close Tabs To The Right")
-                                        .disabled(!has_tabs_right)
-                                        .on_click(window.listener_for(
+                                    PopupMenuItem::new(
+                                        t!("TabContextMenu.close_tabs_to_right").to_string(),
+                                    )
+                                    .disabled(!has_tabs_right)
+                                    .on_click(
+                                        window.listener_for(
                                             &view_for_menu,
                                             move |this, _, window, cx| {
                                                 this.close_tabs_to_right(idx, window, cx).detach();
                                             },
-                                        )),
+                                        ),
+                                    ),
                                 )
                             })
                     })),
             )
-            .when(show_tab_dropdown, |el| {
-                el.child(
-                    Popover::new("tab-list-popover")
-                        .anchor(Corner::TopRight)
-                        .p_0()
-                        .open(self.list_popover_open)
-                        .on_open_change(cx.listener(move |this, open, window, cx| {
-                            this.list_popover_open = *open;
-                            if *open {
-                                let tabs_data: Vec<(usize, SharedString, Option<Icon>, bool)> =
-                                    this.tabs
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(idx, tab)| {
-                                            (
-                                                idx,
-                                                tab.content().title(cx),
-                                                tab.content().icon(cx),
-                                                tab.content().closeable(cx),
-                                            )
-                                        })
-                                        .collect();
-                                let container = cx.entity();
+            .child(
+                Popover::new("tab-list-popover")
+                    .anchor(Anchor::TopRight)
+                    .p_0()
+                    .open(self.list_popover_open)
+                    .on_open_change(cx.listener(move |this, open, window, cx| {
+                        this.list_popover_open = *open;
+                        if *open {
+                            let tabs_data: Vec<(usize, SharedString, Option<Icon>, bool)> = this
+                                .tabs
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, tab)| {
+                                    (
+                                        idx,
+                                        tab.title(cx),
+                                        tab.content().icon(cx),
+                                        tab.content().closeable(cx),
+                                    )
+                                })
+                                .collect();
+                            let container = cx.entity();
 
                                 if let Some(tab_list) = &this.tab_list {
                                     tab_list.update(cx, |state, _| {
@@ -2155,18 +3828,113 @@ impl TabContainer {
     }
 }
 
-impl Focusable for TabContainer {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        if self.pinned_tab_active {
-            if let Some(pinned) = &self.pinned_tab {
-                return pinned.content().focus_handle(cx);
+fn normalize_sidebar_placement(
+    requested: SidebarPlacement,
+    policy: SidebarPanelPolicy,
+) -> SidebarPlacement {
+    if policy.allowed_placements.contains(requested) {
+        return requested;
+    }
+    if policy.allowed_placements.right {
+        SidebarPlacement::Right
+    } else if policy.allowed_placements.left {
+        SidebarPlacement::Left
+    } else {
+        SidebarPlacement::Bottom
+    }
+}
+
+struct SidebarResizeEventHandler {
+    container: Entity<TabContainer>,
+}
+
+impl IntoElement for SidebarResizeEventHandler {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SidebarResizeEventHandler {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(Style::default(), None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let bounds = window.bounds();
+        self.container.update(cx, |container, _| {
+            container.sidebar_bounds = Bounds {
+                origin: Point::default(),
+                size: bounds.size,
+            };
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.on_mouse_event({
+            let container = self.container.clone();
+            let resizing = container.read(cx).sidebar_resizing.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if resizing.is_none() || !phase.bubble() {
+                    return;
+                }
+                container.update(cx, |container, cx| {
+                    container.resize_sidebar_panel(event.position, window, cx);
+                });
             }
-        }
-        if let Some(active_tab) = self.active_tab() {
-            active_tab.content().focus_handle(cx)
-        } else {
-            self.focus_handle.clone()
-        }
+        });
+
+        window.on_mouse_event({
+            let container = self.container.clone();
+            move |_: &MouseUpEvent, phase, window, cx| {
+                if phase.bubble() {
+                    container.update(cx, |container, cx| {
+                        container.finish_sidebar_resize(window, cx);
+                    });
+                }
+            }
+        });
+    }
+}
+
+impl Focusable for TabContainer {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 

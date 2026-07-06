@@ -1,35 +1,42 @@
+use std::rc::Rc;
+
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, DefiniteLength, Edges, EdgesRefinement, Entity, Hsla, InteractiveElement as _,
-    IntoElement, IsZero, MouseButton, ParentElement as _, Rems, RenderOnce, StyleRefinement,
-    Styled, TextAlign, Window, div, px, relative,
+    AnyElement, App, Context, DefiniteLength, Edges, EdgesRefinement, Entity, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Rems, RenderOnce,
+    StyleRefinement, Styled, TextAlign, Window, div, px, relative,
 };
 
 use crate::button::{Button, ButtonVariants as _};
 use crate::input::clear_button;
-use crate::input::element::{LINE_NUMBER_RIGHT_MARGIN, RIGHT_MARGIN};
-use crate::scroll::Scrollbar;
+use crate::menu::PopupMenu;
 use crate::spinner::Spinner;
-use crate::{ActiveTheme, v_flex};
+use crate::{ActiveTheme, Colorize, v_flex};
 use crate::{IconName, Size};
 use crate::{Selectable, StyledExt, h_flex};
 use crate::{Sizable, StyleSized};
 
-use super::InputState;
+use super::{InputState, element::EditorScrollbar};
 
+/// Local colors for input-like controls embedded in a differently themed panel.
+#[derive(Clone, Copy)]
+pub struct LocalInputStyle {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub muted_foreground: Hsla,
+    pub border: Hsla,
+}
+
+/// Returns `(background, foreground)` colors for input-like components.
 pub(crate) fn input_style(disabled: bool, cx: &App) -> (Hsla, Hsla) {
-    let mut bg = cx.theme().input_background();
     if disabled {
-        bg.a = (bg.a / 0.3).min(1.0);
-    }
-
-    let fg = if disabled {
-        cx.theme().muted_foreground
+        (
+            cx.theme().input.mix_oklab(cx.theme().transparent, 0.8),
+            cx.theme().muted_foreground,
+        )
     } else {
-        cx.theme().foreground
-    };
-
-    (bg, fg)
+        (cx.theme().input_background(), cx.theme().foreground)
+    }
 }
 
 fn should_handle_vertical_navigation(is_multi_line: bool, context_menu_open: bool) -> bool {
@@ -51,36 +58,23 @@ pub struct Input {
     disabled: bool,
     bordered: bool,
     focus_bordered: bool,
+    caret_color: Option<Hsla>,
+    local_style: Option<LocalInputStyle>,
     tab_index: isize,
     selected: bool,
     bare: bool,
+
+    /// An optional context menu builder to allow a custom context menu on the input.
+    ///
+    /// If set, this will override the built-in context menu.
+    context_menu_builder:
+        Option<Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>>,
 }
 
 impl Sizable for Input {
     fn with_size(mut self, size: impl Into<Size>) -> Self {
         self.size = size.into();
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_handle_vertical_navigation;
-
-    #[test]
-    fn single_line_input_handles_vertical_navigation_when_menu_is_open() {
-        assert!(should_handle_vertical_navigation(false, true));
-    }
-
-    #[test]
-    fn single_line_input_without_menu_keeps_vertical_navigation_for_parent() {
-        assert!(!should_handle_vertical_navigation(false, false));
-    }
-
-    #[test]
-    fn multi_line_input_always_handles_vertical_navigation() {
-        assert!(should_handle_vertical_navigation(true, false));
-        assert!(should_handle_vertical_navigation(true, true));
     }
 }
 
@@ -111,9 +105,12 @@ impl Input {
             disabled: false,
             bordered: true,
             focus_bordered: true,
+            caret_color: None,
+            local_style: None,
             tab_index: 0,
             selected: false,
             bare: false,
+            context_menu_builder: None,
         }
     }
 
@@ -157,6 +154,18 @@ impl Input {
         self
     }
 
+    /// Override the blinking caret color for locally themed embedded inputs.
+    pub fn caret_color(mut self, color: Hsla) -> Self {
+        self.caret_color = Some(color);
+        self
+    }
+
+    /// Override input colors for a locally themed embedded panel.
+    pub fn local_style(mut self, style: LocalInputStyle) -> Self {
+        self.local_style = Some(style);
+        self
+    }
+
     /// Set whether to show the clear button when the input field is not empty, default is false.
     pub fn cleanable(mut self, cleanable: bool) -> Self {
         self.cleanable = cleanable;
@@ -175,38 +184,43 @@ impl Input {
         self
     }
 
-    /// 纯编辑器模式：去掉 Input 自带的 padding、height、items_center 等布局样式，
-    /// 完全由父容器控制布局。用于嵌入表格单元格等场景。
-    pub fn bare(mut self) -> Self {
-        self.bare = true;
-        self
-    }
-
     /// Set the tab index for the input, default is 0.
     pub fn tab_index(mut self, index: isize) -> Self {
         self.tab_index = index;
         self
     }
 
-    fn render_toggle_mask_button(state: Entity<InputState>) -> impl IntoElement {
+    /// Pure editor mode: remove Input-owned padding, height and vertical centering.
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
+        self
+    }
+
+    /// Sets the context menu for the input.
+    pub fn context_menu(
+        mut self,
+        f: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    ) -> Self {
+        self.context_menu_builder = Some(Rc::new(f));
+        self
+    }
+
+    fn render_toggle_mask_button(state: &Entity<InputState>, cx: &App) -> impl IntoElement {
+        let masked = state.read(cx).masked;
         Button::new("toggle-mask")
-            .icon(IconName::Eye)
+            .icon(if masked {
+                IconName::Eye
+            } else {
+                IconName::EyeOff
+            })
             .xsmall()
             .ghost()
             .tab_stop(false)
-            .on_mouse_down(MouseButton::Left, {
+            .on_click({
                 let state = state.clone();
                 move |_, window, cx| {
                     state.update(cx, |state, cx| {
-                        state.set_masked(false, window, cx);
-                    })
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let state = state.clone();
-                move |_, window, cx| {
-                    state.update(cx, |state, cx| {
-                        state.set_masked(true, window, cx);
+                        state.set_masked(!state.masked, window, cx);
                     })
                 }
             })
@@ -218,7 +232,6 @@ impl Input {
         input_state: &Entity<InputState>,
         state: &InputState,
         window: &Window,
-        _cx: &App,
     ) -> impl IntoElement {
         let base_size = window.text_style().font_size;
         let rem_size = window.rem_size();
@@ -242,42 +255,19 @@ impl Input {
                 .unwrap_or(px(0.)),
         };
 
+        state.editor_scrollbar_paddings.set(paddings);
+        state.editor_scrollbar_snapshot.set(None);
+
         v_flex()
             .size_full()
             .children(state.search_panel.clone())
-            .child(div().flex_1().child(input_state.clone()).map(|this| {
-                if let Some(last_layout) = state.last_layout.as_ref() {
-                    let left = if last_layout.line_number_width.is_zero() {
-                        px(0.)
-                    } else {
-                        // Align left edge to the Line number.
-                        paddings.left + last_layout.line_number_width - LINE_NUMBER_RIGHT_MARGIN
-                    };
-
-                    let scroll_size = gpui::Size {
-                        width: state.scroll_size.width - left + paddings.right + RIGHT_MARGIN,
-                        height: state.scroll_size.height,
-                    };
-
-                    let scrollbar = if !state.soft_wrap {
-                        Scrollbar::new(&state.scroll_handle)
-                    } else {
-                        Scrollbar::vertical(&state.scroll_handle)
-                    };
-
-                    this.relative().child(
-                        div()
-                            .absolute()
-                            .top(-paddings.top)
-                            .left(left)
-                            .right(-paddings.right)
-                            .bottom(-paddings.bottom)
-                            .child(scrollbar.scroll_size(scroll_size)),
-                    )
-                } else {
-                    this
-                }
-            }))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .child(input_state.clone())
+                    .child(EditorScrollbar::new(input_state.clone())),
+            )
     }
 }
 
@@ -293,8 +283,12 @@ impl RenderOnce for Input {
         let text_align = self.style.text.text_align.unwrap_or(TextAlign::Left);
 
         self.state.update(cx, |state, _| {
+            state.context_menu_builder = self.context_menu_builder.clone();
             state.disabled = self.disabled;
             state.size = self.size;
+            state.caret_color = self.caret_color;
+            state.placeholder_color = self.local_style.map(|style| style.muted_foreground);
+
             // Only for single line mode
             if state.mode.is_single_line() {
                 state.text_align = text_align;
@@ -313,12 +307,25 @@ impl RenderOnce for Input {
             _ => px(6.),
         };
 
-        let (bg, fg) = input_style(state.disabled, cx);
+        let (bg, fg) = self.local_style.map_or_else(
+            || input_style(state.disabled, cx),
+            |style| {
+                if state.disabled {
+                    input_style(true, cx)
+                } else {
+                    (style.background, style.foreground)
+                }
+            },
+        );
         let bg = if state.mode.is_code_editor() {
             cx.theme().editor_background()
         } else {
             bg
         };
+        let border_color = self
+            .local_style
+            .filter(|_| !state.disabled)
+            .map_or(cx.theme().input, |style| style.border);
 
         let prefix = self.prefix;
         let suffix = self.suffix;
@@ -414,10 +421,10 @@ impl RenderOnce for Input {
             .on_scroll_wheel(window.listener_for(&self.state, InputState::on_scroll_wheel))
             .size_full()
             .when(!self.bare, |this| this.line_height(LINE_HEIGHT))
-            .input_text_size(self.size)
             .when(!self.bare, |this| this.input_px(self.size))
             .when(!self.bare, |this| this.input_py(self.size))
             .when(!self.bare, |this| this.input_h(self.size))
+            .input_text_size(self.size)
             .when(!self.disabled, |this| this.cursor_text())
             .when(!self.bare, |this| this.items_center())
             .when(state.mode.is_multi_line() && !self.bare, |this| {
@@ -430,7 +437,7 @@ impl RenderOnce for Input {
                     .when(self.disabled, |this| this.opacity(0.5))
                     .rounded(cx.theme().radius)
                     .when(self.bordered, |this| {
-                        this.border_color(cx.theme().input)
+                        this.border_color(border_color)
                             .border_1()
                             .when(cx.theme().shadow, |this| this.shadow_xs())
                             .when(focused && self.focus_bordered, |this| {
@@ -444,13 +451,7 @@ impl RenderOnce for Input {
             .children(prefix)
             .when(state.mode.is_multi_line(), |mut this| {
                 let paddings = this.style().padding.clone();
-                this.child(Self::render_editor(
-                    paddings,
-                    &self.state,
-                    &state,
-                    window,
-                    cx,
-                ))
+                this.child(Self::render_editor(paddings, &self.state, &state, window))
             })
             .when(!state.mode.is_multi_line(), |this| {
                 this.child(self.state.clone())
@@ -460,13 +461,12 @@ impl RenderOnce for Input {
                     h_flex()
                         .id("suffix")
                         .gap(gap_x)
-                        .when(self.appearance, |this| this.bg(bg))
                         .items_center()
                         .when(state.loading, |this| {
                             this.child(Spinner::new().color(cx.theme().muted_foreground))
                         })
                         .when(self.mask_toggle, |this| {
-                            this.child(Self::render_toggle_mask_button(self.state.clone()))
+                            this.child(Self::render_toggle_mask_button(&self.state, cx))
                         })
                         .when(show_clear_button, |this| {
                             this.child(clear_button(cx).on_click({

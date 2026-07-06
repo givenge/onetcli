@@ -10,6 +10,7 @@ use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
 use raw_window_handle::HasWindowHandle;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::RawWindowHandle;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ALWAYS_ON_TOP: AtomicBool = AtomicBool::new(false);
@@ -30,6 +31,8 @@ actions!(
         ToggleAlwaysOnTop,
         MinimizeWindow,
         DuplicateTab,
+        SwitchNextTab,
+        SwitchPreviousTab,
         QuitApp,
     ]
 );
@@ -41,6 +44,12 @@ pub struct GlobalTabContainer {
 
 impl gpui::Global for GlobalTabContainer {}
 
+impl GlobalTabContainer {
+    pub fn primary_pane(&self) -> Entity<TabContainer> {
+        self.tab_container.clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct GlobalHomePage {
     pub home_page: Entity<HomePage>,
@@ -48,22 +57,48 @@ pub struct GlobalHomePage {
 
 impl gpui::Global for GlobalHomePage {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InitialPinnedTabLayout {
+    home_tab_id: &'static str,
+    workbench_tab_id: &'static str,
+    active_pinned_index: usize,
+}
+
+fn initial_home_tab_layout(startup_default_page: StartupDefaultPage) -> InitialPinnedTabLayout {
+    InitialPinnedTabLayout {
+        home_tab_id: "home",
+        workbench_tab_id: "ai-workbench",
+        active_pinned_index: active_pinned_index_for_startup_default_page(startup_default_page),
+    }
+}
+
+fn active_pinned_index_for_startup_default_page(startup_default_page: StartupDefaultPage) -> usize {
+    match startup_default_page {
+        StartupDefaultPage::Home => 0,
+        StartupDefaultPage::AiWorkbench => 1,
+    }
+}
+
 #[cfg(target_os = "macos")]
 use gpui::px;
 
 use gpui_component::dock::{ClosePanel, ToggleZoom};
 use gpui_component::{ActiveTheme, IconName, Root, Theme, ThemeMode};
 use one_core::llm::manager::GlobalProviderState;
-use one_core::settings::AppSettings;
+use one_core::settings::{AppSettings, StartupDefaultPage};
+use one_core::split_tab_container::{SplitTabContainer, TabPaneFactory};
 use one_core::storage::manager::get_config_dir;
 use one_core::tab_container::{TabContainer, TabContentRegistry, TabItem};
+use one_core::tab_navigation::{
+    ActiveTabSlot, TabCycleDirection, tab_number_target, tab_slot_after_cycle,
+};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::setting_tab;
 use db::GlobalDbState;
-use one_core::storage::{ConnectionRepository, GlobalStorageState};
+use one_core::storage::{ConnectionRepository, GlobalStorageState, traits::Repository};
 
 fn activate_tab_by_number(number: usize, cx: &mut App) {
     let Some(active_window) = cx.active_window() else {
@@ -77,19 +112,47 @@ fn activate_tab_by_number(number: usize, cx: &mut App) {
     cx.defer(move |cx| {
         _ = active_window.update(cx, |_, window, cx| {
             container.update(cx, |tc, cx| {
-                if number == 1 && tc.has_pinned_tab() {
-                    tc.activate_pinned_tab(window, cx);
-                    return;
+                match tab_number_target(number, tc.pinned_tab_count(), tc.tabs().len()) {
+                    Some(ActiveTabSlot::Pinned(index)) => {
+                        tc.activate_pinned_tab_at(index, window, cx);
+                    }
+                    Some(ActiveTabSlot::Regular(index)) => {
+                        tc.set_active_index(index, window, cx);
+                    }
+                    None => {}
                 }
+            });
+        });
+    });
+}
 
-                let index = if tc.has_pinned_tab() {
-                    number.saturating_sub(2)
-                } else {
-                    number.saturating_sub(1)
+fn switch_tab(direction: TabCycleDirection, cx: &mut App) {
+    let Some(active_window) = cx.active_window() else {
+        return;
+    };
+    let Some(container) = cx.try_global::<GlobalTabContainer>() else {
+        return;
+    };
+    let container = container.tab_container.clone();
+
+    cx.defer(move |cx| {
+        _ = active_window.update(cx, |_, window, cx| {
+            container.update(cx, |tc, cx| {
+                let active_slot = tc
+                    .active_pinned_index()
+                    .map(ActiveTabSlot::Pinned)
+                    .unwrap_or_else(|| ActiveTabSlot::Regular(tc.active_index()));
+                let Some(next_slot) = tab_slot_after_cycle(
+                    active_slot,
+                    tc.pinned_tab_count(),
+                    tc.tabs().len(),
+                    direction,
+                ) else {
+                    return;
                 };
-
-                if index < tc.tabs().len() {
-                    tc.set_active_index(index, window, cx);
+                match next_slot {
+                    ActiveTabSlot::Pinned(index) => tc.activate_pinned_tab_at(index, window, cx),
+                    ActiveTabSlot::Regular(index) => tc.set_active_index(index, window, cx),
                 }
             });
         });
@@ -330,10 +393,13 @@ pub fn init(cx: &mut App) {
         }
     }
     one_core::init(cx);
+    ai_chat_view::init(cx);
+    crate::public_mcp_approval::init(cx);
+    crate::ai_chat_acp_approval::init(cx);
+    crate::ai_chat_acp::init(cx);
     one_ui::init(cx);
     db_view::search_shortcut::init(cx);
     db_view::sql_editor_view::init(cx);
-    db_view::chatdb::agents::init(cx);
     crate::auth::init(cx);
     crate::license::init(cx);
     {
@@ -351,8 +417,8 @@ pub fn init(cx: &mut App) {
     }
     terminal_view::init(cx);
     redis_view::init(cx);
-    crate::public_mcp_approval::init(cx);
     crate::public_mcp_runtime::init(cx);
+    crate::personal_sync_runtime::init(cx);
     mongodb_view::init(cx);
     remote_desktop_view::init(cx);
     crate::home_tab::init(cx);
@@ -461,6 +527,16 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         .map(|key| KeyBinding::new(&key, DuplicateTab, None)),
     );
     keybindings.extend(
+        shortcuts_for(cx, action_id::APP_SWITCH_NEXT_TAB, &["ctrl-tab"])
+            .into_iter()
+            .map(|key| KeyBinding::new(&key, SwitchNextTab, None)),
+    );
+    keybindings.extend(
+        shortcuts_for(cx, action_id::APP_SWITCH_PREVIOUS_TAB, &["ctrl-shift-tab"])
+            .into_iter()
+            .map(|key| KeyBinding::new(&key, SwitchPreviousTab, None)),
+    );
+    keybindings.extend(
         shortcuts_for(
             cx,
             action_id::APP_QUIT,
@@ -512,6 +588,20 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
     ));
     keybindings.extend(rebind_keybindings(
         cx,
+        action_id::APP_SWITCH_NEXT_TAB,
+        &["ctrl-tab"],
+        None,
+        SwitchNextTab,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::APP_SWITCH_PREVIOUS_TAB,
+        &["ctrl-shift-tab"],
+        None,
+        SwitchPreviousTab,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
         action_id::APP_QUIT,
         &[default_shortcut("cmd-q", "alt-f4")],
         None,
@@ -533,6 +623,8 @@ fn init_action_handlers(cx: &mut App) {
     cx.on_action(|_: &ToggleFullscreen, cx| toggle_fullscreen(cx));
     cx.on_action(|_: &ToggleAlwaysOnTop, cx| toggle_always_on_top(cx));
     cx.on_action(|_: &DuplicateTab, cx| duplicate_tab(cx));
+    cx.on_action(|_: &SwitchNextTab, cx| switch_tab(TabCycleDirection::Next, cx));
+    cx.on_action(|_: &SwitchPreviousTab, cx| switch_tab(TabCycleDirection::Previous, cx));
     cx.on_action(|_: &QuitApp, cx| quit_app(cx));
     cx.on_action(|_: &OpenConnectionQuickOpen, cx| {
         let Some(active_window) = cx.active_window() else {
@@ -575,12 +667,12 @@ fn init_action_handlers(cx: &mut App) {
 }
 
 pub struct OnetCliApp {
-    tab_container: Entity<TabContainer>,
+    split_container: Entity<SplitTabContainer>,
 }
 
 impl OnetCliApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let tab_container = cx.new(|cx| {
+        let pane_factory: TabPaneFactory = Rc::new(|window, cx, primary| {
             let mut container = TabContainer::new(window, cx)
                 .with_tab_bar_colors(
                     Some(gpui::rgb(0x2b2b2b).into()),
@@ -591,66 +683,108 @@ impl OnetCliApp {
                     Some(gpui::rgb(0x3a3a3a).into()),
                 )
                 .with_inactive_tab_bg_color(Some(gpui::rgb(0x3a3a3a).into()))
-                .with_tab_content_colors(Some(gpui::white()), Some(gpui::rgb(0xaaaaaa).into()));
+                .with_tab_content_colors(Some(gpui::white()), Some(gpui::rgb(0xaaaaaa).into()))
+                .with_split_enabled(true);
 
             #[cfg(target_os = "macos")]
             {
-                container = container
-                    .with_left_padding(px(80.0))
-                    .with_top_padding(px(4.0))
-                    .with_trailing_controls(|window, cx| {
-                        theme_toggle_button(window, cx).into_any_element()
-                    })
+                if primary {
+                    container = container
+                        .with_left_padding(px(80.0))
+                        .with_top_padding(px(4.0))
+                }
             }
 
             #[cfg(not(target_os = "macos"))]
             {
-                // 窗口置顶按钮注入：点击时切换置顶并刷新按钮视觉状态
-                let on_toggle: std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync> =
-                    std::sync::Arc::new(|_window: &mut Window, cx: &mut App| {
-                        toggle_always_on_top(cx);
-                        if let Some(tab_container) = cx
-                            .try_global::<GlobalTabContainer>()
-                            .map(|global| global.tab_container.clone())
-                        {
-                            tab_container.update(cx, |_, cx| cx.notify());
-                        }
-                    });
-                let is_active: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
-                    std::sync::Arc::new(|| ALWAYS_ON_TOP.load(Ordering::Relaxed));
-                container = container
-                    .with_window_controls(true)
-                    .with_always_on_top_control(on_toggle, is_active);
+                if primary {
+                    // 窗口置顶按钮注入：点击时切换置顶并刷新按钮视觉状态
+                    let on_toggle: std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync> =
+                        std::sync::Arc::new(|_window: &mut Window, cx: &mut App| {
+                            toggle_always_on_top(cx);
+                            if let Some(tab_container) = cx
+                                .try_global::<GlobalTabContainer>()
+                                .map(|global| global.tab_container.clone())
+                            {
+                                tab_container.update(cx, |_, cx| cx.notify());
+                            }
+                        });
+                    let is_active: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+                        std::sync::Arc::new(|| ALWAYS_ON_TOP.load(Ordering::Relaxed));
+                    container = container
+                        .with_window_controls(true)
+                        .with_always_on_top_control(on_toggle, is_active);
+                }
             }
 
             container
         });
+        let split_container = cx.new(|cx| SplitTabContainer::new(window, cx, pane_factory.clone()));
+        let tab_container = split_container.read(cx).primary_pane();
 
         cx.set_global(GlobalTabContainer {
             tab_container: tab_container.clone(),
         });
-        // Set HomePage as the pinned tab (always visible, not scrollable)
+        // Initialize fixed tabs before the scrollable workspace tabs.
         {
+            let layout = initial_home_tab_layout(AppSettings::current(cx).startup_default_page);
             let tab_container_clone = tab_container.clone();
             tab_container.update(cx, |tc, cx| {
                 let home_page = cx.new(|cx| HomePage::new(tab_container_clone, window, cx));
                 cx.set_global(GlobalHomePage {
                     home_page: home_page.clone(),
                 });
-                let home_tab = TabItem::new("home", "app", home_page);
-                tc.set_pinned_tab(home_tab, cx);
-                tc.activate_pinned_tab(window, cx);
+                let home_tab = TabItem::new(layout.home_tab_id, "app", home_page);
+                tc.add_pinned_tab(home_tab, cx);
+
+                let connections = cx
+                    .global::<GlobalStorageState>()
+                    .storage
+                    .get::<ConnectionRepository>()
+                    .and_then(|repo| repo.list().ok())
+                    .unwrap_or_default();
+                let (scope, catalog, mentions) =
+                    ai_chat_view::build_workbench_resource_state(&connections);
+                let workbench = cx.new(|cx| {
+                    ai_chat_view::DefaultAgentChatPanel::new_workbench_with_scope_and_catalog(
+                        scope, catalog, mentions, window, cx,
+                    )
+                });
+                let workbench_tab = TabItem::new(layout.workbench_tab_id, "app", workbench);
+                tc.add_pinned_tab(workbench_tab, cx);
+                tc.activate_pinned_tab_at(layout.active_pinned_index, window, cx);
             });
         }
 
-        Self { tab_container }
+        Self { split_container }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_log_file_path, default_log_file_path, log_file_appender};
+    use super::{
+        configured_log_file_path, default_log_file_path, initial_home_tab_layout, log_file_appender,
+    };
+    use one_core::settings::StartupDefaultPage;
     use std::io::Write;
+
+    #[test]
+    fn initial_layout_pins_home_and_ai_workbench_with_ai_active() {
+        let layout = initial_home_tab_layout(StartupDefaultPage::AiWorkbench);
+
+        assert_eq!("home", layout.home_tab_id);
+        assert_eq!("ai-workbench", layout.workbench_tab_id);
+        assert_eq!(1, layout.active_pinned_index);
+    }
+
+    #[test]
+    fn initial_layout_uses_startup_default_page_for_active_pinned_tab() {
+        let home_layout = initial_home_tab_layout(StartupDefaultPage::Home);
+        let ai_layout = initial_home_tab_layout(StartupDefaultPage::AiWorkbench);
+
+        assert_eq!(0, home_layout.active_pinned_index);
+        assert_eq!(1, ai_layout.active_pinned_index);
+    }
 
     #[test]
     fn configured_log_file_path_uses_default_for_empty_value() {
@@ -722,7 +856,7 @@ impl Render for OnetCliApp {
             .size_full()
             .relative()
             .bg(cx.theme().background)
-            .child(div().size_full().child(self.tab_container.clone()))
+            .child(div().size_full().child(self.split_container.clone()))
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)

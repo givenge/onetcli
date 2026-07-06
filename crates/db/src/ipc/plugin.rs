@@ -6,8 +6,8 @@ use crate::import_export::{
     ImportResult,
 };
 use crate::ipc::client::JsonRpcClient;
-use crate::ipc::connection::{ExternalDbConnection, WIRE_PREFIX};
-use crate::ipc::protocol::driver_config_value_with_target;
+use crate::ipc::connection::ExternalDbConnection;
+use crate::ipc::protocol::{WIRE_PREFIX, driver_config_value_with_target, schema_users_wire_sql};
 use crate::ipc::registry::{
     IpcDriverManifest, IpcDriverRegistry, LimitStyle, TableReferenceSchemaMode,
 };
@@ -17,6 +17,9 @@ use crate::oracle::OraclePlugin;
 use crate::plugin::{ConnectionLifecycle, DatabasePlugin, SqlCompletionInfo};
 use crate::plugin_manifest::{DatabaseCapabilities, DatabaseUiManifest};
 use crate::postgresql::PostgresPlugin;
+use crate::schema_preferences::{
+    SchemaFilterProfile, filter_schemas, schema_filter_profile_for_database_type,
+};
 use crate::sqlite::SqlitePlugin;
 use crate::ssh_tunnel::resolve_connection_target;
 use crate::streaming_parser::StreamingSqlParser;
@@ -88,6 +91,15 @@ impl ExternalDatabasePlugin {
             self.driver.dialect.compatible_database_type,
             Some(DatabaseType::Oracle)
         )
+    }
+
+    fn schema_filter_profile(&self) -> SchemaFilterProfile {
+        self.driver
+            .dialect
+            .compatible_database_type
+            .as_ref()
+            .map(schema_filter_profile_for_database_type)
+            .unwrap_or(SchemaFilterProfile::None)
     }
 
     fn oracle_table_save_request(&self, request: &TableSaveRequest) -> TableSaveRequest {
@@ -719,15 +731,22 @@ impl DatabasePlugin for ExternalDatabasePlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<Vec<String>> {
-        self.metadata(
-            connection,
-            wire_method::SCHEMA_SCHEMAS,
-            serde_json::json!({ "database": database }),
-        )
-        .await
-        .map(|schemas: Vec<wire_schema::SchemaInfo>| {
-            schemas.into_iter().map(|schema| schema.name).collect()
-        })
+        let schemas = self
+            .metadata(
+                connection,
+                wire_method::SCHEMA_SCHEMAS,
+                serde_json::json!({ "database": database }),
+            )
+            .await
+            .map(|schemas: Vec<wire_schema::SchemaInfo>| {
+                schemas.into_iter().map(|schema| schema.name).collect()
+            })?;
+
+        Ok(filter_schemas(
+            connection.config(),
+            self.schema_filter_profile(),
+            schemas,
+        ))
     }
 
     async fn list_schemas_view(
@@ -1371,6 +1390,24 @@ impl DatabasePlugin for ExternalDatabasePlugin {
         Ok(join_ddl_statements(result.statements, None))
     }
 
+    fn build_list_users_sql(&self, database: Option<&str>) -> Option<String> {
+        let fallback = self
+            .compatible_plugin()
+            .and_then(|plugin| plugin.build_list_users_sql(database));
+        let declares_methods = !self.driver.methods.is_empty();
+        let supports_users_method = self
+            .driver
+            .methods
+            .iter()
+            .any(|method| method == wire_method::SCHEMA_USERS);
+
+        if supports_users_method || !declares_methods {
+            return Some(schema_users_wire_sql(fallback.as_deref()));
+        }
+
+        fallback
+    }
+
     async fn drop_database_async(&self, database: &str) -> Result<String> {
         self.build_drop_database_sql_async(database).await
     }
@@ -1494,16 +1531,21 @@ impl DatabasePlugin for ExternalDatabasePlugin {
     }
 
     fn build_create_table_sql(&self, design: &TableDesign) -> String {
-        let columns = design
+        let mut definitions = design
             .columns
             .iter()
             .map(|column| self.build_column_def(column))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        definitions.extend(
+            design
+                .foreign_keys
+                .iter()
+                .map(|foreign_key| self.build_foreign_key_def(foreign_key)),
+        );
         format!(
             "CREATE TABLE {} ({})",
             self.quote_identifier(&design.table_name),
-            columns
+            definitions.join(", ")
         )
     }
 
@@ -1519,9 +1561,26 @@ impl DatabasePlugin for ExternalDatabasePlugin {
             .iter()
             .map(|column| (column.name.as_str(), column))
             .collect();
+        let original_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = original
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+        let new_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
         let mut statements = Vec::new();
         let (index_drops, index_creates) = self.build_index_change_sql(&table, original, new);
 
+        for (name, original_foreign_key) in &original_foreign_keys {
+            match new_foreign_keys.get(name) {
+                Some(new_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements.push(self.build_drop_foreign_key_sql(&new.table_name, name)),
+            }
+        }
         statements.extend(index_drops);
         for column in &new.columns {
             if !original_cols.contains_key(column.name.as_str()) {
@@ -1545,6 +1604,14 @@ impl DatabasePlugin for ExternalDatabasePlugin {
             }
         }
         statements.extend(index_creates);
+        for (name, new_foreign_key) in &new_foreign_keys {
+            match original_foreign_keys.get(name) {
+                Some(original_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements
+                    .push(self.build_add_foreign_key_sql(&new.table_name, new_foreign_key)),
+            }
+        }
 
         if statements.is_empty() {
             "-- No changes detected".to_string()
@@ -1995,7 +2062,7 @@ fn object_view(
         title: title.into(),
         columns: columns
             .into_iter()
-            .map(|name| gpui_component::table::Column::new(name, name))
+            .map(|name| ObjectViewColumn::new(name, name))
             .collect(),
         rows,
     }
@@ -2035,8 +2102,8 @@ fn object_view_from_wire(
     })
 }
 
-fn column_from_wire(column: wire_schema::ObjectViewColumn) -> gpui_component::table::Column {
-    let mut result = gpui_component::table::Column::new(column.key, column.name);
+fn column_from_wire(column: wire_schema::ObjectViewColumn) -> ObjectViewColumn {
+    let mut result = ObjectViewColumn::new(column.key, column.name);
     if let Some(width) = column
         .width_px
         .filter(|width| width.is_finite() && *width >= MIN_CUSTOM_COLUMN_WIDTH_PX)
@@ -2062,7 +2129,7 @@ mod tests {
     use crate::QueryResult;
     use crate::connection::StreamingProgress;
     use crate::executor::{ExecOptions, SqlResult, SqlSource};
-    use crate::ipc::connection::WIRE_PREFIX;
+    use crate::ipc::protocol::WIRE_PREFIX;
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
@@ -2394,6 +2461,42 @@ mod tests {
             Some("singlefile:/tmp/from-extra.db".to_string()),
             lifecycle.physical_open_lock_key
         );
+    }
+
+    #[test]
+    fn external_user_listing_uses_schema_users_wire_method() {
+        let mut driver = driver_manifest("users", false, "users.connection");
+        driver.methods = vec![wire_method::SCHEMA_USERS.to_string()];
+        driver.dialect.compatible_database_type = Some(DatabaseType::PostgreSQL);
+        let plugin = ExternalDatabasePlugin::for_driver(driver);
+
+        let sql = plugin
+            .build_list_users_sql(None)
+            .expect("schema/users should be available");
+        let envelope: serde_json::Value =
+            serde_json::from_str(sql.strip_prefix(WIRE_PREFIX).unwrap()).unwrap();
+
+        assert_eq!(Some(wire_method::SCHEMA_USERS), envelope["method"].as_str());
+        assert!(
+            envelope["params"]["fallback_sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("pg_catalog.pg_roles"))
+        );
+    }
+
+    #[test]
+    fn external_user_listing_falls_back_when_declared_method_set_excludes_users() {
+        let mut driver = driver_manifest("users", false, "users.connection");
+        driver.methods = vec![wire_method::SCHEMA_DATABASES.to_string()];
+        driver.dialect.compatible_database_type = Some(DatabaseType::PostgreSQL);
+        let plugin = ExternalDatabasePlugin::for_driver(driver);
+
+        let sql = plugin
+            .build_list_users_sql(None)
+            .expect("compatible PostgreSQL fallback should be available");
+
+        assert!(sql.contains("pg_catalog.pg_roles"));
+        assert!(!sql.starts_with(WIRE_PREFIX));
     }
 
     #[test]
@@ -2740,10 +2843,10 @@ mod tests {
         assert_eq!(DbNodeType::Column, view.db_node_type);
         assert_eq!("Driver Columns", view.title);
         assert_eq!(2, view.columns.len());
-        assert_eq!("Field", view.columns[0].name.as_ref());
-        assert_eq!(gpui::px(220.0), view.columns[0].width);
-        assert_eq!("Null?", view.columns[1].name.as_ref());
-        assert_eq!(gpui::TextAlign::Right, view.columns[1].align);
+        assert_eq!("Field", view.columns[0].label);
+        assert_eq!(220.0, view.columns[0].width_px);
+        assert_eq!("Null?", view.columns[1].label);
+        assert_eq!(ObjectViewColumnAlign::Right, view.columns[1].align);
         assert_eq!(
             vec![
                 vec!["id".to_string(), "false".to_string()],
@@ -2763,7 +2866,7 @@ mod tests {
         assert_eq!(DbNodeType::Database, view.db_node_type);
         assert_eq!("Databases", view.title);
         assert_eq!(2, view.columns.len());
-        assert_eq!("Name", view.columns[0].name.as_ref());
+        assert_eq!("Name", view.columns[0].label);
         assert_eq!(vec![vec!["mockdb".to_string(), String::new()]], view.rows);
     }
 
@@ -2986,5 +3089,70 @@ mod tests {
 
         assert!(sql.contains("DROP INDEX IF EXISTS \"idx_payload\";"));
         assert!(sql.contains("CREATE UNIQUE INDEX \"idx_id\" ON \"events\" (\"id\");"));
+    }
+
+    #[test]
+    fn sync_create_table_builder_includes_foreign_keys() {
+        let plugin = ExternalDatabasePlugin::new();
+        let mut design = TableDesign::new("main", "order_items");
+        design.add_column(ColumnDefinition::new("id").data_type("INTEGER"));
+        design.add_column(ColumnDefinition::new("order_id").data_type("INTEGER"));
+        design.foreign_keys.push(ForeignKeyDefinition {
+            name: "fk_order_items_order".to_string(),
+            columns: vec!["order_id".to_string()],
+            ref_table: "orders".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete: "CASCADE".to_string(),
+            on_update: "NO ACTION".to_string(),
+        });
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE NO ACTION"
+        ));
+    }
+
+    #[test]
+    fn sync_alter_table_builder_includes_foreign_key_changes() {
+        let plugin = ExternalDatabasePlugin::new();
+        let mut original = TableDesign::new("main", "order_items");
+        original.add_column(ColumnDefinition::new("id").data_type("INTEGER"));
+        original.add_column(ColumnDefinition::new("order_id").data_type("INTEGER"));
+        original.add_column(ColumnDefinition::new("legacy_order_id").data_type("INTEGER"));
+        original.foreign_keys.push(ForeignKeyDefinition {
+            name: "fk_order_items_legacy".to_string(),
+            columns: vec!["legacy_order_id".to_string()],
+            ref_table: "orders".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete: String::new(),
+            on_update: String::new(),
+        });
+
+        let mut current = TableDesign::new("main", "order_items");
+        current.add_column(ColumnDefinition::new("id").data_type("INTEGER"));
+        current.add_column(ColumnDefinition::new("order_id").data_type("INTEGER"));
+        current.foreign_keys.push(ForeignKeyDefinition {
+            name: "fk_order_items_order".to_string(),
+            columns: vec!["order_id".to_string()],
+            ref_table: "orders".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete: "CASCADE".to_string(),
+            on_update: "NO ACTION".to_string(),
+        });
+
+        let sql = plugin.build_alter_table_sql(&original, &current);
+
+        assert!(
+            sql.contains("ALTER TABLE \"order_items\" DROP CONSTRAINT \"fk_order_items_legacy\";")
+        );
+        assert!(
+            sql.find("DROP CONSTRAINT \"fk_order_items_legacy\"")
+                .unwrap()
+                < sql.find("DROP COLUMN \"legacy_order_id\"").unwrap()
+        );
+        assert!(sql.contains(
+            "ALTER TABLE \"order_items\" ADD CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE NO ACTION;"
+        ));
     }
 }

@@ -99,6 +99,15 @@ pub struct DatabaseOperationRequest {
     pub field_values: HashMap<String, String>,
 }
 
+/// Database user operation request.
+#[derive(Clone, Debug)]
+pub struct DatabaseUserOperationRequest {
+    pub user_name: String,
+    pub host: Option<String>,
+    pub database: Option<String>,
+    pub field_values: HashMap<String, String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectionLifecycle {
     pub close_on_release: bool,
@@ -574,6 +583,79 @@ pub trait DatabasePlugin: Send + Sync {
 
     async fn build_drop_database_sql_async(&self, database_name: &str) -> Result<String> {
         Ok(self.build_drop_database_sql(database_name))
+    }
+
+    // === User Management Operations ===
+    /// Build SQL for listing database users.
+    fn build_list_users_sql(&self, _database: Option<&str>) -> Option<String> {
+        None
+    }
+
+    /// Columns used by the database users view. The order must match `build_list_users_sql`.
+    fn user_list_columns(&self) -> Vec<ObjectViewColumn> {
+        Vec::new()
+    }
+
+    /// List database users as a view model with localized column labels.
+    async fn list_users_view(
+        &self,
+        connection: &dyn DbConnection,
+        database: Option<&str>,
+    ) -> Result<ObjectView> {
+        let sql = self
+            .build_list_users_sql(database)
+            .ok_or_else(|| anyhow!("database users are not supported"))?;
+        let query = match connection.query(&sql).await? {
+            SqlResult::Query(query) => query,
+            SqlResult::Error(error) => return Err(anyhow!(error.message)),
+            SqlResult::Exec(_) => bail!("user listing did not return a result set"),
+        };
+        let columns = self.user_list_columns();
+        let columns = if columns.is_empty() {
+            query
+                .columns
+                .iter()
+                .map(|name| ObjectViewColumn::new(name.clone(), name.clone()))
+                .map(|column| column.width(180.0))
+                .collect()
+        } else {
+            columns
+        };
+        let rows = query
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| value.unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Ok(ObjectView {
+            db_node_type: DbNodeType::Connection,
+            title: format!("{} user(s)", rows.len()),
+            columns,
+            rows,
+        })
+    }
+
+    /// Build SQL for creating a database user.
+    fn build_create_user_sql(&self, _request: &DatabaseUserOperationRequest) -> Option<String> {
+        None
+    }
+
+    /// Build SQL for modifying a database user.
+    fn build_modify_user_sql(&self, _request: &DatabaseUserOperationRequest) -> Option<String> {
+        None
+    }
+
+    /// Build SQL for dropping a database user.
+    fn build_drop_user_sql(&self, _request: &DatabaseUserOperationRequest) -> Option<String> {
+        None
+    }
+
+    /// Build SQL for changing database user privileges.
+    fn build_user_privileges_sql(&self, _request: &DatabaseUserOperationRequest) -> Option<String> {
+        None
     }
 
     // === Schema Management Operations ===
@@ -2325,6 +2407,16 @@ pub trait DatabasePlugin: Send + Sync {
         format!("TRUNCATE TABLE {}", self.quote_identifier(table))
     }
 
+    /// Truncate table with an optional schema.
+    fn truncate_table_with_schema(
+        &self,
+        database: &str,
+        _schema: Option<&str>,
+        table: &str,
+    ) -> String {
+        self.truncate_table(database, table)
+    }
+
     /// Rename table
     fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> String;
 
@@ -2351,6 +2443,71 @@ pub trait DatabasePlugin: Send + Sync {
 
     /// Build column definition from ColumnDefinition (for table designer)
     fn build_column_def(&self, col: &ColumnDefinition) -> String;
+
+    /// Build FOREIGN KEY constraint definition from ForeignKeyDefinition.
+    fn build_foreign_key_def(&self, foreign_key: &ForeignKeyDefinition) -> String {
+        let columns = foreign_key
+            .columns
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ref_columns = foreign_key
+            .ref_columns
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut definition = format!(
+            "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+            self.quote_identifier(&foreign_key.name),
+            columns,
+            self.quote_identifier(&foreign_key.ref_table),
+            ref_columns
+        );
+        if let Some(action) = foreign_key_action_sql(&foreign_key.on_delete) {
+            definition.push_str(&format!(" ON DELETE {action}"));
+        }
+        if let Some(action) = foreign_key_action_sql(&foreign_key.on_update) {
+            definition.push_str(&format!(" ON UPDATE {action}"));
+        }
+        definition
+    }
+
+    /// Compare two foreign keys for SQL-relevant differences.
+    fn foreign_key_changed(
+        &self,
+        left: &ForeignKeyDefinition,
+        right: &ForeignKeyDefinition,
+    ) -> bool {
+        left.columns != right.columns
+            || left.ref_table != right.ref_table
+            || left.ref_columns != right.ref_columns
+            || foreign_key_action_sql(&left.on_delete) != foreign_key_action_sql(&right.on_delete)
+            || foreign_key_action_sql(&left.on_update) != foreign_key_action_sql(&right.on_update)
+    }
+
+    /// Build SQL for adding a foreign key to an existing table.
+    fn build_add_foreign_key_sql(
+        &self,
+        table_name: &str,
+        foreign_key: &ForeignKeyDefinition,
+    ) -> String {
+        format!(
+            "ALTER TABLE {} ADD {};",
+            self.quote_identifier(table_name),
+            self.build_foreign_key_def(foreign_key)
+        )
+    }
+
+    /// Build SQL for dropping a foreign key from an existing table.
+    fn build_drop_foreign_key_sql(&self, table_name: &str, foreign_key_name: &str) -> String {
+        format!(
+            "ALTER TABLE {} DROP CONSTRAINT {};",
+            self.quote_identifier(table_name),
+            self.quote_identifier(foreign_key_name)
+        )
+    }
 
     /// Build CREATE TABLE SQL from TableDesign
     fn build_create_table_sql(&self, design: &TableDesign) -> String;
@@ -2524,6 +2681,22 @@ pub trait DatabasePlugin: Send + Sync {
         config: &ExportConfig,
         progress_tx: Option<ExportProgressSender>,
     ) -> Result<ExportResult>;
+}
+
+fn foreign_key_action_sql(action: &str) -> Option<String> {
+    let action = action.trim();
+    if action.is_empty() {
+        return None;
+    }
+    let action = action
+        .split_whitespace()
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    match action.as_str() {
+        "CASCADE" | "RESTRICT" | "NO ACTION" | "SET NULL" | "SET DEFAULT" => Some(action),
+        _ => None,
+    }
 }
 
 /// 将 design 中被重命名的列名回退为旧名，以便与 original 做 diff 时不会产生误删/误增。
@@ -2910,6 +3083,24 @@ mod tests {
         let capabilities = DatabasePlugin::capabilities(&plugin);
         assert!(capabilities.supports_functions);
         assert!(capabilities.supports_procedures);
+    }
+
+    #[test]
+    fn database_user_operation_request_keeps_context() {
+        let request = DatabaseUserOperationRequest {
+            user_name: "alice".to_string(),
+            host: Some("10.%".to_string()),
+            database: Some("appdb".to_string()),
+            field_values: HashMap::from([("password".to_string(), "secret".to_string())]),
+        };
+
+        assert_eq!("alice", request.user_name);
+        assert_eq!(Some("10.%"), request.host.as_deref());
+        assert_eq!(Some("appdb"), request.database.as_deref());
+        assert_eq!(
+            Some("secret"),
+            request.field_values.get("password").map(String::as_str)
+        );
     }
 
     #[test]

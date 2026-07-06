@@ -1,11 +1,15 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
-pub mod chatdb;
 pub mod common;
 pub mod compare;
 pub mod connection_form_window;
 pub mod database_objects_tab;
 pub mod database_tab;
+mod database_table_columns;
+mod database_toolbar;
+mod database_users_list;
+mod database_users_tab;
+mod database_users_toolbar;
 pub mod database_view_plugin;
 pub mod db_object_selector;
 mod db_tree_event;
@@ -35,6 +39,6 @@ mod table_data;
 pub mod table_data_tab;
 pub mod table_designer_tab;
 
+pub use ai_chat_view::{AskAiButton, emit_ask_ai_event, init_ask_ai_notifier};
 pub use common::DatabaseFormEvent;
 pub(crate) use driver_i18n::t_driver;
-pub use one_core::ai_chat::ask_ai::{AskAiButton, emit_ask_ai_event, init_ask_ai_notifier};

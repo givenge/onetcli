@@ -1,6 +1,6 @@
-use gpui::{App, AppContext, Context, Entity, FocusHandle, SharedString, Window};
+use gpui::{App, AppContext, Context, Entity, FocusHandle, Window};
 use gpui_component::{IndexPath, input::InputState, select::SelectState};
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption};
+use one_core::cloud_sync::{GlobalCloudUser, TeamOption, ensure_team_key_ready_for_save};
 use one_core::storage::{
     ConnectionType, PortForwardingKind, PortForwardingParams, StoredConnection, Workspace,
 };
@@ -21,7 +21,6 @@ pub struct PortForwardingFormWindowConfig {
 
 pub struct PortForwardingFormWindow {
     pub(super) focus_handle: FocusHandle,
-    pub(super) title: SharedString,
     pub(super) is_editing: bool,
     pub(super) editing_id: Option<i64>,
     pub(super) editing_cloud_id: Option<String>,
@@ -47,11 +46,6 @@ impl PortForwardingFormWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let is_editing = config.editing_connection.is_some();
-        let title = if is_editing {
-            t!("PortForwarding.edit")
-        } else {
-            t!("PortForwarding.new")
-        };
         let name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("PortForwarding.name_placeholder"))
         });
@@ -99,7 +93,6 @@ impl PortForwardingFormWindow {
 
         let mut form = Self {
             focus_handle: cx.focus_handle(),
-            title: title.to_string().into(),
             is_editing,
             editing_id: config.editing_connection.as_ref().and_then(|c| c.id),
             editing_cloud_id: config
@@ -241,6 +234,11 @@ impl PortForwardingFormWindow {
         let mut conn = StoredConnection::new_port_forwarding(name, params, self.workspace_id(cx));
         conn.sync_enabled = self.sync_enabled;
         conn.team_id = self.team_id(cx);
+        if let Err(error) = ensure_team_key_ready_for_save(conn.team_id.as_deref(), cx) {
+            self.validation_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         conn.remark = non_empty_text(&self.remark_input, cx);
         if !self.is_editing {
             conn.owner_id = GlobalCloudUser::get_user(cx).map(|user| user.id);

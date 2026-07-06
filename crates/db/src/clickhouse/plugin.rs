@@ -1,5 +1,5 @@
+use crate::types::ObjectViewColumn as Column;
 use anyhow::Result;
-use gpui_component::table::Column;
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -15,7 +15,9 @@ use crate::manifest_helpers::{
     DatabaseActionDescriptorExt, action, action_with_scope, field, option, ssh_auth_rules,
     ssh_enabled_rules, ssh_field, ssh_number_field, ssh_password_field, tab, yes_no_options,
 };
-use crate::plugin::{DatabaseOperationRequest, DatabasePlugin, SqlCompletionInfo};
+use crate::plugin::{
+    DatabaseOperationRequest, DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo,
+};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
@@ -82,20 +84,116 @@ impl ClickHousePlugin {
 }
 
 fn build_clickhouse_ui_manifest() -> DatabaseUiManifest {
+    let mut forms = vec![
+        clickhouse_connection_form(),
+        clickhouse_database_form(false),
+        clickhouse_database_form(true),
+    ];
+    forms.extend(clickhouse_user_forms());
+
     DatabaseUiManifest {
         capabilities: DatabaseUiCapabilities {
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_functions: true,
             supports_table_engine: true,
             table_engines: clickhouse_engine_names(),
             ..DatabaseUiCapabilities::default()
         },
-        forms: vec![
-            clickhouse_connection_form(),
-            clickhouse_database_form(false),
-            clickhouse_database_form(true),
-        ],
+        forms,
         actions: clickhouse_action_manifest(),
         ..DatabaseUiManifest::default()
+    }
+}
+
+fn clickhouse_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn clickhouse_user_password(request: &DatabaseUserOperationRequest) -> &str {
+    request
+        .field_values
+        .get("password")
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .unwrap_or("change_me")
+}
+
+fn clickhouse_user_privileges(request: &DatabaseUserOperationRequest) -> &str {
+    match request.field_values.get("privileges").map(String::as_str) {
+        Some("SELECT") => "SELECT",
+        Some("INSERT") => "INSERT",
+        Some("ALTER") => "ALTER",
+        Some("ALL") => "ALL",
+        _ => "SELECT",
+    }
+}
+
+fn clickhouse_user_forms() -> Vec<DatabaseFormManifest> {
+    vec![
+        clickhouse_user_form(DatabaseFormKind::CreateUser, true, false),
+        clickhouse_user_form(DatabaseFormKind::EditUser, true, false),
+        clickhouse_user_form(DatabaseFormKind::DeleteUser, false, false),
+        clickhouse_user_form(DatabaseFormKind::UserPrivileges, false, true),
+    ]
+}
+
+fn clickhouse_user_form(
+    kind: DatabaseFormKind,
+    include_password: bool,
+    include_privileges: bool,
+) -> DatabaseFormManifest {
+    let mut fields = vec![field(
+        "name",
+        "DatabaseUser.name",
+        DatabaseFormFieldType::Text,
+    )];
+    if include_password {
+        fields.push(field(
+            "password",
+            "DatabaseUser.password",
+            DatabaseFormFieldType::Password,
+        ));
+    }
+    if include_privileges {
+        fields.push(field(
+            "database",
+            "DatabaseUser.database",
+            DatabaseFormFieldType::Text,
+        ));
+        fields.push(
+            field(
+                "privileges",
+                "DatabaseUser.privileges",
+                DatabaseFormFieldType::Select,
+            )
+            .with_default("SELECT")
+            .with_options(vec![
+                option("SELECT", "DatabaseUser.privilege_select"),
+                option("INSERT", "DatabaseUser.privilege_insert"),
+                option("ALTER", "DatabaseUser.privilege_alter"),
+                option("ALL", "DatabaseUser.privilege_all"),
+            ]),
+        );
+    }
+    DatabaseFormManifest {
+        kind,
+        title_i18n_key: user_form_title_key(kind).into(),
+        submit_i18n_key: "Common.save".into(),
+        tabs: vec![tab("user", "DatabaseUser.user_tab", fields)],
+    }
+}
+
+fn user_form_title_key(kind: DatabaseFormKind) -> &'static str {
+    match kind {
+        DatabaseFormKind::CreateUser => "DatabaseUser.create_title",
+        DatabaseFormKind::EditUser => "DatabaseUser.edit_title",
+        DatabaseFormKind::DeleteUser => "DatabaseUser.delete_title",
+        DatabaseFormKind::UserPrivileges => "DatabaseUser.privileges_title",
+        _ => "DatabaseUser.user_title",
     }
 }
 
@@ -508,6 +606,11 @@ impl DatabasePlugin for ClickHousePlugin {
     fn capabilities(&self) -> DatabaseCapabilities {
         DatabaseUiCapabilities {
             supports_functions: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_table_engine: true,
             table_engines: self.engines(),
             ..DatabaseUiCapabilities::default()
@@ -626,15 +729,13 @@ impl DatabasePlugin for ClickHousePlugin {
     }
 
     async fn list_databases_view(&self, connection: &dyn DbConnection) -> Result<ObjectView> {
-        use gpui::px;
-
         let databases = self.list_databases_detailed(connection).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("engine", "Engine").width(px(120.0)),
-            Column::new("tables", "Tables").width(px(80.0)).text_right(),
-            Column::new("comment", "Comment").width(px(300.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("engine", "Engine").width(120.0),
+            Column::new("tables", "Tables").width(80.0).text_right(),
+            Column::new("comment", "Comment").width(300.0),
         ];
 
         let rows: Vec<Vec<String>> = databases
@@ -754,14 +855,12 @@ impl DatabasePlugin for ClickHousePlugin {
         database: &str,
         _schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let tables = self.list_tables(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("engine", "Engine").width(px(150.0)),
-            Column::new("comment", "Comment").width(px(300.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("engine", "Engine").width(150.0),
+            Column::new("comment", "Comment").width(300.0),
         ];
 
         let rows: Vec<Vec<String>> = tables
@@ -853,18 +952,16 @@ impl DatabasePlugin for ClickHousePlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns = self
             .list_columns(connection, database, schema, table)
             .await?;
 
         let column_defs = vec![
-            Column::new("name", "Name").width(px(150.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("nullable", "Nullable").width(px(80.0)),
-            Column::new("default", "Default").width(px(150.0)),
-            Column::new("comment", "Comment").width(px(200.0)),
+            Column::new("name", "Name").width(150.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("nullable", "Nullable").width(80.0),
+            Column::new("default", "Default").width(150.0),
+            Column::new("comment", "Comment").width(200.0),
         ];
 
         let rows: Vec<Vec<String>> = columns
@@ -948,14 +1045,12 @@ impl DatabasePlugin for ClickHousePlugin {
         _schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self.list_indexes(connection, database, None, table).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(150.0)),
-            Column::new("type", "Type").width(px(200.0)),
-            Column::new("columns", "Expression").width(px(300.0)),
+            Column::new("name", "Name").width(150.0),
+            Column::new("type", "Type").width(200.0),
+            Column::new("columns", "Expression").width(300.0),
         ];
 
         let rows: Vec<Vec<String>> = indexes
@@ -1020,13 +1115,11 @@ impl DatabasePlugin for ClickHousePlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let views = self.list_views(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("definition", "Definition").width(px(600.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("definition", "Definition").width(600.0),
         ];
 
         let rows: Vec<Vec<String>> = views
@@ -1089,13 +1182,11 @@ impl DatabasePlugin for ClickHousePlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let functions = self.list_functions(connection, database).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("definition", "Definition").width(px(400.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("definition", "Definition").width(400.0),
         ];
 
         let rows: Vec<Vec<String>> = functions
@@ -1133,12 +1224,10 @@ impl DatabasePlugin for ClickHousePlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         Ok(ObjectView {
             db_node_type: DbNodeType::Procedure,
             title: "Procedures".to_string(),
-            columns: vec![Column::new("name", "Name").width(px(200.0))],
+            columns: vec![Column::new("name", "Name").width(200.0)],
             rows: Vec::new(),
         })
     }
@@ -1158,12 +1247,10 @@ impl DatabasePlugin for ClickHousePlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         Ok(ObjectView {
             db_node_type: DbNodeType::Trigger,
             title: "Triggers".to_string(),
-            columns: vec![Column::new("name", "Name").width(px(200.0))],
+            columns: vec![Column::new("name", "Name").width(200.0)],
             rows: Vec::new(),
         })
     }
@@ -1184,12 +1271,10 @@ impl DatabasePlugin for ClickHousePlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         Ok(ObjectView {
             db_node_type: DbNodeType::Sequence,
             title: "Sequences".to_string(),
-            columns: vec![Column::new("name", "Name").width(px(200.0))],
+            columns: vec![Column::new("name", "Name").width(200.0)],
             rows: Vec::new(),
         })
     }
@@ -1217,6 +1302,64 @@ impl DatabasePlugin for ClickHousePlugin {
         }
 
         def
+    }
+
+    fn build_list_users_sql(&self, _database: Option<&str>) -> Option<String> {
+        Some(
+            r#"SELECT
+  name,
+  storage,
+  auth_type
+FROM system.users
+ORDER BY name;"#
+                .to_string(),
+        )
+    }
+
+    fn user_list_columns(&self) -> Vec<Column> {
+        vec![
+            Column::localized("name", "DatabaseUser.columns.name").width(180.0),
+            Column::localized("storage", "DatabaseUser.columns.storage").width(160.0),
+            Column::localized("auth_type", "DatabaseUser.columns.auth_type").width(180.0),
+        ]
+    }
+
+    fn build_create_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "CREATE USER IF NOT EXISTS {} IDENTIFIED WITH plaintext_password BY {};",
+            self.quote_identifier(&request.user_name),
+            clickhouse_string_literal(clickhouse_user_password(request))
+        ))
+    }
+
+    fn build_modify_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "ALTER USER {} IDENTIFIED WITH plaintext_password BY {};",
+            self.quote_identifier(&request.user_name),
+            clickhouse_string_literal(clickhouse_user_password(request))
+        ))
+    }
+
+    fn build_drop_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "DROP USER {};",
+            self.quote_identifier(&request.user_name)
+        ))
+    }
+
+    fn build_user_privileges_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        let database = request
+            .field_values
+            .get("database")
+            .map(String::as_str)
+            .or(request.database.as_deref())
+            .filter(|database| !database.trim().is_empty())?;
+        Some(format!(
+            "GRANT {} ON {}.* TO {};",
+            clickhouse_user_privileges(request),
+            self.quote_identifier(database),
+            self.quote_identifier(&request.user_name)
+        ))
     }
 
     fn build_create_database_sql(&self, request: &DatabaseOperationRequest) -> String {
@@ -1564,11 +1707,29 @@ mod tests {
     use super::*;
     use crate::plugin::DatabasePlugin;
     use crate::plugin_manifest::{DatabaseActionId, DatabaseFormKind};
-    use crate::types::{ColumnDefinition, IndexDefinition, TableDesign, TableOptions};
+    use crate::types::{
+        ColumnDefinition, ForeignKeyDefinition, IndexDefinition, TableDesign, TableOptions,
+    };
     use std::collections::HashMap;
 
     fn create_plugin() -> ClickHousePlugin {
         ClickHousePlugin::new()
+    }
+
+    fn user_request(
+        user_name: &str,
+        database: Option<&str>,
+        values: &[(&str, &str)],
+    ) -> crate::plugin::DatabaseUserOperationRequest {
+        crate::plugin::DatabaseUserOperationRequest {
+            user_name: user_name.to_string(),
+            host: None,
+            database: database.map(str::to_string),
+            field_values: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
     }
 
     // ==================== Basic Plugin Info Tests ====================
@@ -1591,6 +1752,11 @@ mod tests {
     fn test_capabilities() {
         let capabilities = create_plugin().capabilities();
         assert!(capabilities.supports_functions);
+        assert!(capabilities.supports_users);
+        assert!(capabilities.supports_user_create);
+        assert!(capabilities.supports_user_edit);
+        assert!(capabilities.supports_user_delete);
+        assert!(capabilities.supports_user_privileges);
         assert!(!capabilities.supports_procedures);
         assert!(!capabilities.supports_sequences);
         assert_eq!(capabilities.table_engines, clickhouse_engine_names());
@@ -1608,6 +1774,10 @@ mod tests {
                 DatabaseFormKind::Connection,
                 DatabaseFormKind::CreateDatabase,
                 DatabaseFormKind::EditDatabase,
+                DatabaseFormKind::CreateUser,
+                DatabaseFormKind::EditUser,
+                DatabaseFormKind::DeleteUser,
+                DatabaseFormKind::UserPrivileges,
             ]
         );
         assert!(
@@ -1671,6 +1841,51 @@ mod tests {
         let sql = plugin.drop_view("test_db", "my_view");
         assert!(sql.contains("DROP VIEW"));
         assert!(sql.contains("`my_view`"));
+    }
+
+    #[test]
+    fn test_build_list_users_sql() {
+        let plugin = create_plugin();
+        let sql = plugin
+            .build_list_users_sql(Some("appdb"))
+            .expect("ClickHouse supports user listing");
+
+        assert!(sql.contains("FROM system.users"));
+        assert!(sql.contains("name"));
+        assert!(sql.contains("auth_type"));
+    }
+
+    #[test]
+    fn test_build_clickhouse_user_operation_sql() {
+        let plugin = create_plugin();
+        let request = user_request(
+            "app`user",
+            Some("app`db"),
+            &[("password", "pa'ss"), ("privileges", "SELECT")],
+        );
+
+        assert_eq!(
+            Some(
+                "CREATE USER IF NOT EXISTS `app``user` IDENTIFIED WITH plaintext_password BY 'pa''ss';"
+                    .to_string()
+            ),
+            plugin.build_create_user_sql(&request)
+        );
+        assert_eq!(
+            Some(
+                "ALTER USER `app``user` IDENTIFIED WITH plaintext_password BY 'pa''ss';"
+                    .to_string()
+            ),
+            plugin.build_modify_user_sql(&request)
+        );
+        assert_eq!(
+            Some("DROP USER `app``user`;".to_string()),
+            plugin.build_drop_user_sql(&request)
+        );
+        assert_eq!(
+            Some("GRANT SELECT ON `app``db`.* TO `app``user`;".to_string()),
+            plugin.build_user_privileges_sql(&request)
+        );
     }
 
     // ==================== Database Operations Tests ====================
@@ -1816,6 +2031,35 @@ mod tests {
         assert!(sql.contains("ORDER BY"));
     }
 
+    #[test]
+    fn test_build_create_table_sql_ignores_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "events".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("UInt64"),
+                ColumnDefinition::new("order_id").data_type("UInt64"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_events_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains("CREATE TABLE `events`"));
+        assert!(!sql.contains("FOREIGN KEY"));
+        assert!(!sql.contains("fk_events_order"));
+    }
+
     // ==================== ALTER TABLE Tests ====================
 
     #[test]
@@ -1932,6 +2176,42 @@ mod tests {
         assert!(sql.contains("ADD INDEX"));
         assert!(sql.contains("`idx_value`"));
         assert!(sql.contains("`value`"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_ignores_foreign_key_changes() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "events".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("UInt64"),
+                ColumnDefinition::new("order_id").data_type("UInt64"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "events".to_string(),
+            columns: original.columns.clone(),
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_events_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert_eq!("-- No changes detected", sql);
     }
 
     // ==================== Completion Info Tests ====================

@@ -11,8 +11,9 @@ use crate::{
     ActiveTheme, Disableable, ElementExt as _, Icon, IconName, IndexPath, Selectable, Sizable,
     Size, StyleSized, StyledExt,
     actions::{Cancel, Confirm, SelectDown, SelectUp},
+    global_state::GlobalState,
     h_flex,
-    input::{clear_button, input_style},
+    input::{LocalInputStyle, clear_button, input_style},
     list::{List, ListDelegate, ListState},
     v_flex,
 };
@@ -235,7 +236,7 @@ where
             }
 
             _ = state.update(cx, |this, cx| {
-                this.open = false;
+                this.set_open(false, cx);
                 this.focus(window, cx);
             });
         });
@@ -253,7 +254,7 @@ where
                 cx.emit(SelectEvent::Confirm(selected_value.clone()));
                 this.final_selected_index = selected_index;
                 this.selected_value = selected_value;
-                this.open = false;
+                this.set_open(false, cx);
                 this.focus(window, cx);
             });
         });
@@ -316,8 +317,10 @@ struct SelectOptions {
     search_placeholder: Option<SharedString>,
     empty: Option<AnyElement>,
     menu_width: Length,
+    menu_max_h: Length,
     disabled: bool,
     appearance: bool,
+    local_style: Option<LocalInputStyle>,
 }
 
 impl Default for SelectOptions {
@@ -331,9 +334,11 @@ impl Default for SelectOptions {
             title_prefix: None,
             empty: None,
             menu_width: Length::Auto,
+            menu_max_h: rems(20.).into(),
             disabled: false,
             appearance: true,
             search_placeholder: None,
+            local_style: None,
         }
     }
 }
@@ -603,6 +608,7 @@ where
         });
         self.final_selected_index = selected_index;
         self.update_selected_value(window, cx);
+        cx.notify();
     }
 
     /// Set selected value for the select.
@@ -670,13 +676,13 @@ where
             });
         }
 
-        self.open = false;
+        self.set_open(false, cx);
         cx.notify();
     }
 
     fn up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
-            self.open = true;
+            self.set_open(true, cx);
         }
 
         self.list.focus_handle(cx).focus(window, cx);
@@ -685,7 +691,7 @@ where
 
     fn down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
-            self.open = true;
+            self.set_open(true, cx);
         }
 
         self.list.focus_handle(cx).focus(window, cx);
@@ -697,7 +703,7 @@ where
         cx.propagate();
 
         if !self.open {
-            self.open = true;
+            self.set_open(true, cx);
             cx.notify();
         }
 
@@ -707,19 +713,32 @@ where
     fn toggle_menu(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
 
-        self.open = !self.open;
+        self.set_open(!self.open, cx);
         if self.open {
             self.list.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
     }
 
-    fn escape(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn escape(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
             cx.propagate();
+            return;
         }
 
-        self.open = false;
+        cx.stop_propagation();
+        self.set_open(false, cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.open = open;
+        if self.open {
+            GlobalState::global_mut(cx).register_deferred_popover(&self.focus_handle)
+        } else {
+            GlobalState::global_mut(cx).unregister_deferred_popover(&self.focus_handle)
+        }
         cx.notify();
     }
 
@@ -731,7 +750,12 @@ where
 
     /// Returns the title element for the select input.
     fn display_title(&mut self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let default_title = div().text_color(cx.theme().muted_foreground).child(
+        let muted_foreground = self
+            .options
+            .local_style
+            .filter(|_| !self.options.disabled)
+            .map_or(cx.theme().muted_foreground, |style| style.muted_foreground);
+        let default_title = div().text_color(muted_foreground).child(
             self.options
                 .placeholder
                 .clone()
@@ -783,7 +807,23 @@ where
         let allow_open = !(self.open || self.options.disabled);
         let outline_visible = self.open || is_focused && !self.options.disabled;
         let popup_radius = cx.theme().radius.min(px(8.));
+
         let (bg, fg) = input_style(self.options.disabled, cx);
+        let (bg, fg, border, muted_foreground) = self.options.local_style.map_or_else(
+            || (bg, fg, cx.theme().input, cx.theme().muted_foreground),
+            |style| {
+                if self.options.disabled {
+                    (bg, fg, cx.theme().input, cx.theme().muted_foreground)
+                } else {
+                    (
+                        style.background,
+                        style.foreground,
+                        style.border,
+                        style.muted_foreground,
+                    )
+                }
+            },
+        );
 
         self.list
             .update(cx, |list, cx| list.set_searchable(searchable, cx));
@@ -803,10 +843,10 @@ where
                     .when(self.options.appearance, |this| {
                         this.bg(bg)
                             .text_color(fg)
-                            .border_color(cx.theme().input)
+                            .when(self.options.disabled, |this| this.opacity(0.5))
+                            .border_color(border)
                             .rounded(cx.theme().radius)
                             .when(cx.theme().shadow, |this| this.shadow_xs())
-                            .when(self.options.disabled, |this| this.opacity(0.5))
                     })
                     .map(|this| {
                         if self.options.disabled {
@@ -854,7 +894,7 @@ where
                                     None => Icon::new(IconName::ChevronDown),
                                 };
 
-                                this.child(icon.xsmall().text_color(cx.theme().muted_foreground))
+                                this.child(icon.xsmall().text_color(muted_foreground))
                             }),
                     )
                     .on_prepaint({
@@ -876,9 +916,9 @@ where
                                     v_flex()
                                         .occlude()
                                         .mt_1p5()
-                                        .bg(cx.theme().background)
+                                        .bg(bg)
                                         .border_1()
-                                        .border_color(cx.theme().border)
+                                        .border_color(border)
                                         .rounded(popup_radius)
                                         .shadow_md()
                                         .child(
@@ -890,7 +930,7 @@ where
                                                     },
                                                 )
                                                 .with_size(self.options.size)
-                                                .max_h(rems(20.))
+                                                .max_h(self.options.menu_max_h)
                                                 .paddings(Edges::all(px(4.))),
                                         ),
                                 )
@@ -920,6 +960,12 @@ where
     /// Set the width of the dropdown menu, default: Length::Auto
     pub fn menu_width(mut self, width: impl Into<Length>) -> Self {
         self.options.menu_width = width.into();
+        self
+    }
+
+    /// Set the max height of the dropdown menu, default: 20rem
+    pub fn menu_max_h(mut self, max_h: impl Into<Length>) -> Self {
+        self.options.menu_max_h = max_h.into();
         self
     }
 
@@ -972,6 +1018,12 @@ where
     /// Set the appearance of the select, if false the select input will no border, background.
     pub fn appearance(mut self, appearance: bool) -> Self {
         self.options.appearance = appearance;
+        self
+    }
+
+    /// Override closed-control colors for a locally themed embedded panel.
+    pub fn local_style(mut self, style: LocalInputStyle) -> Self {
+        self.options.local_style = Some(style);
         self
     }
 }

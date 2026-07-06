@@ -54,6 +54,7 @@ fn validate_fs_permission(permission: &str) -> Result<ValidatedPermission, Permi
     }
     let allowed = path == "~"
         || path.starts_with("~/")
+        || windows_env_path_prefix(path).is_some()
         || path.starts_with('/')
         || path == "${task.workspace}"
         || path == "${user_pick}";
@@ -66,6 +67,25 @@ fn validate_fs_permission(permission: &str) -> Result<ValidatedPermission, Permi
         PermissionRisk::Normal
     };
     Ok(valid(permission, PermissionKind::FileSystem, risk))
+}
+
+fn windows_env_path_prefix(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix('%')?;
+    let end = rest.find('%')?;
+    let name = &rest[..end];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return None;
+    }
+    let tail = &rest[end + 1..];
+    if tail.starts_with('/') || tail.starts_with('\\') {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 fn validate_net_permission(permission: &str) -> Result<ValidatedPermission, PermissionError> {
@@ -225,4 +245,16 @@ fn is_valid_db_scope(scope: &str) -> bool {
         || scope.contains('/')
         || scope.contains('\\')
         || path_has_escape(scope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_permission;
+
+    #[test]
+    fn secret_permission_allows_termius_localkey_scope() {
+        let permission = validate_permission("secrets:read:termius.localkey").unwrap();
+
+        assert_eq!(permission.raw, "secrets:read:termius.localkey");
+    }
 }

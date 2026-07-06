@@ -1,14 +1,13 @@
 use gpui::{
     AnyElement, App, Context, Corners, Edges, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, actions, div, prelude::FluentBuilder as _, px,
+    StyleRefinement, Styled, TextAlign, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 
-use super::{Input, InputState};
-use crate::button::ButtonVariants;
+use super::{Input, InputState, LocalInputStyle};
+use crate::button::{Button, ButtonVariants};
 use crate::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable, Size, StyledExt as _, button::Button,
-    h_flex, v_flex,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, Size, StyledExt as _, h_flex, v_flex,
 };
 
 actions!(number_input, [Increment, Decrement]);
@@ -31,6 +30,7 @@ pub struct NumberInput {
     suffix: Option<AnyElement>,
     appearance: bool,
     disabled: bool,
+    local_style: Option<LocalInputStyle>,
     style: StyleRefinement,
 }
 
@@ -45,6 +45,7 @@ impl NumberInput {
             suffix: None,
             appearance: true,
             disabled: false,
+            local_style: None,
             style: StyleRefinement::default(),
         }
     }
@@ -73,6 +74,12 @@ impl NumberInput {
         self
     }
 
+    /// Override control colors for a locally themed embedded panel.
+    pub fn local_style(mut self, style: LocalInputStyle) -> Self {
+        self.local_style = Some(style);
+        self
+    }
+
     fn on_increment(state: &Entity<InputState>, window: &mut Window, cx: &mut App) {
         state.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -96,21 +103,11 @@ impl Disableable for NumberInput {
 }
 
 impl InputState {
-    pub(crate) fn on_action_increment(
-        &mut self,
-        _: &Increment,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_action_increment(&mut self, _: &Increment, window: &mut Window, cx: &mut Context<Self>) {
         self.on_number_input_step(StepAction::Increment, window, cx);
     }
 
-    pub(crate) fn on_action_decrement(
-        &mut self,
-        _: &Decrement,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_action_decrement(&mut self, _: &Decrement, window: &mut Window, cx: &mut Context<Self>) {
         self.on_number_input_step(StepAction::Decrement, window, cx);
     }
 
@@ -154,6 +151,13 @@ impl Styled for NumberInput {
 
 impl RenderOnce for NumberInput {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let button_style = self.local_style.map(|style| {
+            StyleRefinement::default()
+                .bg(style.background)
+                .text_color(style.foreground)
+                .border_color(style.border)
+        });
+
         h_flex()
             .id(("number-input", self.state.entity_id()))
             .key_context(CONTEXT)
@@ -171,7 +175,13 @@ impl RenderOnce for NumberInput {
                     .compact()
                     .tab_stop(false)
                     .disabled(self.disabled)
-                    .border_color(cx.theme().input)
+                    .border_color(
+                        self.local_style
+                            .map_or(cx.theme().input, |style| style.border),
+                    )
+                    .when_some(button_style.clone(), |this, style| {
+                        this.refine_style(&style)
+                    })
                     .border_corners(Corners {
                         top_left: true,
                         top_right: false,
@@ -196,8 +206,10 @@ impl RenderOnce for NumberInput {
                     .appearance(self.appearance)
                     .with_size(self.size)
                     .disabled(self.disabled)
+                    .when_some(self.local_style, |this, style| this.local_style(style))
                     .gap_0()
                     .rounded_none()
+                    .text_align(TextAlign::Center)
                     .when_some(self.prefix, |this, prefix| this.prefix(prefix))
                     .when_some(self.suffix, |this, suffix| this.suffix(suffix)),
             )
@@ -209,7 +221,11 @@ impl RenderOnce for NumberInput {
                     .compact()
                     .tab_stop(false)
                     .disabled(self.disabled)
-                    .border_color(cx.theme().input)
+                    .border_color(
+                        self.local_style
+                            .map_or(cx.theme().input, |style| style.border),
+                    )
+                    .when_some(button_style, |this, style| this.refine_style(&style))
                     .border_corners(Corners {
                         top_left: false,
                         top_right: true,

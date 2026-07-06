@@ -1,6 +1,6 @@
+use crate::types::ObjectViewColumn as Column;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use gpui_component::table::Column;
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -142,6 +142,49 @@ impl DuckDbPlugin {
 
     fn primary_key_changed(original: &TableDesign, new: &TableDesign) -> bool {
         Self::primary_key_columns(original) != Self::primary_key_columns(new)
+    }
+
+    fn foreign_key_action(action: &str) -> String {
+        action
+            .trim()
+            .split_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn foreign_key_changed(left: &ForeignKeyDefinition, right: &ForeignKeyDefinition) -> bool {
+        left.columns != right.columns
+            || left.ref_table != right.ref_table
+            || left.ref_columns != right.ref_columns
+            || Self::foreign_key_action(&left.on_delete)
+                != Self::foreign_key_action(&right.on_delete)
+            || Self::foreign_key_action(&left.on_update)
+                != Self::foreign_key_action(&right.on_update)
+    }
+
+    fn foreign_keys_changed(original: &TableDesign, new: &TableDesign) -> bool {
+        let original_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = original
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+        let new_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+
+        if original_foreign_keys.len() != new_foreign_keys.len() {
+            return true;
+        }
+
+        original_foreign_keys.iter().any(|(name, original_key)| {
+            new_foreign_keys
+                .get(name)
+                .map(|new_key| Self::foreign_key_changed(original_key, new_key))
+                .unwrap_or(true)
+        })
     }
 
     fn column_changed_for_alter(original: &ColumnDefinition, new: &ColumnDefinition) -> bool {
@@ -876,13 +919,11 @@ impl DatabasePlugin for DuckDbPlugin {
         database: &str,
         schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let tables = self.list_tables(connection, database, schema).await?;
 
         let columns = vec![
-            Column::new("schema", "Schema").width(px(160.0)),
-            Column::new("name", "Name").width(px(220.0)),
+            Column::new("schema", "Schema").width(160.0),
+            Column::new("name", "Name").width(220.0),
         ];
 
         let rows: Vec<Vec<String>> = tables
@@ -987,18 +1028,16 @@ impl DatabasePlugin for DuckDbPlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns_data = self
             .list_columns(connection, database, schema, table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("type", "Type").width(px(160.0)),
-            Column::new("nullable", "Nullable").width(px(90.0)),
-            Column::new("primary", "Primary").width(px(90.0)),
-            Column::new("default", "Default").width(px(200.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("type", "Type").width(160.0),
+            Column::new("nullable", "Nullable").width(90.0),
+            Column::new("primary", "Primary").width(90.0),
+            Column::new("default", "Default").width(200.0),
         ];
 
         let rows: Vec<Vec<String>> = columns_data
@@ -1081,16 +1120,14 @@ impl DatabasePlugin for DuckDbPlugin {
         schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self
             .list_indexes(connection, database, schema.map(str::to_string), table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("columns", "Columns").width(px(250.0)),
-            Column::new("unique", "Unique").width(px(80.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("columns", "Columns").width(250.0),
+            Column::new("unique", "Unique").width(80.0),
         ];
 
         let rows: Vec<Vec<String>> = indexes
@@ -1167,14 +1204,12 @@ impl DatabasePlugin for DuckDbPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let views = self.list_views(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("schema", "Schema").width(px(160.0)),
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("definition", "Definition").width(px(320.0)),
+            Column::new("schema", "Schema").width(160.0),
+            Column::new("name", "Name").width(180.0),
+            Column::new("definition", "Definition").width(320.0),
         ];
 
         let rows: Vec<Vec<String>> = views
@@ -1389,7 +1424,7 @@ impl DatabasePlugin for DuckDbPlugin {
     }
 
     fn build_alter_table_sql(&self, original: &TableDesign, new: &TableDesign) -> String {
-        if Self::primary_key_changed(original, new) {
+        if Self::primary_key_changed(original, new) || Self::foreign_keys_changed(original, new) {
             self.build_recreate_table_sql(original, new)
         } else {
             self.build_native_alter_sql(original, new)
@@ -1428,7 +1463,9 @@ mod tests {
     use crate::duckdb::DuckDbConnection;
     use crate::plugin::DatabasePlugin;
     use crate::plugin_manifest::{DatabaseActionId, DatabaseFormKind};
-    use crate::types::{ColumnDefinition, IndexDefinition, TableDesign, TableOptions};
+    use crate::types::{
+        ColumnDefinition, ForeignKeyDefinition, IndexDefinition, TableDesign, TableOptions,
+    };
     use one_core::storage::{DatabaseType, DbConnectionConfig};
 
     fn build_config(path: String) -> DbConnectionConfig {
@@ -1496,6 +1533,13 @@ mod tests {
                 .iter()
                 .any(|action| action.id == DatabaseActionId::OpenTableData)
         );
+    }
+
+    #[test]
+    fn test_user_listing_is_not_supported() {
+        let plugin = create_plugin();
+
+        assert_eq!(None, plugin.build_list_users_sql(None));
     }
 
     #[tokio::test]
@@ -1621,6 +1665,39 @@ mod tests {
     }
 
     #[test]
+    fn test_build_create_table_sql_with_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id")
+                    .data_type("INTEGER")
+                    .nullable(false),
+                ColumnDefinition::new("order_id")
+                    .data_type("INTEGER")
+                    .nullable(false),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "NO ACTION".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE NO ACTION"
+        ));
+    }
+
+    #[test]
     fn test_build_alter_table_sql_prefers_native_duckdb_alter_statements() {
         let plugin = create_plugin();
         let original = TableDesign {
@@ -1714,5 +1791,45 @@ mod tests {
         assert!(sql.contains("INSERT INTO"));
         assert!(sql.contains("DROP TABLE \"users\";"));
         assert!(sql.contains("ALTER TABLE \"users_duckdb_tmp\" RENAME TO \"users\";"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_recreates_table_when_foreign_keys_change() {
+        let plugin = create_plugin();
+        let original = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INTEGER"),
+                ColumnDefinition::new("order_id").data_type("INTEGER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+        let current = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "order_items".to_string(),
+            columns: original.columns.clone(),
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "NO ACTION".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &current);
+
+        assert!(sql.contains("order_items_duckdb_tmp"));
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE NO ACTION"
+        ));
+        assert!(sql.contains("DROP TABLE \"order_items\";"));
+        assert!(sql.contains("ALTER TABLE \"order_items_duckdb_tmp\" RENAME TO \"order_items\";"));
     }
 }

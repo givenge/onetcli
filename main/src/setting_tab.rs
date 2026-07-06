@@ -6,6 +6,9 @@ use crate::app_init::is_valid_system_hotkey;
 use crate::auth::get_auth_service;
 use crate::settings::llm_providers_view::LlmProvidersView;
 use crate::settings::mcp_settings::mcp_setting_group;
+use crate::settings::tool_exposure_settings::{
+    agent_tool_exposure_setting_group, mcp_tool_exposure_setting_group,
+};
 use crate::update;
 use crate::webdav_backup;
 use font_kit::{file_type::FileType, font::Font};
@@ -17,8 +20,8 @@ use gpui::{
     PathPromptOptions, Render, SharedString, Styled, WeakEntity, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, Size, Theme, ThemeMode, TitleBar,
-    WindowExt,
+    ActiveTheme, AxisExt, Disableable, Icon, IconName, IndexPath, Sizable, Size, Theme, ThemeMode,
+    TitleBar, WindowExt,
     button::{Button, ButtonVariants as _},
     clipboard::Clipboard,
     group_box::GroupBoxVariant,
@@ -27,21 +30,34 @@ use gpui_component::{
     kbd::Kbd,
     scroll::ScrollableElement,
     select::{Select, SelectItem, SelectState},
-    setting::{NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{
+        NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage,
+        Settings,
+    },
     switch::Switch,
     v_flex,
 };
+use one_core::cloud_sync::{
+    CloudSyncService, GlobalCloudUser, SyncEngine, TeamKeyStatus, TeamOption,
+    forget_team_key_for_cached_team, get_cached_team_options, personal::SyncStoreHealth,
+    save_team_key_for_cached_team,
+};
+use one_core::crypto;
 use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::action_id;
 use one_core::llm::manager::GlobalProviderState;
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
+use one_core::storage::GlobalStorageState;
 pub const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
 pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
+const TEAM_KEYS_SETTINGS_PAGE_INDEX: usize = 2;
 
+use gpui_component::input::InputEvent;
 pub use one_core::settings::{
     AppSettings, CustomFont, DatabaseOpenMode, GlobalCurrentUser, GlobalProxySettings, LOCALE_EN,
-    LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK, LargeTextCellEditorOpenMode, ProxyType,
-    WebDavBackupSettings, effective_locale_for_setting,
+    LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK, LargeTextCellEditorOpenMode,
+    PersonalSyncBackendKind, PersonalSyncSettings, ProxyType, StartupDefaultPage, SyncProvider,
+    effective_locale_for_setting, is_installed_font_family, is_supported_grid_monospace_font,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
@@ -73,6 +89,7 @@ fn app_font_options(cx: &App) -> Vec<(SharedString, SharedString)> {
         builtin_app_font_options(),
         &AppSettings::global(cx).custom_fonts,
         FontFamilyKind::Any,
+        None,
     )
 }
 
@@ -84,10 +101,12 @@ fn builtin_monospace_font_options() -> Vec<(SharedString, SharedString)> {
 }
 
 fn monospace_font_options(cx: &App) -> Vec<(SharedString, SharedString)> {
+    let installed_font_names = cx.text_system().all_font_names();
     merge_font_options_with_custom_fonts(
         builtin_monospace_font_options(),
         &AppSettings::global(cx).custom_fonts,
         FontFamilyKind::Monospace,
+        Some(&installed_font_names),
     )
 }
 
@@ -101,18 +120,49 @@ fn merge_font_options_with_custom_fonts(
     mut options: Vec<(SharedString, SharedString)>,
     custom_fonts: &[CustomFont],
     kind: FontFamilyKind,
+    installed_font_names: Option<&[String]>,
 ) -> Vec<(SharedString, SharedString)> {
+    if let Some(installed_font_names) = installed_font_names {
+        mark_missing_font_options(&mut options, installed_font_names);
+    }
+
     let custom_families = custom_fonts.iter().flat_map(|font| match kind {
         FontFamilyKind::Any => font.families.iter(),
         FontFamilyKind::Monospace => font.monospace_families.iter(),
     });
     for family in custom_families {
-        if family.trim().is_empty() || options.iter().any(|(value, _)| value.as_ref() == family) {
+        let family = family.trim();
+        if family.is_empty()
+            || matches!(kind, FontFamilyKind::Monospace)
+                && !is_supported_grid_monospace_font(family)
+            || options.iter().any(|(value, _)| value.as_ref() == family)
+        {
             continue;
         }
-        options.push((family.clone().into(), family.clone().into()));
+        let label =
+            if installed_font_names.is_some_and(|names| !is_installed_font_family(family, names)) {
+                missing_font_label(family)
+            } else {
+                family.into()
+            };
+        options.push((family.into(), label));
     }
     options
+}
+
+fn mark_missing_font_options(
+    options: &mut [(SharedString, SharedString)],
+    installed_font_names: &[String],
+) {
+    for (value, label) in options {
+        if !is_installed_font_family(value.as_ref(), installed_font_names) {
+            *label = missing_font_label(value.as_ref());
+        }
+    }
+}
+
+fn missing_font_label(font_family: &str) -> SharedString {
+    format!("{} (未安装)", font_family).into()
 }
 
 const FONT_FILE_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc", "otc"];
@@ -308,25 +358,59 @@ pub struct SettingsPanel {
     llm_providers_view: Entity<LlmProvidersView>,
     size: Size,
     group_variant: GroupBoxVariant,
+    initial_page_index: usize,
+    monospace_font_options_cache: Option<FontOptionsCache>,
+}
+
+#[derive(Clone)]
+struct FontOptionsCache {
+    custom_fonts: Vec<CustomFont>,
+    options: Vec<(SharedString, SharedString)>,
 }
 
 impl SettingsPanel {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_initial_page(0, cx)
+    }
+
+    pub fn new_team_keys(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_initial_page(TEAM_KEYS_SETTINGS_PAGE_INDEX, cx)
+    }
+
+    fn new_with_initial_page(initial_page_index: usize, cx: &mut Context<Self>) -> Self {
         let llm_providers_view = cx.new(|cx| LlmProvidersView::new(cx));
         Self {
             focus_handle: cx.focus_handle(),
             llm_providers_view,
             size: Size::default(),
             group_variant: GroupBoxVariant::Outline,
+            initial_page_index,
+            monospace_font_options_cache: None,
         }
     }
 
-    fn setting_pages(&self, _window: &mut Window, cx: &App) -> Vec<SettingPage> {
+    fn cached_monospace_font_options(&mut self, cx: &App) -> Vec<(SharedString, SharedString)> {
+        let custom_fonts = AppSettings::global(cx).custom_fonts.clone();
+        if let Some(cache) = &self.monospace_font_options_cache
+            && cache.custom_fonts == custom_fonts
+        {
+            return cache.options.clone();
+        }
+
+        let options = monospace_font_options(cx);
+        self.monospace_font_options_cache = Some(FontOptionsCache {
+            custom_fonts,
+            options: options.clone(),
+        });
+        options
+    }
+
+    fn setting_pages(&mut self, _window: &mut Window, cx: &App) -> Vec<SettingPage> {
         let llm_view = self.llm_providers_view.clone();
         let default_settings = AppSettings::default();
         let default_system_hotkey = AppSettings::default().current_system_hotkey().to_string();
         let app_font_options = app_font_options(cx);
-        let font_options = monospace_font_options(cx);
+        let font_options = self.cached_monospace_font_options(cx);
 
         vec![
             SettingPage::new(t!("Settings.General.title"))
@@ -371,6 +455,45 @@ impl SettingsPanel {
                             )
                             .description(
                                 t!("Settings.General.Language.ui_language_desc").to_string(),
+                            ),
+                        ]),
+                    SettingGroup::new()
+                        .title(t!("Settings.General.Startup.group_title"))
+                        .items(vec![
+                            SettingItem::new(
+                                t!("Settings.General.Startup.default_page"),
+                                SettingField::dropdown(
+                                    vec![
+                                        (
+                                            StartupDefaultPage::Home.as_str().into(),
+                                            t!("Settings.General.Startup.default_page_home").into(),
+                                        ),
+                                        (
+                                            StartupDefaultPage::AiWorkbench.as_str().into(),
+                                            t!(
+                                                "Settings.General.Startup.default_page_ai_workbench"
+                                            )
+                                            .into(),
+                                        ),
+                                    ],
+                                    |cx: &App| {
+                                        SharedString::from(
+                                            AppSettings::global(cx).startup_default_page.as_str(),
+                                        )
+                                    },
+                                    |val: SharedString, cx: &mut App| {
+                                        let page = StartupDefaultPage::from_str(val.as_ref());
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.startup_default_page = page;
+                                        });
+                                    },
+                                )
+                                .default_value(SharedString::from(
+                                    default_settings.startup_default_page.as_str(),
+                                )),
+                            )
+                            .description(
+                                t!("Settings.General.Startup.default_page_desc").to_string(),
                             ),
                         ]),
                     SettingGroup::new()
@@ -757,6 +880,8 @@ impl SettingsPanel {
                                 t!("Settings.General.Database.table_row_height_desc").to_string(),
                             ),
                         ]),
+                    mcp_tool_exposure_setting_group(&default_settings.tool_exposure),
+                    agent_tool_exposure_setting_group(&default_settings.tool_exposure),
                     mcp_setting_group(&default_settings.mcp),
                     SettingGroup::new()
                         .title(t!("Settings.General.Log.group_title"))
@@ -808,11 +933,15 @@ impl SettingsPanel {
                             render_global_proxy_settings_item(cx)
                         })),
                 ]),
-            SettingPage::new(t!("Settings.Backup.title")).group(SettingGroup::new().item(
-                SettingItem::render(move |_options, _window, cx| {
-                    render_webdav_backup_settings_item(cx)
-                }),
-            )),
+            SettingPage::new(t!("Settings.Sync.title"))
+                .resettable(true)
+                .group(sync_setting_group(
+                    default_settings.sync_provider,
+                    &default_settings.personal_sync,
+                )),
+            SettingPage::new(t!("TeamSync.manage_keys"))
+                .resettable(false)
+                .group(team_key_setting_group()),
             // 快捷键页面
             SettingPage::new(t!("Settings.Shortcuts.title")).group(
                 SettingGroup::new().item(SettingItem::render(move |_options, window, cx| {
@@ -830,6 +959,854 @@ impl SettingsPanel {
             )),
         ]
     }
+}
+
+fn sync_setting_group(
+    sync_provider_default: SyncProvider,
+    defaults: &PersonalSyncSettings,
+) -> SettingGroup {
+    SettingGroup::new()
+        .title(t!("Settings.Sync.group_title"))
+        .items(vec![
+            sync_provider_item(sync_provider_default),
+            personal_sync_backend_item(defaults.backend),
+            personal_sync_path_item(defaults.path.clone()),
+            personal_sync_auto_sync_item(defaults.auto_sync),
+            personal_sync_git_auto_push_item(defaults.git.auto_push),
+            SettingItem::render(move |_options, window, cx| {
+                render_personal_sync_actions(window, cx)
+            }),
+        ])
+}
+
+fn sync_provider_item(default: SyncProvider) -> SettingItem {
+    SettingItem::new(
+        t!("Settings.Sync.provider"),
+        SettingField::dropdown(
+            sync_provider_options(),
+            |cx: &App| SharedString::from(AppSettings::global(cx).sync_provider.as_str()),
+            |val: SharedString, cx: &mut App| {
+                AppSettings::update_and_save(cx, |settings| {
+                    settings.sync_provider = SyncProvider::from_str(&val);
+                });
+            },
+        )
+        .default_value(SharedString::from(default.as_str())),
+    )
+    .description(t!("Settings.Sync.provider_desc").to_string())
+}
+
+fn sync_provider_options() -> Vec<(SharedString, SharedString)> {
+    vec![
+        (
+            SharedString::from(SyncProvider::OnetCloud.as_str()),
+            SharedString::from(t!("Settings.Sync.Provider.onet_cloud").to_string()),
+        ),
+        (
+            SharedString::from(SyncProvider::Personal.as_str()),
+            SharedString::from(t!("Settings.Sync.Provider.personal").to_string()),
+        ),
+    ]
+}
+
+fn personal_sync_backend_item(default: PersonalSyncBackendKind) -> SettingItem {
+    SettingItem::new(
+        t!("Settings.Sync.backend"),
+        SettingField::dropdown(
+            personal_sync_backend_options(),
+            |cx: &App| SharedString::from(AppSettings::global(cx).personal_sync.backend.as_str()),
+            |val: SharedString, cx: &mut App| {
+                AppSettings::update_and_save(cx, |settings| {
+                    settings.personal_sync.backend = PersonalSyncBackendKind::from_str(&val);
+                });
+            },
+        )
+        .default_value(SharedString::from(default.as_str())),
+    )
+    .description(t!("Settings.Sync.backend_desc").to_string())
+}
+
+fn personal_sync_path_item(default: String) -> SettingItem {
+    SettingItem::new(
+        t!("Settings.Sync.path"),
+        SettingField::render(move |options, window, cx| {
+            render_personal_sync_path_field(default.clone(), options, window, cx)
+        }),
+    )
+    .description(t!("Settings.Sync.path_desc").to_string())
+}
+
+struct PersonalSyncPathInputState {
+    input: Entity<InputState>,
+    _subscription: gpui::Subscription,
+}
+
+fn render_personal_sync_path_field(
+    default: String,
+    options: &gpui_component::setting::RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let value = SharedString::from(AppSettings::global(cx).personal_sync.path.clone());
+    let state = window
+        .use_keyed_state(
+            SharedString::from(format!(
+                "personal-sync-path-{}-{}-{}",
+                options.page_ix, options.group_ix, options.item_ix
+            )),
+            cx,
+            |window, cx| {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .default_value(value)
+                        .placeholder(default)
+                });
+                let _subscription = cx.subscribe(&input, |_, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let path = input.read(cx).value();
+                        AppSettings::update_and_save(cx, |settings| {
+                            settings.personal_sync.path = path.trim().to_string();
+                        });
+                    }
+                });
+                PersonalSyncPathInputState {
+                    input,
+                    _subscription,
+                }
+            },
+        )
+        .read(cx);
+    let input = state.input.clone();
+    h_flex()
+        .gap_2()
+        .child(Input::new(&input).with_size(options.size).map(|this| {
+            if options.layout.is_horizontal() {
+                this.w_64()
+            } else {
+                this.w_full()
+            }
+        }))
+        .child(
+            Button::new("personal-sync-select-directory")
+                .icon(IconName::Folder)
+                .with_size(options.size)
+                .tooltip(t!("Settings.Sync.select_directory").to_string())
+                .on_click(move |_, window, cx| {
+                    prompt_for_personal_sync_directory(input.clone(), window, cx);
+                }),
+        )
+        .into_any_element()
+}
+
+fn prompt_for_personal_sync_directory(
+    input: Entity<InputState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let target_window = window.window_handle();
+    let future = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some(t!("Settings.Sync.select_directory").to_string().into()),
+    });
+    window
+        .spawn(cx, async move |cx| {
+            if let Ok(Ok(Some(paths))) = future.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let path = path.to_string_lossy().to_string();
+                    let _ = cx.update(|_view, cx: &mut App| {
+                        AppSettings::update_and_save(cx, |settings| {
+                            settings.personal_sync.path = path.clone();
+                        });
+                        let _ = cx.update_window(target_window, |_, window, cx| {
+                            input.update(cx, |state, cx| {
+                                state.set_value(path, window, cx);
+                            });
+                            window.refresh();
+                        });
+                    });
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+}
+
+fn personal_sync_auto_sync_item(default: bool) -> SettingItem {
+    SettingItem::new(
+        t!("Settings.Sync.auto_sync"),
+        SettingField::switch(
+            |cx: &App| AppSettings::global(cx).personal_sync.auto_sync,
+            |val: bool, cx: &mut App| {
+                AppSettings::update_and_save(cx, |settings| settings.personal_sync.auto_sync = val);
+            },
+        )
+        .default_value(default),
+    )
+    .description(t!("Settings.Sync.auto_sync_desc").to_string())
+}
+
+fn personal_sync_git_auto_push_item(default: bool) -> SettingItem {
+    SettingItem::new(
+        t!("Settings.Sync.git_auto_push"),
+        SettingField::switch(
+            |cx: &App| AppSettings::global(cx).personal_sync.git.auto_push,
+            |val: bool, cx: &mut App| {
+                AppSettings::update_and_save(cx, |settings| {
+                    settings.personal_sync.git.auto_push = val;
+                });
+            },
+        )
+        .default_value(default),
+    )
+    .description(t!("Settings.Sync.git_auto_push_desc").to_string())
+}
+
+pub(crate) fn personal_sync_backend_options() -> Vec<(SharedString, SharedString)> {
+    vec![
+        (
+            SharedString::from("folder"),
+            SharedString::from(t!("Settings.Sync.Backend.folder")),
+        ),
+        (
+            SharedString::from("git"),
+            SharedString::from(t!("Settings.Sync.Backend.git")),
+        ),
+    ]
+}
+
+pub(crate) fn personal_sync_status_label(health: &SyncStoreHealth) -> String {
+    match health {
+        SyncStoreHealth::Ready => t!("Settings.Sync.Status.ready").to_string(),
+        SyncStoreHealth::NotConfigured => t!("Settings.Sync.Status.not_configured").to_string(),
+        SyncStoreHealth::DirectoryUnavailable => {
+            t!("Settings.Sync.Status.directory_unavailable").to_string()
+        }
+        SyncStoreHealth::SchemaUnsupported => {
+            t!("Settings.Sync.Status.schema_unsupported").to_string()
+        }
+        SyncStoreHealth::GitAuthRequired => {
+            t!("Settings.Sync.Status.git_auth_required").to_string()
+        }
+        SyncStoreHealth::GitMergeConflict => {
+            t!("Settings.Sync.Status.git_merge_conflict").to_string()
+        }
+        SyncStoreHealth::PausedAfterRepeatedFailures => {
+            t!("Settings.Sync.Status.paused_after_repeated_failures").to_string()
+        }
+    }
+}
+
+pub(crate) struct PersonalSyncStatusViewModel {
+    label: String,
+    detail: Option<String>,
+    syncing: bool,
+}
+
+pub(crate) fn personal_sync_status_view_model(
+    status: &crate::personal_sync_status::PersonalSyncRuntimeStatus,
+) -> PersonalSyncStatusViewModel {
+    match status {
+        crate::personal_sync_status::PersonalSyncRuntimeStatus::Disabled => {
+            PersonalSyncStatusViewModel {
+                label: personal_sync_status_label(&SyncStoreHealth::NotConfigured),
+                detail: None,
+                syncing: false,
+            }
+        }
+        crate::personal_sync_status::PersonalSyncRuntimeStatus::Ready { health, message } => {
+            PersonalSyncStatusViewModel {
+                label: personal_sync_status_label(health),
+                detail: message.clone(),
+                syncing: false,
+            }
+        }
+        crate::personal_sync_status::PersonalSyncRuntimeStatus::Syncing => {
+            PersonalSyncStatusViewModel {
+                label: t!("Settings.Sync.Status.syncing").to_string(),
+                detail: None,
+                syncing: true,
+            }
+        }
+        crate::personal_sync_status::PersonalSyncRuntimeStatus::Failed { health, message } => {
+            PersonalSyncStatusViewModel {
+                label: personal_sync_status_label(health),
+                detail: Some(message.clone()),
+                syncing: false,
+            }
+        }
+    }
+}
+
+fn render_personal_sync_actions(_window: &mut Window, cx: &mut App) -> gpui::AnyElement {
+    let status = crate::personal_sync_runtime::runtime_status(cx);
+    let status_view = personal_sync_status_view_model(&status);
+    let enabled = crate::personal_sync_runtime::actions_enabled(cx) && !status_view.syncing;
+    let conflict_count = crate::personal_sync_conflicts::current_personal_conflict_count(cx);
+    h_flex()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .gap_3()
+        .child(
+            v_flex()
+                .gap_1()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .child(t!("Settings.Sync.status").to_string()),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status_view.label),
+                )
+                .when_some(status_view.detail, |this, detail| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(detail),
+                    )
+                }),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("personal-sync-test")
+                        .icon(IconName::Check)
+                        .label(t!("Settings.Sync.test_connection").to_string())
+                        .disabled(!enabled)
+                        .on_click(|_, _, cx| {
+                            crate::personal_sync_runtime::test_connection(cx);
+                        }),
+                )
+                .child(
+                    Button::new("personal-sync-now")
+                        .icon(IconName::Refresh)
+                        .label(t!("Settings.Sync.sync_now").to_string())
+                        .disabled(!enabled)
+                        .on_click(|_, _, cx| {
+                            crate::personal_sync_runtime::sync_now(cx);
+                        }),
+                )
+                .when(conflict_count > 0, |this| {
+                    this.child(
+                        Button::new("personal-sync-conflicts")
+                            .icon(IconName::TriangleAlert)
+                            .label(format!("{}", conflict_count))
+                            .tooltip(
+                                t!(
+                                    "Home.personal_sync_conflict_tooltip",
+                                    count = conflict_count
+                                )
+                                .to_string(),
+                            )
+                            .on_click(|_, window, cx| {
+                                crate::personal_sync_conflicts::show_personal_conflict_dialog(
+                                    window, cx,
+                                );
+                            }),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+fn team_key_setting_group() -> SettingGroup {
+    SettingGroup::new()
+        .title(t!("TeamSync.manage_keys"))
+        .item(SettingItem::render(move |_options, window, cx| {
+            render_team_key_management_section(window, cx)
+        }))
+}
+
+fn render_team_key_management_section(_window: &mut Window, cx: &mut App) -> gpui::AnyElement {
+    let teams = get_cached_team_options(cx);
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(
+            h_flex()
+                .w_full()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("TeamSync.page_desc").to_string()),
+                )
+                .child(
+                    Button::new("team-key-refresh")
+                        .icon(IconName::Refresh)
+                        .label(t!("TeamSync.refresh_teams").to_string())
+                        .small()
+                        .on_click(|_, window, cx| {
+                            refresh_team_key_cache_from_settings(window, cx);
+                        }),
+                ),
+        )
+        .when(teams.is_empty(), |this| {
+            this.child(render_team_key_empty(cx))
+        })
+        .children(teams.into_iter().map(|team| render_team_key_row(team, cx)))
+        .into_any_element()
+}
+
+fn render_team_key_empty(cx: &mut App) -> gpui::AnyElement {
+    v_flex()
+        .w_full()
+        .gap_2()
+        .p_4()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(gpui::px(8.0))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(t!("TeamSync.empty_title").to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("TeamSync.no_teams").to_string()),
+        )
+        .into_any_element()
+}
+
+fn render_team_key_row(team: TeamOption, cx: &mut App) -> gpui::AnyElement {
+    let can_rotate = team_key_role_can_rotate(team.role.as_deref());
+    let can_forget = !matches!(team.key_status, TeamKeyStatus::Missing);
+    let team_for_save = team.clone();
+    let team_for_rotate = team.clone();
+    let team_id_for_forget = team.id.clone();
+
+    v_flex()
+        .w_full()
+        .gap_3()
+        .p_3()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(gpui::px(8.0))
+        .child(
+            h_flex()
+                .w_full()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(team.name.clone()),
+                        )
+                        .child(render_team_key_meta(&team, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(format!("team-key-save-{}", team.id))
+                                .icon(IconName::Key)
+                                .label(t!("TeamSync.save_local_key").to_string())
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    show_team_key_entry_dialog(team_for_save.clone(), window, cx);
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("team-key-rotate-{}", team.id))
+                                .icon(IconName::Refresh)
+                                .label(t!("TeamSync.rotate_key").to_string())
+                                .small()
+                                .disabled(!can_rotate)
+                                .on_click(move |_, window, cx| {
+                                    show_team_key_rotation_dialog(
+                                        team_for_rotate.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("team-key-forget-{}", team.id))
+                                .icon(IconName::Key)
+                                .label(t!("TeamSync.forget_local_key").to_string())
+                                .small()
+                                .danger()
+                                .disabled(!can_forget)
+                                .on_click(move |_, window, cx| {
+                                    forget_team_key_from_settings(
+                                        team_id_for_forget.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_team_key_meta(team: &TeamOption, cx: &mut App) -> gpui::AnyElement {
+    h_flex()
+        .gap_3()
+        .flex_wrap()
+        .child(team_key_status_badge(team.key_status, cx))
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{} {}", t!("TeamSync.version"), team.key_version)),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "{} {}",
+                    t!("TeamSync.role"),
+                    team.role.as_deref().unwrap_or("-")
+                )),
+        )
+        .into_any_element()
+}
+
+fn team_key_status_badge(status: TeamKeyStatus, cx: &mut App) -> gpui::AnyElement {
+    let (label, color) = match status {
+        TeamKeyStatus::Missing => (
+            t!("TeamSync.status_missing").to_string(),
+            cx.theme().warning,
+        ),
+        TeamKeyStatus::Cached => (t!("TeamSync.status_cached").to_string(), cx.theme().success),
+        TeamKeyStatus::Unlocked => (
+            t!("TeamSync.status_unlocked").to_string(),
+            cx.theme().success,
+        ),
+        TeamKeyStatus::VersionMismatch => (
+            t!("TeamSync.status_version_mismatch").to_string(),
+            cx.theme().danger,
+        ),
+    };
+    div()
+        .text_xs()
+        .text_color(color)
+        .child(label)
+        .into_any_element()
+}
+
+fn show_team_key_entry_dialog(team: TeamOption, window: &mut Window, cx: &mut App) {
+    let team_id = team.id.clone();
+    let team_name = team.name.clone();
+    let key_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(t!("TeamSync.key_placeholder").to_string())
+            .masked(true)
+    });
+    let error_message = cx.new(|_| Option::<String>::None);
+    let key_input_for_ok = key_input.clone();
+    let key_input_for_render = key_input.clone();
+    let error_for_ok = error_message.clone();
+    let error_for_render = error_message.clone();
+    let team_for_ok = team.clone();
+
+    window.open_dialog(cx, move |dialog, _window, cx| {
+        let team_id_ok = team_id.clone();
+        let team_ok = team_for_ok.clone();
+        let key_input_ok = key_input_for_ok.clone();
+        let error_ok = error_for_ok.clone();
+        dialog
+            .title(format!("{} - {}", t!("TeamSync.save_local_key"), team_name))
+            .width(gpui::px(460.))
+            .confirm()
+            .on_ok(move |_, window, cx| {
+                let team_key = key_input_ok.read(cx).text().to_string();
+                if team_key.is_empty() {
+                    set_team_key_dialog_error(&error_ok, t!("TeamSync.key_empty").to_string(), cx);
+                    return false;
+                }
+                if team_ok.key_verification.is_none() {
+                    if !team_key_role_can_rotate(team_ok.role.as_deref()) {
+                        set_team_key_dialog_error(
+                            &error_ok,
+                            t!("TeamSync.initialize_requires_manager").to_string(),
+                            cx,
+                        );
+                        return false;
+                    }
+                    initialize_team_key_from_settings(team_id_ok.clone(), team_key, window, cx);
+                    return true;
+                }
+                match save_team_key_for_cached_team(&team_id_ok, &team_key, cx) {
+                    Ok(()) => {
+                        window.push_notification(t!("TeamSync.save_success").to_string(), cx);
+                        true
+                    }
+                    Err(error) => {
+                        set_team_key_dialog_error(&error_ok, error.to_string(), cx);
+                        false
+                    }
+                }
+            })
+            .child(
+                v_flex()
+                    .gap_4()
+                    .p_4()
+                    .child(Input::new(&key_input_for_render).mask_toggle().w_full())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("TeamSync.key_help").to_string()),
+                    )
+                    .when_some(error_for_render.read(cx).clone(), |this, msg| {
+                        this.child(div().text_sm().text_color(cx.theme().danger).child(msg))
+                    }),
+            )
+    });
+}
+
+fn show_team_key_rotation_dialog(team: TeamOption, window: &mut Window, cx: &mut App) {
+    let team_id = team.id.clone();
+    let team_name = team.name.clone();
+    let old_key_input = team_key_input(window, cx, t!("TeamSync.key_placeholder").to_string());
+    let new_key_input = team_key_input(window, cx, t!("TeamSync.new_key_placeholder").to_string());
+    let error_message = cx.new(|_| Option::<String>::None);
+    let old_for_ok = old_key_input.clone();
+    let new_for_ok = new_key_input.clone();
+    let old_for_render = old_key_input.clone();
+    let new_for_render = new_key_input.clone();
+    let error_for_ok = error_message.clone();
+    let error_for_render = error_message.clone();
+
+    window.open_dialog(cx, move |dialog, _window, cx| {
+        let team_id_ok = team_id.clone();
+        let old_ok = old_for_ok.clone();
+        let new_ok = new_for_ok.clone();
+        let error_ok = error_for_ok.clone();
+        dialog
+            .title(format!("{} - {}", t!("TeamSync.rotate_key"), team_name))
+            .width(gpui::px(500.))
+            .confirm()
+            .on_ok(move |_, window, cx| {
+                let old_key = old_ok.read(cx).text().to_string();
+                let new_key = new_ok.read(cx).text().to_string();
+                if old_key.is_empty() || new_key.is_empty() {
+                    set_team_key_dialog_error(
+                        &error_ok,
+                        t!("TeamSync.rotate_key_empty").to_string(),
+                        cx,
+                    );
+                    return false;
+                }
+                if old_key == new_key {
+                    set_team_key_dialog_error(
+                        &error_ok,
+                        t!("TeamSync.new_key_same").to_string(),
+                        cx,
+                    );
+                    return false;
+                }
+                rotate_team_key_from_settings(team_id_ok.clone(), old_key, new_key, window, cx);
+                true
+            })
+            .child(
+                v_flex()
+                    .gap_4()
+                    .p_4()
+                    .child(Input::new(&old_for_render).mask_toggle().w_full())
+                    .child(Input::new(&new_for_render).mask_toggle().w_full())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("TeamSync.rotate_help").to_string()),
+                    )
+                    .when_some(error_for_render.read(cx).clone(), |this, msg| {
+                        this.child(div().text_sm().text_color(cx.theme().danger).child(msg))
+                    }),
+            )
+    });
+}
+
+fn team_key_input(window: &mut Window, cx: &mut App, placeholder: String) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .masked(true)
+    })
+}
+
+fn set_team_key_dialog_error(error: &Entity<Option<String>>, message: String, cx: &mut App) {
+    error.update(cx, |msg, cx| {
+        *msg = Some(message);
+        cx.notify();
+    });
+}
+
+fn team_key_refresh_success_message(count: usize) -> String {
+    t!("TeamSync.refresh_success", count = count).to_string()
+}
+
+fn refresh_team_key_cache_from_settings(window: &mut Window, cx: &mut App) {
+    let Some(user) = GlobalCloudUser::get_user(cx) else {
+        window.push_notification(t!("Home.cloud_need_login").to_string(), cx);
+        return;
+    };
+    let Some(storage) = cx.try_global::<GlobalStorageState>() else {
+        window.push_notification("GlobalStorageState not found".to_string(), cx);
+        return;
+    };
+    let sync_service = Arc::new(std::sync::RwLock::new(CloudSyncService::new()));
+    if let Ok(mut service) = sync_service.write() {
+        service.set_logged_in(user.id);
+    }
+    let engine = SyncEngine::new(
+        get_auth_service(cx).cloud_client(),
+        sync_service,
+        storage.storage.clone(),
+    );
+    let target_window = window.window_handle();
+    window.push_notification(t!("TeamSync.refresh_started").to_string(), cx);
+    window
+        .spawn(cx, async move |cx| {
+            let result = engine.refresh_team_key_cache().await;
+            let message = result
+                .map(team_key_refresh_success_message)
+                .unwrap_or_else(|error| error.to_string());
+            let _ = cx.update(|_view, cx: &mut App| {
+                let _ = cx.update_window(target_window, |_, window, cx| {
+                    window.push_notification(message, cx);
+                    window.refresh();
+                });
+            });
+        })
+        .detach();
+}
+
+fn initialize_team_key_from_settings(
+    team_id: String,
+    team_key: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(user) = GlobalCloudUser::get_user(cx) else {
+        window.push_notification(t!("Home.cloud_need_login").to_string(), cx);
+        return;
+    };
+    let Some(personal_key) = crypto::get_raw_master_key() else {
+        window.push_notification(t!("Encryption.key_locked_tooltip").to_string(), cx);
+        return;
+    };
+    let Some(storage) = cx.try_global::<GlobalStorageState>() else {
+        window.push_notification("GlobalStorageState not found".to_string(), cx);
+        return;
+    };
+    let sync_service = Arc::new(std::sync::RwLock::new(CloudSyncService::new()));
+    if let Ok(mut service) = sync_service.write() {
+        service.set_logged_in(user.id);
+    }
+    let engine = SyncEngine::new(
+        get_auth_service(cx).cloud_client(),
+        sync_service,
+        storage.storage.clone(),
+    );
+    let target_window = window.window_handle();
+    window.push_notification(t!("TeamSync.initialize_started").to_string(), cx);
+    window
+        .spawn(cx, async move |cx| {
+            let result = engine
+                .save_or_initialize_team_key_for_cached_team(&team_id, &team_key, &personal_key)
+                .await;
+            let message = match result {
+                Ok(_) => t!("TeamSync.initialize_success").to_string(),
+                Err(error) => error.to_string(),
+            };
+            let _ = cx.update(|_view, cx: &mut App| {
+                let _ = cx.update_window(target_window, |_, window, cx| {
+                    window.push_notification(message, cx);
+                    window.refresh();
+                });
+            });
+        })
+        .detach();
+}
+
+fn forget_team_key_from_settings(team_id: String, window: &mut Window, cx: &mut App) {
+    match forget_team_key_for_cached_team(&team_id, cx) {
+        Ok(()) => {
+            window.push_notification(t!("TeamSync.forget_success").to_string(), cx);
+            window.refresh();
+        }
+        Err(error) => window.push_notification(error.to_string(), cx),
+    }
+}
+
+fn rotate_team_key_from_settings(
+    team_id: String,
+    old_key: String,
+    new_key: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(user) = GlobalCloudUser::get_user(cx) else {
+        window.push_notification(t!("Home.cloud_need_login").to_string(), cx);
+        return;
+    };
+    let Some(storage) = cx.try_global::<GlobalStorageState>() else {
+        window.push_notification("GlobalStorageState not found".to_string(), cx);
+        return;
+    };
+    let sync_service = Arc::new(std::sync::RwLock::new(CloudSyncService::new()));
+    if let Ok(mut service) = sync_service.write() {
+        service.set_logged_in(user.id);
+    }
+    let engine = SyncEngine::new(
+        get_auth_service(cx).cloud_client(),
+        sync_service,
+        storage.storage.clone(),
+    );
+    let target_window = window.window_handle();
+    window.push_notification(t!("TeamSync.rotate_started").to_string(), cx);
+    window
+        .spawn(cx, async move |cx| {
+            let result = engine.rotate_team_key(&team_id, &old_key, &new_key).await;
+            let message = match result {
+                Ok(rotation) => t!(
+                    "TeamSync.rotate_success",
+                    count = rotation.re_encrypted,
+                    version = rotation.key_version
+                )
+                .to_string(),
+                Err(error) => error.to_string(),
+            };
+            let _ = cx.update(|_view, cx: &mut App| {
+                let _ = cx.update_window(target_window, |_, window, cx| {
+                    window.push_notification(message, cx);
+                    window.refresh();
+                });
+            });
+        })
+        .detach();
+}
+
+fn team_key_role_can_rotate(role: Option<&str>) -> bool {
+    matches!(role, Some("owner" | "admin"))
 }
 
 impl Focusable for SettingsPanel {
@@ -870,10 +1847,20 @@ impl Render for SettingsPanel {
             init_settings(cx);
         }
 
+        let settings_id = if self.initial_page_index == TEAM_KEYS_SETTINGS_PAGE_INDEX {
+            "main-app-settings-team-keys"
+        } else {
+            "main-app-settings"
+        };
+
         div().track_focus(&self.focus_handle).size_full().child(
-            Settings::new("main-app-settings")
+            Settings::new(settings_id)
                 .with_size(self.size)
                 .with_group_variant(self.group_variant)
+                .default_selected_index(SelectIndex {
+                    page_ix: self.initial_page_index,
+                    ..Default::default()
+                })
                 .pages(self.setting_pages(window, cx)),
         )
     }
@@ -1802,6 +2789,20 @@ const TAB_SHORTCUTS: &[ShortcutEntry] = &[
         system_hotkey: false,
     },
     ShortcutEntry {
+        keys_macos: &["ctrl-tab"],
+        keys_other: &["ctrl-tab"],
+        label_key: "Settings.Shortcuts.switch_next_tab",
+        action_id: Some(action_id::APP_SWITCH_NEXT_TAB),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["ctrl-shift-tab"],
+        keys_other: &["ctrl-shift-tab"],
+        label_key: "Settings.Shortcuts.switch_previous_tab",
+        action_id: Some(action_id::APP_SWITCH_PREVIOUS_TAB),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
         keys_macos: &["cmd-o"],
         keys_other: &["alt-o"],
         label_key: "Settings.Shortcuts.quick_open",
@@ -2465,12 +3466,17 @@ fn render_shortcuts_section(
 #[cfg(test)]
 mod tests {
     use gpui::http_client::HttpClient;
+    use one_core::cloud_sync::personal::SyncStoreHealth;
+    use rust_i18n::t;
 
     use super::{
         AppSettings, CustomFont, FontFamilyKind, GlobalProxySettings, ProxyType,
         build_app_http_client, builtin_monospace_font_options, is_supported_font_file,
-        merge_font_options_with_custom_fonts, parse_font_families,
+        merge_font_options_with_custom_fonts, parse_font_families, personal_sync_backend_options,
+        personal_sync_status_label, personal_sync_status_view_model,
+        team_key_refresh_success_message,
     };
+    use crate::personal_sync_status::PersonalSyncRuntimeStatus;
     use std::path::Path;
 
     #[test]
@@ -2515,6 +3521,16 @@ mod tests {
     }
 
     #[test]
+    fn team_key_refresh_success_message_reports_cached_count() {
+        rust_i18n::set_locale("en");
+
+        assert_eq!(
+            "Team list refreshed. 2 teams cached.",
+            team_key_refresh_success_message(2)
+        );
+    }
+
+    #[test]
     fn app_settings_defaults_custom_keybindings_for_legacy_config() {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
 
@@ -2530,14 +3546,14 @@ mod tests {
     }
 
     #[test]
-    fn monospace_font_options_include_only_cjk_monospace_fonts() {
+    fn monospace_font_options_exclude_fallback_only_cjk_fonts() {
         let values = builtin_monospace_font_options()
             .into_iter()
             .map(|(value, _)| value.to_string())
             .collect::<Vec<_>>();
 
-        assert!(values.iter().any(|value| value == "Noto Sans Mono CJK SC"));
-        assert!(values.iter().any(|value| value == "Source Han Mono SC"));
+        assert!(!values.iter().any(|value| value == "Noto Sans Mono CJK SC"));
+        assert!(!values.iter().any(|value| value == "Source Han Mono SC"));
         assert!(!values.iter().any(|value| value == "Noto Sans CJK SC"));
         assert!(!values.iter().any(|value| value == "Source Han Sans SC"));
         assert!(!values.iter().any(|value| value == "Microsoft YaHei"));
@@ -2561,6 +3577,7 @@ mod tests {
                 ],
             }],
             FontFamilyKind::Monospace,
+            None,
         );
 
         let values = options
@@ -2569,13 +3586,34 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(values.iter().any(|value| value == "Custom Mono SC"));
-        assert_eq!(
-            1,
-            values
-                .iter()
-                .filter(|value| value.as_str() == "Noto Sans Mono CJK SC")
-                .count()
+        assert!(!values.iter().any(|value| value == "Noto Sans Mono CJK SC"));
+    }
+
+    #[test]
+    fn monospace_font_options_filter_custom_fonts_unsuitable_for_grid_preview() {
+        let options = merge_font_options_with_custom_fonts(
+            builtin_monospace_font_options(),
+            &[CustomFont {
+                path: "/tmp/CjkFonts.ttc".to_string(),
+                families: vec!["PingFang SC".to_string()],
+                monospace_families: vec![
+                    "Noto Sans Mono CJK SC".to_string(),
+                    "PingFang SC".to_string(),
+                    "Table Safe Mono".to_string(),
+                ],
+            }],
+            FontFamilyKind::Monospace,
+            None,
         );
+
+        let values = options
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.iter().any(|value| value == "Table Safe Mono"));
+        assert!(!values.iter().any(|value| value == "Noto Sans Mono CJK SC"));
+        assert!(!values.iter().any(|value| value == "PingFang SC"));
     }
 
     #[test]
@@ -2588,6 +3626,7 @@ mod tests {
                 monospace_families: Vec::new(),
             }],
             FontFamilyKind::Monospace,
+            None,
         );
 
         let values = options
@@ -2596,6 +3635,50 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!values.iter().any(|value| value == "Noto Sans SC"));
+    }
+
+    #[test]
+    fn monospace_font_options_mark_missing_fonts_without_changing_values() {
+        let options = merge_font_options_with_custom_fonts(
+            vec![
+                ("Menlo".into(), "Menlo".into()),
+                ("Fira Code".into(), "Fira Code".into()),
+            ],
+            &[CustomFont {
+                path: "/tmp/CustomMono.ttf".to_string(),
+                families: vec!["Custom Mono".to_string()],
+                monospace_families: vec!["Custom Mono".to_string()],
+            }],
+            FontFamilyKind::Monospace,
+            Some(&["Menlo".to_string()]),
+        );
+
+        assert!(
+            options
+                .iter()
+                .any(|(value, label)| { value.as_ref() == "Menlo" && label.as_ref() == "Menlo" })
+        );
+        assert!(options.iter().any(|(value, label)| {
+            value.as_ref() == "Fira Code" && label.as_ref() == "Fira Code (未安装)"
+        }));
+        assert!(options.iter().any(|(value, label)| {
+            value.as_ref() == "Custom Mono" && label.as_ref() == "Custom Mono (未安装)"
+        }));
+    }
+
+    #[test]
+    fn setting_pages_uses_cached_monospace_font_options() {
+        let source = include_str!("setting_tab.rs");
+        let setting_pages = source
+            .split("fn setting_pages(")
+            .nth(1)
+            .expect("setting_pages exists")
+            .split("fn render_personal_sync_path_field")
+            .next()
+            .expect("setting_pages has an end marker");
+
+        assert!(setting_pages.contains("self.cached_monospace_font_options(cx)"));
+        assert!(!setting_pages.contains("let font_options = monospace_font_options(cx);"));
     }
 
     #[test]
@@ -2666,6 +3749,51 @@ mod tests {
         let err = settings.validate().expect_err("缺少主机和端口时应校验失败");
 
         assert!(err.contains("主机"));
+    }
+
+    #[test]
+    fn personal_sync_backend_options_include_folder_and_git() {
+        let options = personal_sync_backend_options();
+
+        assert_eq!(
+            vec![
+                ("folder".into(), t!("Settings.Sync.Backend.folder").into()),
+                ("git".into(), t!("Settings.Sync.Backend.git").into()),
+            ],
+            options
+        );
+    }
+
+    #[test]
+    fn personal_sync_status_label_maps_git_auth_required() {
+        assert_eq!(
+            t!("Settings.Sync.Status.git_auth_required").to_string(),
+            personal_sync_status_label(&SyncStoreHealth::GitAuthRequired)
+        );
+    }
+
+    #[test]
+    fn personal_sync_status_view_model_shows_syncing_feedback() {
+        let view = personal_sync_status_view_model(&PersonalSyncRuntimeStatus::Syncing);
+
+        assert_eq!(t!("Settings.Sync.Status.syncing").to_string(), view.label);
+        assert_eq!(None, view.detail);
+        assert!(view.syncing);
+    }
+
+    #[test]
+    fn personal_sync_status_view_model_shows_failure_detail() {
+        let view = personal_sync_status_view_model(&PersonalSyncRuntimeStatus::Failed {
+            health: SyncStoreHealth::DirectoryUnavailable,
+            message: "missing directory".to_string(),
+        });
+
+        assert_eq!(
+            t!("Settings.Sync.Status.directory_unavailable").to_string(),
+            view.label
+        );
+        assert_eq!(Some("missing directory".to_string()), view.detail);
+        assert!(!view.syncing);
     }
 }
 

@@ -1,18 +1,18 @@
-use crate::database_view_plugin::{
-    ContextMenuEvent, ContextMenuItem, ToolbarButtonType, build_context_menu_for,
-    build_toolbar_buttons_for,
+use crate::database_table_columns::{
+    render_table_column_resize_handle, resize_table_column, ui_columns_from_object_columns,
 };
-use crate::db_tree_view::{DbTreeViewEvent, SqlDumpMode, get_icon_for_node_type};
+use crate::database_view_plugin::{ToolbarButtonType, build_toolbar_buttons_for};
+use crate::db_tree_view::get_icon_for_node_type;
 use crate::search_shortcut::{
     DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, focus_search_input,
 };
-use db::{DbNode, DbNodeType, GlobalDbState, ObjectView};
+use db::{DbNode, DbNodeType, GlobalDbState, ObjectView, ObjectViewColumn};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, px, uniform_list,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, MouseDownEvent,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    WeakEntity, Window, div, px, uniform_list,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -36,17 +36,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
-
-const DB_OBJECTS_ROW_NUMBER_WIDTH: Pixels = px(48.0);
-const DB_OBJECTS_COLUMN_RESIZE_HANDLE_WIDTH: Pixels = px(6.0);
-const DB_OBJECTS_MIN_COLUMN_WIDTH: Pixels = px(64.0);
-
-#[derive(Clone, Copy, Debug)]
-struct ColumnResizeState {
-    col_ix: usize,
-    start_x: Pixels,
-    start_width: Pixels,
-}
 
 fn format_timestamp(ts: i64) -> String {
     use chrono::{DateTime, Local};
@@ -182,18 +171,6 @@ pub struct DatabaseObjects {
     _subscriptions: Vec<Subscription>,
 }
 
-#[derive(Clone)]
-struct ResizeObjectColumn {
-    entity_id: EntityId,
-    col_ix: usize,
-}
-
-impl Render for ResizeObjectColumn {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size(px(0.0))
-    }
-}
-
 impl DatabaseObjects {
     fn on_action_focus_search(
         &mut self,
@@ -282,7 +259,7 @@ impl DatabaseObjects {
         cx.spawn(async move |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = Self::load_connection_list_view(storage_manager, clone_workspace);
             if let Some(view) = result {
-                let columns = view.columns.clone();
+                let columns = ui_columns_from_object_columns(&view.columns);
                 let rows = view.rows.clone();
                 let db_node_type = view.db_node_type;
                 entity
@@ -397,7 +374,7 @@ impl DatabaseObjects {
                 };
 
             if let Some(view) = result {
-                let columns = view.columns.clone();
+                let columns = ui_columns_from_object_columns(&view.columns);
                 let rows = view.rows.clone();
                 let db_node_type = view.db_node_type;
                 entity
@@ -554,18 +531,6 @@ impl DatabaseObjects {
         }
     }
 
-    fn resize_column(columns: &mut [Column], col_ix: usize, width: Pixels) {
-        let Some(column) = columns.get_mut(col_ix) else {
-            return;
-        };
-
-        if !column.resizable {
-            return;
-        }
-
-        column.width = width.max(column.min_width).min(column.max_width);
-    }
-
     fn load_connection_list_view(
         storage_manager: StorageManager,
         workspace: Option<Workspace>,
@@ -605,12 +570,12 @@ impl DatabaseObjects {
         Some(ObjectView {
             db_node_type: DbNodeType::Connection,
             columns: vec![
-                Column::new("name", t!("ConnectionForm.connection_name")).width(200.0),
-                Column::new("id", "ID").width(80.0),
-                Column::new("type", t!("Common.type")),
-                Column::new("created_at", t!("Table.created_at")).width(200.0),
-                Column::new("updated_at", t!("Table.updated_at")).width(200.0),
-                Column::new("remark", t!("ConnectionForm.remark")).width(250.0),
+                ObjectViewColumn::new("name", t!("ConnectionForm.connection_name")).width(200.0),
+                ObjectViewColumn::new("id", "ID").width(80.0),
+                ObjectViewColumn::new("type", t!("Common.type")),
+                ObjectViewColumn::new("created_at", t!("Table.created_at")).width(200.0),
+                ObjectViewColumn::new("updated_at", t!("Table.updated_at")).width(200.0),
+                ObjectViewColumn::new("remark", t!("ConnectionForm.remark")).width(250.0),
             ],
             rows,
             title: t!("Connection.connection_list").to_string(),
@@ -634,9 +599,9 @@ impl DatabaseObjects {
             return Some(ObjectView {
                 db_node_type: DbNodeType::NamedQuery,
                 columns: vec![
-                    Column::new("name", t!("Query.query_name")).width(200.0),
-                    Column::new("created_at", t!("Table.created_at")).width(180.0),
-                    Column::new("updated_at", t!("Table.updated_at")).width(180.0),
+                    ObjectViewColumn::new("name", t!("Query.query_name")).width(200.0),
+                    ObjectViewColumn::new("created_at", t!("Table.created_at")).width(180.0),
+                    ObjectViewColumn::new("updated_at", t!("Table.updated_at")).width(180.0),
                 ],
                 rows: vec![],
                 title: t!("Query.query_list").to_string(),
@@ -682,9 +647,9 @@ impl DatabaseObjects {
         Some(ObjectView {
             db_node_type: DbNodeType::NamedQuery,
             columns: vec![
-                Column::new("name", t!("Query.query_name")).width(200.0),
-                Column::new("created_at", t!("Table.created_at")).width(180.0),
-                Column::new("updated_at", t!("Table.updated_at")).width(180.0),
+                ObjectViewColumn::new("name", t!("Query.query_name")).width(200.0),
+                ObjectViewColumn::new("created_at", t!("Table.created_at")).width(180.0),
+                ObjectViewColumn::new("updated_at", t!("Table.updated_at")).width(180.0),
             ],
             rows,
             title: t!("Query.query_list").to_string(),
@@ -1329,6 +1294,25 @@ impl DatabaseObjects {
         header.into_any_element()
     }
 
+    fn render_column_resize_handle(
+        &self,
+        col_ix: usize,
+        column: &Column,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        render_table_column_resize_handle(
+            "database-object-column-resize",
+            "database-object-column-resize",
+            col_ix,
+            column,
+            cx,
+            |this: &Self, col_ix| this.columns.get(col_ix).map(|column| column.width),
+            |this: &mut Self, col_ix, width| {
+                resize_table_column(&mut this.columns, col_ix, width);
+            },
+        )
+    }
+
     fn render_row(&self, args: ObjectRowRenderArgs<'_>, cx: &App) -> impl IntoElement {
         let mut row = h_flex()
             .w_full()
@@ -1876,34 +1860,6 @@ mod tests {
             DatabaseObjectsEvent::AddDatabaseToTree { node }
                 if node.node_type == DbNodeType::Schema && node.name == "public"
         ));
-    }
-
-    #[test]
-    fn resize_column_updates_width_with_minimum_bound() {
-        let mut columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("type", "Type").width(px(120.0)),
-        ];
-
-        DatabaseObjects::resize_column(&mut columns, 0, px(260.0));
-        assert_eq!(px(260.0), columns[0].width);
-
-        DatabaseObjects::resize_column(&mut columns, 0, px(8.0));
-        assert_eq!(px(20.0), columns[0].width);
-    }
-
-    #[test]
-    fn resize_column_ignores_invalid_and_non_resizable_columns() {
-        let mut columns = vec![
-            Column::new("name", "Name")
-                .width(px(200.0))
-                .resizable(false),
-        ];
-
-        DatabaseObjects::resize_column(&mut columns, 0, px(260.0));
-        DatabaseObjects::resize_column(&mut columns, 99, px(320.0));
-
-        assert_eq!(px(200.0), columns[0].width);
     }
 }
 

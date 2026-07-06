@@ -3,10 +3,12 @@ mod persistence;
 mod selects;
 mod view;
 
-use gpui::{App, Context, Entity, FocusHandle, SharedString, Window};
+use gpui::{App, Context, Entity, FocusHandle, Window};
 use gpui_component::input::InputState;
 use gpui_component::select::SelectState;
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption, get_cached_team_options};
+use one_core::cloud_sync::{
+    GlobalCloudUser, TeamOption, ensure_team_key_ready_for_save, get_cached_team_options,
+};
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event};
 use one_core::storage::{RemoteDesktopParams, RemoteDesktopProtocol, StoredConnection, Workspace};
 use rust_i18n::t;
@@ -27,7 +29,6 @@ pub struct RemoteDesktopFormWindowConfig {
 pub struct RemoteDesktopFormWindow {
     protocol: RemoteDesktopProtocol,
     focus_handle: FocusHandle,
-    title: SharedString,
     is_editing: bool,
     editing_id: Option<i64>,
     editing_cloud_id: Option<String>,
@@ -69,7 +70,6 @@ impl RemoteDesktopFormWindow {
         Self {
             protocol: config.protocol,
             focus_handle: cx.focus_handle(),
-            title: form_title(config.protocol, is_editing).into(),
             is_editing,
             editing_id: config.editing_connection.as_ref().and_then(|c| c.id),
             editing_cloud_id: config
@@ -190,6 +190,8 @@ impl RemoteDesktopFormWindow {
         );
         connection.sync_enabled = self.sync_enabled;
         connection.team_id = self.team_id(cx);
+        ensure_team_key_ready_for_save(connection.team_id.as_deref(), cx)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         connection.owner_id = if self.is_editing {
             self.editing_connection
                 .as_ref()
@@ -247,13 +249,5 @@ impl RemoteDesktopFormWindow {
             .selected_value()
             .cloned()
             .flatten()
-    }
-}
-
-fn form_title(protocol: RemoteDesktopProtocol, is_editing: bool) -> String {
-    if is_editing {
-        t!("RemoteDesktopForm.title_edit", protocol = protocol.label()).to_string()
-    } else {
-        t!("RemoteDesktopForm.title_new", protocol = protocol.label()).to_string()
     }
 }

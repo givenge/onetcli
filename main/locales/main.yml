@@ -74,6 +74,17 @@ McpApproval:
     zh-CN: "还有 %{count} 个请求等待审批"
     zh-HK: "還有 %{count} 個請求等待審批"
 
+# ACP 审批
+AcpApproval:
+  dialog_title:
+    en: ACP Permission
+    zh-CN: ACP 权限请求
+    zh-HK: ACP 權限請求
+  pending_count:
+    en: "%{count} more requests waiting"
+    zh-CN: "还有 %{count} 个请求等待处理"
+    zh-HK: "還有 %{count} 個請求等待處理"
+
 # 首页
 Home:
   title:
@@ -116,6 +127,10 @@ Home:
     en: Import
     zh-CN: 导入
     zh-HK: 導入
+  other_app_import:
+    en: Import from other apps
+    zh-CN: 从其他应用导入
+    zh-HK: 從其他應用導入
   card_view:
     en: Card View
     zh-CN: 卡片视图
@@ -216,6 +231,50 @@ Home:
     en: "%{count} sync conflicts need to be resolved"
     zh-CN: "%{count} 个同步冲突需要解决"
     zh-HK: "%{count} 個同步衝突需要解決"
+  personal_sync_conflict_tooltip:
+    en: "%{count} personal sync conflicts need to be resolved"
+    zh-CN: "%{count} 个个人同步冲突需要解决"
+    zh-HK: "%{count} 個個人同步衝突需要解決"
+  personal_sync_conflict_dialog_title:
+    en: "Personal sync conflicts (%{count})"
+    zh-CN: "个人同步冲突（%{count} 个）"
+    zh-HK: "個人同步衝突（%{count} 個）"
+  personal_sync_conflict_type:
+    en: "Conflict type: %{conflict_type}"
+    zh-CN: "冲突类型: %{conflict_type}"
+    zh-HK: "衝突類型: %{conflict_type}"
+  personal_sync_conflict_use_remote:
+    en: Use remote version
+    zh-CN: 使用远端版本
+    zh-HK: 使用遠端版本
+  personal_sync_conflict_use_local:
+    en: Use local version
+    zh-CN: 使用本地版本
+    zh-HK: 使用本地版本
+  personal_sync_conflict_apply:
+    en: Apply
+    zh-CN: 应用
+    zh-HK: 套用
+  personal_sync_conflict_connection:
+    en: Connection
+    zh-CN: 连接
+    zh-HK: 連線
+  personal_sync_conflict_workspace:
+    en: Workspace
+    zh-CN: 工作区
+    zh-HK: 工作區
+  personal_sync_conflict_both_modified:
+    en: Local and remote both changed
+    zh-CN: 本地和远端都有修改
+    zh-HK: 本地和遠端都有修改
+  personal_sync_conflict_local_deleted_remote_modified:
+    en: Local deleted, remote changed
+    zh-CN: 本地已删除，远端有更新
+    zh-HK: 本地已刪除，遠端有更新
+  personal_sync_conflict_local_modified_remote_deleted:
+    en: Local changed, remote deleted
+    zh-CN: 本地有更新，远端已删除
+    zh-HK: 本地有更新，遠端已刪除
   sync_conflict_type:
     en: "Conflict type: %{conflict_type}"
     zh-CN: "冲突类型: %{conflict_type}"
@@ -301,6 +360,12 @@ Home:
     zh-CN: "%{name} (副本 %{index})"
     zh-HK: "%{name} (副本 %{index})"
 
+TeamManagement:
+  title:
+    en: Team
+    zh-CN: 团队
+    zh-HK: 團隊
+
 # 团队同步
 TeamSync:
   personal:
@@ -319,6 +384,146 @@ TeamSync:
     en: No edit permission
     zh-CN: 无编辑权限
     zh-HK: 無編輯權限
+  key_missing_short:
+    en: Needs key
+    zh-CN: 需密钥
+    zh-HK: 需密鑰
+  key_cached_short:
+    en: Key saved
+    zh-CN: 已保存密钥
+    zh-HK: 已保存密鑰
+  manage_keys:
+    en: Team keys
+    zh-CN: 团队密钥
+    zh-HK: 團隊密鑰
+  refresh_teams:
+    en: Refresh teams
+    zh-CN: 刷新团队列表
+    zh-HK: 重新整理團隊列表
+  refresh_started:
+    en: Refreshing team list...
+    zh-CN: 正在刷新团队列表...
+    zh-HK: 正在重新整理團隊列表...
+  refresh_success:
+    en: Team list refreshed. %{count} teams cached.
+    zh-CN: 团队列表已刷新，已缓存 %{count} 个团队。
+    zh-HK: 團隊列表已重新整理，已快取 %{count} 個團隊。
+  initialize_started:
+    en: Initializing team key...
+    zh-CN: 正在初始化团队密钥...
+    zh-HK: 正在初始化團隊密鑰...
+  initialize_success:
+    en: Team key initialized and saved locally
+    zh-CN: 团队密钥已初始化，并已保存到本机
+    zh-HK: 團隊密鑰已初始化，並已保存到本機
+  initialize_requires_manager:
+    en: This team has no key verification data. Ask an owner or admin to initialize the team key.
+    zh-CN: 该团队尚未初始化密钥验证数据，请让 owner 或 admin 初始化团队密钥。
+    zh-HK: 該團隊尚未初始化密鑰驗證資料，請讓 owner 或 admin 初始化團隊密鑰。
+  key_label:
+    en: Team key
+    zh-CN: 团队密钥
+    zh-HK: 團隊密鑰
+  new_key_label:
+    en: New key
+    zh-CN: 新密钥
+    zh-HK: 新密鑰
+  new_key_placeholder:
+    en: Optional, fill to rotate and re-encrypt
+    zh-CN: 可选，填写后轮换并批量重加密
+    zh-HK: 可選，填寫後輪換並批量重加密
+  key_placeholder:
+    en: Enter the team key
+    zh-CN: 输入团队密钥
+    zh-HK: 輸入團隊密鑰
+  key_help:
+    en: The key is verified locally and saved encrypted on this device only.
+    zh-CN: 密钥只在本机校验，并加密保存到本机。
+    zh-HK: 密鑰只在本機校驗，並加密保存到本機。
+  rotate_help:
+    en: Fill the new key to rotate the team key and re-encrypt all team sync records.
+    zh-CN: 填写新密钥会轮换团队密钥，并批量重加密该团队的所有同步数据。
+    zh-HK: 填寫新密鑰會輪換團隊密鑰，並批量重加密該團隊的所有同步資料。
+  key_empty:
+    en: Please enter the team key
+    zh-CN: 请输入团队密钥
+    zh-HK: 請輸入團隊密鑰
+  new_key_same:
+    en: New team key must be different from the current key
+    zh-CN: 新团队密钥不能和当前密钥相同
+    zh-HK: 新團隊密鑰不能和目前密鑰相同
+  select_team_required:
+    en: Please select a team
+    zh-CN: 请选择团队
+    zh-HK: 請選擇團隊
+  no_teams:
+    en: No cached teams. Create or join a team, then refresh the team list.
+    zh-CN: 暂无已缓存团队。创建或加入团队后，请刷新团队列表。
+    zh-HK: 暫無已快取團隊。建立或加入團隊後，請重新整理團隊列表。
+  page_desc:
+    en: Manage local keys for each team you joined or administer. Team keys are encrypted and stored only on this device.
+    zh-CN: 管理你加入或管理的各个团队的本地密钥。团队密钥只会加密保存在本机。
+    zh-HK: 管理你加入或管理的各個團隊的本地密鑰。團隊密鑰只會加密保存在本機。
+  empty_title:
+    en: No cached teams
+    zh-CN: 暂无已缓存团队
+    zh-HK: 暫無已快取團隊
+  save_local_key:
+    en: Save key
+    zh-CN: 录入密钥
+    zh-HK: 錄入密鑰
+  forget_local_key:
+    en: Forget
+    zh-CN: 忘记密钥
+    zh-HK: 忘記密鑰
+  rotate_key:
+    en: Rotate
+    zh-CN: 轮换密钥
+    zh-HK: 輪換密鑰
+  rotate_key_empty:
+    en: Please enter both the current key and the new key
+    zh-CN: 请输入当前密钥和新密钥
+    zh-HK: 請輸入目前密鑰和新密鑰
+  rotate_started:
+    en: Rotating team key...
+    zh-CN: 正在轮换团队密钥...
+    zh-HK: 正在輪換團隊密鑰...
+  rotate_success:
+    en: Team key rotated. Re-encrypted %{count} records, version %{version}.
+    zh-CN: 团队密钥轮换完成，已重加密 %{count} 条数据，版本 %{version}。
+    zh-HK: 團隊密鑰輪換完成，已重加密 %{count} 條資料，版本 %{version}。
+  save_success:
+    en: Team key saved locally
+    zh-CN: 团队密钥已保存到本机
+    zh-HK: 團隊密鑰已保存到本機
+  forget_success:
+    en: Local team key forgotten
+    zh-CN: 已忘记本地团队密钥
+    zh-HK: 已忘記本地團隊密鑰
+  status_missing:
+    en: Missing local key
+    zh-CN: 未录入本地密钥
+    zh-HK: 未錄入本地密鑰
+  status_cached:
+    en: Saved locally
+    zh-CN: 已保存到本机
+    zh-HK: 已保存到本機
+  status_unlocked:
+    en: Unlocked
+    zh-CN: 已解锁
+    zh-HK: 已解鎖
+  status_version_mismatch:
+    en: Version changed
+    zh-CN: 版本已变更
+    zh-HK: 版本已變更
+  version:
+    en: Version
+    zh-CN: 版本
+    zh-HK: 版本
+  role:
+    en: Role
+    zh-CN: 角色
+    zh-HK: 角色
 
 # 用户认证
 Auth:
@@ -552,6 +757,10 @@ Workspace:
     en: Workspace name
     zh-CN: 工作区名称
     zh-HK: 工作區名稱
+  sort_order:
+    en: Sort order
+    zh-CN: 排序值
+    zh-HK: 排序值
   new:
     en: New Workspace
     zh-CN: 新建工作区
@@ -650,6 +859,10 @@ NewConnection:
     en: Select a type, then click Next, or double-click to open the connection form.
     zh-CN: 单击选择后点击下一步，或双击直接进入连接表单。
     zh-HK: 單擊選擇後點擊下一步，或雙擊直接進入連線表單。
+  more_connections:
+    en: "More Connections"
+    zh-CN: "更多连接"
+    zh-HK: "更多連線"
   description_ssh:
     en: Remote server terminal and file connection
     zh-CN: 远程服务器终端与文件连接
@@ -682,6 +895,10 @@ NewConnection:
     en: SSH local port forwarding or SOCKS tunnel
     zh-CN: SSH 本地端口转发或 SOCKS 隧道
     zh-HK: SSH 本地端口轉發或 SOCKS 隧道
+  description_more_connections:
+    en: Find more connection drivers in Extensions
+    zh-CN: 前往扩展市场发现更多连接类型
+    zh-HK: 前往擴展市場探索更多連線類型
   description_database:
     en: Relational database connection
     zh-CN: 关系型数据库连接
@@ -752,6 +969,29 @@ Settings:
         en: English
         zh-CN: English
         zh-HK: English
+
+    # 启动设置
+    Startup:
+      group_title:
+        en: Startup
+        zh-CN: 启动
+        zh-HK: 啟動
+      default_page:
+        en: Default Startup Page
+        zh-CN: 默认启动页
+        zh-HK: 預設啟動頁
+      default_page_desc:
+        en: Select which fixed tab is active when the application opens
+        zh-CN: 选择应用启动时默认激活的固定标签页
+        zh-HK: 選擇應用程式啟動時預設啟用的固定標籤頁
+      default_page_home:
+        en: Home
+        zh-CN: 首页
+        zh-HK: 首頁
+      default_page_ai_workbench:
+        en: AI Workbench
+        zh-CN: AI 工作台
+        zh-HK: AI 工作台
 
     # 外观设置
     Appearance:
@@ -965,6 +1205,79 @@ Settings:
         zh-CN: 设置数据库表和可编辑表格的行高（24-100像素）
         zh-HK: 設置資料庫表和可編輯表格的行高（24-100像素）
 
+    ToolExposure:
+      mcp_group_title:
+        en: MCP Tool Exposure
+        zh-CN: MCP 工具暴露
+        zh-HK: MCP 工具暴露
+      agent_group_title:
+        en: Agent Tool Exposure
+        zh-CN: Agent 工具暴露
+        zh-HK: Agent 工具暴露
+      terminal:
+        en: Terminal Tools
+        zh-CN: 终端工具
+        zh-HK: 終端工具
+      terminal_desc:
+        en: Expose active terminal session tools on this surface
+        zh-CN: 在这一调用面暴露当前终端会话工具
+        zh-HK: 在這一調用面暴露當前終端會話工具
+      terminal_ssh_exec:
+        en: SSH Exec Tools
+        zh-CN: SSH 执行工具
+        zh-HK: SSH 執行工具
+      terminal_ssh_exec_desc:
+        en: Expose structured SSH command execution tools
+        zh-CN: 暴露结构化 SSH 命令执行工具
+        zh-HK: 暴露結構化 SSH 命令執行工具
+      terminal_exec:
+        en: Visible Terminal Exec
+        zh-CN: 可见终端执行
+        zh-HK: 可見終端執行
+      terminal_exec_desc:
+        en: Expose tools that type commands into visible terminal PTYs
+        zh-CN: 暴露向可见终端 PTY 输入命令的工具
+        zh-HK: 暴露向可見終端 PTY 輸入命令的工具
+      connections:
+        en: Connection Tools
+        zh-CN: 连接工具
+        zh-HK: 連線工具
+      connections_desc:
+        en: Expose saved connection inspection, save, and session tools
+        zh-CN: 暴露已保存连接的查看、保存和会话工具
+        zh-HK: 暴露已儲存連線的查看、儲存和會話工具
+      sftp:
+        en: SFTP Tools
+        zh-CN: SFTP 工具
+        zh-HK: SFTP 工具
+      sftp_desc:
+        en: Expose SSH/SFTP file operation tools
+        zh-CN: 暴露 SSH/SFTP 文件操作工具
+        zh-HK: 暴露 SSH/SFTP 檔案操作工具
+      redis:
+        en: Redis Tools
+        zh-CN: Redis 工具
+        zh-HK: Redis 工具
+      redis_desc:
+        en: Expose Redis inspection and command tools
+        zh-CN: 暴露 Redis 查看和命令工具
+        zh-HK: 暴露 Redis 查看和命令工具
+      database:
+        en: Database Tools
+        zh-CN: 数据库工具
+        zh-HK: 資料庫工具
+      database_desc:
+        en: Expose database query, schema, and execution tools
+        zh-CN: 暴露数据库查询、结构和执行工具
+        zh-HK: 暴露資料庫查詢、結構和執行工具
+      internal_functions:
+        en: Internal Function Tools
+        zh-CN: 内置函数工具
+        zh-HK: 內建函數工具
+      internal_functions_desc:
+        en: Expose app-provided function tools to the built-in Agent
+        zh-CN: 向内置 Agent 暴露应用内置函数工具
+        zh-HK: 向內建 Agent 暴露應用內建函數工具
     Mcp:
       group_title:
         en: MCP
@@ -995,13 +1308,25 @@ Settings:
         zh-CN: 持久
         zh-HK: 持久
       permission_mode:
-        en: Permission Mode
-        zh-CN: 权限模式
-        zh-HK: 權限模式
+        en: Permission Profile
+        zh-CN: 权限档位
+        zh-HK: 權限檔位
       permission_mode_desc:
-        en: Control how sensitive MCP tool calls are handled by default
-        zh-CN: 控制敏感 MCP 工具调用的默认处理方式
-        zh-HK: 控制敏感 MCP 工具調用的默認處理方式
+        en: Map MCP access to the unified tool runtime permission profile
+        zh-CN: 将 MCP 访问映射到统一工具运行时权限档位
+        zh-HK: 將 MCP 訪問映射到統一工具運行時權限檔位
+      permission_profile_safe:
+        en: Safe
+        zh-CN: 安全模式
+        zh-HK: 安全模式
+      permission_profile_confirm:
+        en: Confirm
+        zh-CN: 确认模式
+        zh-HK: 確認模式
+      permission_profile_auto:
+        en: Auto
+        zh-CN: 自动模式
+        zh-HK: 自動模式
       permission_mode_deny:
         en: Deny
         zh-CN: 拒绝
@@ -1190,55 +1515,6 @@ Settings:
         en: MCP helper is not executable
         zh-CN: MCP helper 不可执行
         zh-HK: MCP helper 不可執行
-      toolset_terminal:
-        en: Terminal Tools
-        zh-CN: 终端工具
-        zh-HK: 終端工具
-      toolset_terminal_desc:
-        en: Expose active terminal sessions through MCP
-        zh-CN: 通过 MCP 暴露当前终端会话
-        zh-HK: 通過 MCP 暴露當前終端會話
-      toolset_connections:
-        en: Connection Tools
-        zh-CN: 连接工具
-        zh-HK: 連線工具
-      toolset_connections_desc:
-        en: Expose saved connection inspection and creation tools through MCP
-        zh-CN: 通过 MCP 暴露已保存连接的查看和创建工具
-        zh-HK: 通過 MCP 暴露已儲存連線的查看和建立工具
-      toolset_sftp:
-        en: SFTP Tools
-        zh-CN: SFTP 工具
-        zh-HK: SFTP 工具
-      toolset_sftp_desc:
-        en: Expose remote file operations through MCP
-        zh-CN: 通过 MCP 暴露远程文件操作
-        zh-HK: 通過 MCP 暴露遠程檔案操作
-      toolset_database:
-        en: Database Tools
-        zh-CN: 数据库工具
-        zh-HK: 資料庫工具
-      toolset_database_desc:
-        en: Expose database connection creation, inspection, and query tools through MCP
-        zh-CN: 通过 MCP 暴露数据库连接创建、查看和查询工具
-        zh-HK: 通過 MCP 暴露資料庫連線建立、查看和查詢工具
-      toolset_redis:
-        en: Redis Tools
-        zh-CN: Redis 工具
-        zh-HK: Redis 工具
-      toolset_redis_desc:
-        en: Expose Redis command and inspection tools through MCP
-        zh-CN: 通过 MCP 暴露 Redis 命令和查看工具
-        zh-HK: 通過 MCP 暴露 Redis 命令和查看工具
-      toolset_internal_functions:
-        en: Internal Function Tools
-        zh-CN: 内部函数工具
-        zh-HK: 內部函數工具
-      toolset_internal_functions_desc:
-        en: Expose selected internal application functions through MCP
-        zh-CN: 通过 MCP 暴露选定的应用内部函数
-        zh-HK: 通過 MCP 暴露選定的應用內部函數
-
     Log:
       group_title:
         en: Log
@@ -1349,120 +1625,122 @@ Settings:
         zh-CN: 全局代理设置已生效
         zh-HK: 全局代理設置已生效
 
-  Backup:
+  Sync:
     title:
-      en: Backup
-      zh-CN: 备份
-      zh-HK: 備份
-    WebDav:
-      title:
-        en: WebDAV Backup
-        zh-CN: WebDAV 备份
-        zh-HK: WebDAV 備份
-      description:
-        en: Upload local app data snapshots to your own WebDAV storage.
-        zh-CN: 将本地应用数据快照上传到你自己的 WebDAV 存储。
-        zh-HK: 將本地應用資料快照上傳到你自己的 WebDAV 存儲。
-      open:
-        en: Configure
-        zh-CN: 配置
-        zh-HK: 配置
-      dialog_title:
-        en: WebDAV Backup Settings
-        zh-CN: WebDAV 备份设置
-        zh-HK: WebDAV 備份設置
-      dialog_desc:
-        en: Backups include the local database, settings, and saved query files. Logs are excluded.
-        zh-CN: 备份包含本地数据库、设置和已保存的查询文件，不包含日志。
-        zh-HK: 備份包含本地資料庫、設定和已保存的查詢文件，不包含日誌。
-      enable:
-        en: Enable WebDAV Backup
-        zh-CN: 启用 WebDAV 备份
-        zh-HK: 啟用 WebDAV 備份
-      endpoint:
-        en: WebDAV URL
-        zh-CN: WebDAV 地址
-        zh-HK: WebDAV 地址
-      remote_dir:
-        en: Remote Folder
-        zh-CN: 远程目录
-        zh-HK: 遠端目錄
-      username:
-        en: Username
-        zh-CN: 用户名（可选）
-        zh-HK: 用戶名（可選）
-      password:
-        en: Password
-        zh-CN: 密码（可选）
-        zh-HK: 密碼（可選）
-      username_placeholder:
-        en: webdav-user
-        zh-CN: webdav-user
-        zh-HK: webdav-user
-      password_placeholder:
-        en: app-password
-        zh-CN: app-password
-        zh-HK: app-password
-      test:
-        en: Test Connection
-        zh-CN: 测试连接
-        zh-HK: 測試連接
-      testing:
-        en: Testing...
-        zh-CN: 测试中...
-        zh-HK: 測試中...
-      test_success:
-        en: WebDAV connection test passed
-        zh-CN: WebDAV 连接测试成功
-        zh-HK: WebDAV 連接測試成功
-      save_success:
-        en: WebDAV backup settings saved
-        zh-CN: WebDAV 备份设置已保存
-        zh-HK: WebDAV 備份設置已保存
-      manage_title:
-        en: Backup Data Management
-        zh-CN: 备份数据管理
-        zh-HK: 備份資料管理
-      manage_desc:
-        en: Restores are staged first and applied automatically the next time the app starts.
-        zh-CN: 恢复会先暂存到本地，并在下次启动应用时自动应用。
-        zh-HK: 恢復會先暫存到本地，並在下次啟動應用時自動套用。
-      loading:
-        en: Loading backups...
-        zh-CN: 正在加载备份...
-        zh-HK: 正在加載備份...
-      empty:
-        en: No WebDAV backups yet
-        zh-CN: 暂无 WebDAV 备份
-        zh-HK: 暫無 WebDAV 備份
-      file_name:
-        en: File Name
-        zh-CN: 文件名
-        zh-HK: 文件名
-      modified_at:
-        en: Modified Time
-        zh-CN: 修改时间
-        zh-HK: 修改時間
-      size:
-        en: Size
-        zh-CN: 大小
-        zh-HK: 大小
-      actions:
-        en: Actions
-        zh-CN: 操作
-        zh-HK: 操作
-      restore_staged:
-        en: Restore package is ready. Restart the app to apply it.
-        zh-CN: 恢复包已准备好，重启应用后会自动应用。
-        zh-HK: 恢復包已準備好，重新啟動應用後會自動套用。
-      delete_selected:
-        en: Delete Selected (%{count})
-        zh-CN: 删除选中 (%{count})
-        zh-HK: 刪除選中 (%{count})
-      delete_success:
-        en: Deleted %{count} backup(s)
-        zh-CN: 已删除 %{count} 个备份
-        zh-HK: 已刪除 %{count} 個備份
+      en: Sync
+      zh-CN: 同步
+      zh-HK: 同步
+    group_title:
+      en: Sync
+      zh-CN: 同步
+      zh-HK: 同步
+    provider:
+      en: Sync Provider
+      zh-CN: 同步方式
+      zh-HK: 同步方式
+    provider_desc:
+      en: Choose one sync backend. Only the selected backend runs from the home sync action and automatic data changes.
+      zh-CN: 选择一套同步后端。主页同步和数据变更自动同步只会运行所选后端。
+      zh-HK: 選擇一套同步後端。主頁同步和資料變更自動同步只會執行所選後端。
+    backend:
+      en: Backend
+      zh-CN: 后端
+      zh-HK: 後端
+    backend_desc:
+      en: Folder works with local folders, iCloud Drive, OneDrive, and other synced directories; Git adds commit and push support.
+      zh-CN: 文件夹后端可用于本地文件夹、iCloud Drive、OneDrive 以及其他同步目录；Git 后端会增加提交和推送。
+      zh-HK: 資料夾後端可用於本機資料夾、iCloud Drive、OneDrive 以及其他同步目錄；Git 後端會增加提交和推送。
+    path:
+      en: Sync Path
+      zh-CN: 同步路径
+      zh-HK: 同步路徑
+    path_desc:
+      en: Choose the folder or Git repository that stores the .onetcli-sync package.
+      zh-CN: 选择保存 .onetcli-sync 同步包的文件夹或 Git 仓库。
+      zh-HK: 選擇保存 .onetcli-sync 同步包的資料夾或 Git 倉庫。
+    select_directory:
+      en: Select Directory
+      zh-CN: 选择目录
+      zh-HK: 選擇目錄
+    auto_sync:
+      en: Auto Sync
+      zh-CN: 自动同步
+      zh-HK: 自動同步
+    auto_sync_desc:
+      en: Automatically sync when local data or backend files change.
+      zh-CN: 当本地数据或后端文件变化时自动同步。
+      zh-HK: 當本機資料或後端檔案變更時自動同步。
+    git_auto_push:
+      en: Git Auto Push
+      zh-CN: Git 自动推送
+      zh-HK: Git 自動推送
+    git_auto_push_desc:
+      en: Push personal sync commits after Git backend writes.
+      zh-CN: Git 后端写入后自动推送个人同步提交。
+      zh-HK: Git 後端寫入後自動推送個人同步提交。
+    status:
+      en: Status
+      zh-CN: 状态
+      zh-HK: 狀態
+    test_connection:
+      en: Test
+      zh-CN: 测试
+      zh-HK: 測試
+    sync_now:
+      en: Sync Now
+      zh-CN: 立即同步
+      zh-HK: 立即同步
+    Backend:
+      folder:
+        en: Folder
+        zh-CN: 文件夹
+        zh-HK: 資料夾
+      git:
+        en: Git
+        zh-CN: Git
+        zh-HK: Git
+    Provider:
+      onet_cloud:
+        en: OnetCli Cloud Sync
+        zh-CN: OnetCli 云同步
+        zh-HK: OnetCli 雲同步
+      personal:
+        en: Personal Sync
+        zh-CN: 个人同步
+        zh-HK: 個人同步
+    Status:
+      ready:
+        en: Ready
+        zh-CN: 就绪
+        zh-HK: 就緒
+      syncing:
+        en: Syncing
+        zh-CN: 同步中
+        zh-HK: 同步中
+      not_configured:
+        en: Not configured
+        zh-CN: 未配置
+        zh-HK: 未配置
+      directory_unavailable:
+        en: Directory unavailable
+        zh-CN: 目录不可用
+        zh-HK: 目錄不可用
+      schema_unsupported:
+        en: Sync schema unsupported
+        zh-CN: 同步格式版本不受支持
+        zh-HK: 同步格式版本不受支援
+      git_auth_required:
+        en: Git authentication required
+        zh-CN: 需要 Git 认证
+        zh-HK: 需要 Git 認證
+      git_merge_conflict:
+        en: Git merge conflict
+        zh-CN: Git 合并冲突
+        zh-HK: Git 合併衝突
+      paused_after_repeated_failures:
+        en: Paused after repeated failures
+        zh-CN: 多次失败后已暂停
+        zh-HK: 多次失敗後已暫停
 
   # 快捷键
   Shortcuts:
@@ -1550,6 +1828,14 @@ Settings:
       en: "Switch to Tab N"
       zh-CN: "切换到第 N 个标签页"
       zh-HK: "切換到第 N 個標籤頁"
+    switch_next_tab:
+      en: Switch to Next Tab
+      zh-CN: 切换到下一个标签页
+      zh-HK: 切換到下一個標籤頁
+    switch_previous_tab:
+      en: Switch to Previous Tab
+      zh-CN: 切换到上一个标签页
+      zh-HK: 切換到上一個標籤頁
     duplicate_tab:
       en: Duplicate Tab
       zh-CN: 复制标签页
@@ -2146,9 +2432,13 @@ LlmProviders:
 
 Serial:
   new:
-    en: Serial
-    zh-CN: 串口
-    zh-HK: 串口
+    en: New Serial Connection
+    zh-CN: 新建串口连接
+    zh-HK: 新建串口連接
+  edit:
+    en: Edit Serial Connection
+    zh-CN: 编辑串口连接
+    zh-HK: 編輯串口連接
 
 RemoteDesktopForm:
   title_new:
@@ -2159,3 +2449,14 @@ RemoteDesktopForm:
     en: "Edit %{protocol} Connection"
     zh-CN: "编辑 %{protocol} 连接"
     zh-HK: "編輯 %{protocol} 連線"
+
+
+SSH:
+  new:
+    en: New SSH Connection
+    zh-CN: 新建 SSH 连接
+    zh-HK: 新建 SSH 連線
+  edit:
+    en: Edit SSH Connection
+    zh-CN: 编辑 SSH 连接
+    zh-HK: 編輯 SSH 連線

@@ -84,7 +84,7 @@ impl GenericDatabaseForm {
 
             if matches!(field.field_type, DatabaseFormFieldType::Select) {
                 let options = resolve_field_options(plugin.as_ref(), field, &initial_values);
-                let items = to_select_items(options.clone());
+                let items = to_select_items(options.clone(), text_resolver.as_ref());
                 let selected_index = items
                     .iter()
                     .position(|item| item.value == current_value)
@@ -182,7 +182,7 @@ impl GenericDatabaseForm {
 
             let options = resolve_field_options(plugin.as_ref(), &field, &state);
             let next_value = default_select_value(&field, &options);
-            let items = to_select_items(options);
+            let items = to_select_items(options, self.text_resolver.as_ref());
             let selected_index = items
                 .iter()
                 .position(|item| item.value == next_value)
@@ -260,7 +260,7 @@ impl Render for GenericDatabaseForm {
     }
 }
 
-fn flatten_fields(manifest: &DatabaseFormManifest) -> Vec<DatabaseFormField> {
+pub(crate) fn flatten_fields(manifest: &DatabaseFormManifest) -> Vec<DatabaseFormField> {
     manifest
         .tabs
         .iter()
@@ -268,7 +268,7 @@ fn flatten_fields(manifest: &DatabaseFormManifest) -> Vec<DatabaseFormField> {
         .collect()
 }
 
-fn build_input_state(
+pub(crate) fn build_input_state(
     field: &DatabaseFormField,
     value: &str,
     text_resolver: &dyn Fn(&str) -> String,
@@ -293,7 +293,7 @@ fn build_input_state(
     input
 }
 
-fn render_database_field(
+pub(crate) fn render_database_field(
     field_info: &DatabaseFormField,
     is_edit_mode: bool,
     text_resolver: &dyn Fn(&str) -> String,

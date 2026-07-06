@@ -8,7 +8,7 @@ pub mod versioning;
 
 pub use contributes::CommandContrib;
 #[cfg(test)]
-pub use contributes::{CommandHandlerContrib, ContributesManifest};
+pub use contributes::{CommandHandlerContrib, ContributesManifest, HtmlPreviewTransformContrib};
 #[cfg(test)]
 pub use menus::{MenuCommandRef, MenuContrib};
 pub use parser::{ManifestError, load_and_check, load_from_dir};
@@ -16,7 +16,7 @@ pub use parser::{ManifestError, load_and_check, load_from_dir};
 pub use schema::{ApiVersions, Engines, RuntimeSection, WasmRuntime};
 pub use schema::{Manifest, WasmRuntimeKind};
 pub use security::build_permission_review;
-pub use versioning::{HostApiVersions, current_host_version};
+pub use versioning::{HostApiVersions, current_host_version, set_current_host_version};
 
 #[cfg(test)]
 mod parser_tests;

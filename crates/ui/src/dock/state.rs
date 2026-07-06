@@ -244,7 +244,7 @@ mod tests {
     use super::*;
     #[test]
     fn test_deserialize_item_state() {
-        let json = include_str!("../../tests/fixtures/layout.json");
+        let json = include_str!("../fixtures/layout.json");
         let state: DockAreaState = serde_json::from_str(json).unwrap();
         assert_eq!(state.version, None);
         assert_eq!(state.center.panel_name, "StackPanel");

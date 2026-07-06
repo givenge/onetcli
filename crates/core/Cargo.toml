@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+agent-client-protocol.workspace = true
+agent_runtime.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -15,6 +17,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
+notify.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 chrono.workspace = true
@@ -31,3 +34,7 @@ parking_lot.workspace = true
 util.workspace = true
 rust-i18n.workspace = true
 sys-locale.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"

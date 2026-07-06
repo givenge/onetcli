@@ -11,7 +11,7 @@ use crate::{
     sql_editor_view::SqlEditorTab,
     table_designer_tab::{TableDesigner, TableDesignerConfig},
 };
-use db::{DbNode, DbNodeType, GlobalDbState, SqlResult};
+use db::{DbNode, DbNodeType, GlobalDbState, SqlResult, schema_for_new_query};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, ParentElement, PathPromptOptions, Styled,
     Subscription, Window, div, px,
@@ -405,13 +405,11 @@ impl DatabaseEventHandler {
                             Self::handle_dump_sql_file(node, *mode, global_state, window, cx);
                         }
                     }
-                    #[cfg(feature = "compare")]
                     DbTreeViewEvent::CompareData { node_id } => {
                         if let Some(node) = get_node(&node_id, cx) {
                             Self::handle_compare_data(node, window, cx);
                         }
                     }
-                    #[cfg(feature = "compare")]
                     DbTreeViewEvent::CompareSchema { node_id } => {
                         if let Some(node) = get_node(&node_id, cx) {
                             Self::handle_compare_schema(node, window, cx);
@@ -744,7 +742,13 @@ impl DatabaseEventHandler {
     ) {
         let connection_id = node.connection_id.clone();
         let database = node.get_database_name();
-        let schema = node.get_schema_name();
+        let node_schema = node.get_schema_name();
+        let schema = cx
+            .global::<GlobalDbState>()
+            .get_config(&connection_id)
+            .as_ref()
+            .and_then(|config| schema_for_new_query(node_schema.as_deref(), config))
+            .or(node_schema);
         let database_type = node.database_type.clone();
         let title = Self::query_title_for_node(&node, database.as_deref());
         let initial_sql = Self::format_query_table_reference(&node, cx.global::<GlobalDbState>())
@@ -3305,8 +3309,15 @@ impl DatabaseEventHandler {
                             .get("database")
                             .map(|s| s.to_string())
                             .unwrap_or_default();
+                        let schema = meta.get("schema").map(|s| s.to_string());
                         let task = state
-                            .truncate_table(cx, conn_id.clone(), database, tbl_name.clone())
+                            .truncate_table_with_schema(
+                                cx,
+                                conn_id.clone(),
+                                database,
+                                schema,
+                                tbl_name.clone(),
+                            )
                             .await;
 
                         match task {
@@ -3846,7 +3857,6 @@ impl DatabaseEventHandler {
         });
     }
 
-    #[cfg(feature = "compare")]
     /// 处理数据比较事件
     fn handle_compare_data(node: DbNode, window: &mut Window, cx: &mut App) {
         use crate::compare::DataCompareWindow;
@@ -3860,7 +3870,6 @@ impl DatabaseEventHandler {
         );
     }
 
-    #[cfg(feature = "compare")]
     /// 处理结构比较事件
     fn handle_compare_schema(node: DbNode, window: &mut Window, cx: &mut App) {
         use crate::compare::SchemaCompareWindow;

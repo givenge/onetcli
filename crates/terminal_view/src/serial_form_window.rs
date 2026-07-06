@@ -4,7 +4,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, IndexPath, Sizable, TitleBar,
+    ActiveTheme, Disableable, IconName, IndexPath, Sizable,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -12,7 +12,10 @@ use gpui_component::{
     select::{Select, SelectItem, SelectState},
     v_flex,
 };
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption, get_cached_team_options};
+use one_core::cloud_sync::{
+    GlobalCloudUser, TeamKeyStatus, TeamOption, ensure_team_key_ready_for_save,
+    get_cached_team_options,
+};
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event, get_notifier};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
@@ -77,7 +80,18 @@ impl TeamSelectItem {
     fn from_team(team: &TeamOption) -> Self {
         Self {
             id: Some(team.id.clone()),
-            name: team.name.clone(),
+            name: team_select_name(team),
+        }
+    }
+}
+
+fn team_select_name(team: &TeamOption) -> String {
+    match team.key_status {
+        TeamKeyStatus::Missing | TeamKeyStatus::VersionMismatch => {
+            format!("{} ({})", team.name, t!("TeamSync.key_missing_short"))
+        }
+        TeamKeyStatus::Cached | TeamKeyStatus::Unlocked => {
+            format!("{} ({})", team.name, t!("TeamSync.key_cached_short"))
         }
     }
 }
@@ -200,7 +214,6 @@ impl SelectItem for PortItem {
 
 pub struct SerialFormWindow {
     focus_handle: FocusHandle,
-    title: SharedString,
     is_editing: bool,
     editing_id: Option<i64>,
     editing_cloud_id: Option<String>,
@@ -259,13 +272,6 @@ impl SerialFormWindow {
             .editing_connection
             .as_ref()
             .and_then(|c| c.owner_id.clone());
-
-        let title: SharedString = if is_editing {
-            t!("Serial.edit").to_string()
-        } else {
-            t!("Serial.new").to_string()
-        }
-        .into();
 
         let name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("Serial.name_placeholder")));
@@ -417,7 +423,6 @@ impl SerialFormWindow {
 
         Self {
             focus_handle: cx.focus_handle(),
-            title,
             is_editing,
             editing_id,
             editing_cloud_id,
@@ -615,6 +620,11 @@ impl SerialFormWindow {
         let mut conn = StoredConnection::new_serial(name, params, workspace_id);
         conn.sync_enabled = self.sync_enabled;
         conn.team_id = self.get_team_id(cx);
+        if let Err(error) = ensure_team_key_ready_for_save(conn.team_id.as_deref(), cx) {
+            self.test_result = Some(Err(error.to_string()));
+            cx.notify();
+            return;
+        }
         conn.owner_id = if self.is_editing {
             self.editing_owner_id.clone()
         } else {
@@ -748,19 +758,6 @@ impl Render for SerialFormWindow {
         v_flex()
             .justify_center()
             .size_full()
-            .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(self.title.clone()),
-                ),
-            )
             // 表单内容
             .child(
                 div()

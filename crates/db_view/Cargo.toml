@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 default = []
 builtin-duckdb = ["db/builtin-duckdb"]
-compare = ["db/compare"]
 
 [dependencies]
 anyhow.workspace = true
@@ -21,6 +20,7 @@ tracing.workspace = true
 futures.workspace = true
 smol.workspace = true
 gpui.workspace = true
+ai_chat_view.workspace = true
 db.workspace = true
 er_flow.workspace = true
 extension-component = { workspace = true }
@@ -38,6 +38,7 @@ regex.workspace = true
 parking_lot.workspace = true
 once_cell.workspace = true
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 zip = "6.0.0"
 

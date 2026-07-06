@@ -57,6 +57,110 @@ fn manifest_loads_composite_contributions() {
 }
 
 #[test]
+fn manifest_parses_connection_importers() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_manifest(
+        tmp.path(),
+        r#"{
+            "schema_version": 1,
+            "id": "com.onetcli.importer.navicat",
+            "name": "Navicat Importer",
+            "version": "0.1.0",
+            "engines": { "onetcli": ">=0.7.0" },
+            "runtime": {
+                "wasm": [{
+                    "id": "navicat-importer",
+                    "module": "wasm/navicat_importer.wasm",
+                    "kind": "component",
+                    "timeout_ms": 5000,
+                    "max_memory_mb": 64
+                }]
+            },
+            "permissions": [
+                "fs:read:~/Library/Application Support/PremiumSoft CyberTech/Navicat CC/Common/conn.plist"
+            ],
+            "contributes": {
+                "connectionImporters": [{
+                    "id": "navicat",
+                    "runtimeId": "navicat-importer",
+                    "displayName": "Navicat",
+                    "description": "Import database connections from Navicat",
+                    "icon": "database",
+                    "outputKinds": ["database"],
+                    "platforms": ["macos"],
+                    "candidateFiles": [{
+                        "id": "navicat-macos-cc-conn",
+                        "platform": "macos",
+                        "path": "~/Library/Application Support/PremiumSoft CyberTech/Navicat CC/Common/conn.plist"
+                    }]
+                }]
+            }
+        }"#,
+    );
+
+    let manifest = load_from_dir(tmp.path()).unwrap();
+    let importer = &manifest.contributes.connection_importers[0];
+
+    assert_eq!("navicat", importer.id);
+    assert_eq!("navicat-importer", importer.runtime_id);
+    assert_eq!("Navicat", importer.display_name);
+    assert_eq!(Some("database"), importer.icon.as_deref());
+    assert_eq!(vec!["database"], importer.output_kinds);
+    assert_eq!(vec!["macos"], importer.platforms);
+    assert_eq!(1, importer.candidate_files.len());
+    assert_eq!("navicat-macos-cc-conn", importer.candidate_files[0].id);
+    assert_eq!("macos", importer.candidate_files[0].platform);
+    assert_eq!(
+        "~/Library/Application Support/PremiumSoft CyberTech/Navicat CC/Common/conn.plist",
+        importer.candidate_files[0].path
+    );
+}
+
+#[test]
+fn manifest_accepts_windows_env_fs_permissions_for_connection_importers() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_manifest(
+        tmp.path(),
+        r#"{
+            "schema_version": 1,
+            "id": "com.onetcli.importer.dbeaver",
+            "name": "DBeaver Importer",
+            "version": "0.1.0",
+            "engines": { "onetcli": ">=0.7.0" },
+            "runtime": {
+                "wasm": [{
+                    "id": "dbeaver-importer",
+                    "module": "wasm/dbeaver_importer_wasm.wasm",
+                    "kind": "component"
+                }]
+            },
+            "permissions": [
+                "fs:read:%APPDATA%/DBeaverData/workspace6/General/.dbeaver/data-sources.json"
+            ],
+            "contributes": {
+                "connectionImporters": [{
+                    "id": "dbeaver",
+                    "runtimeId": "dbeaver-importer",
+                    "displayName": "DBeaver",
+                    "outputKinds": ["database"],
+                    "platforms": ["windows"],
+                    "candidateFiles": [{
+                        "id": "dbeaver-windows-data-sources",
+                        "platform": "windows",
+                        "path": "%APPDATA%/DBeaverData/workspace6/General/.dbeaver/data-sources.json"
+                    }]
+                }]
+            }
+        }"#,
+    );
+
+    let manifest = load_from_dir(tmp.path()).unwrap();
+
+    assert_eq!("com.onetcli.importer.dbeaver", manifest.id);
+    assert_eq!(1, manifest.contributes.connection_importers.len());
+}
+
+#[test]
 fn manifest_rejects_wasm_module_path_escape() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_manifest(

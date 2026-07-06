@@ -1,6 +1,8 @@
+mod acp_agent_provider;
 mod composite_provider;
 mod database_driver_provider;
 mod kind;
+mod language_bundle_provider;
 mod language_provider;
 pub mod manifest;
 mod mcp_helper_provider;
@@ -8,9 +10,13 @@ mod provider;
 mod remote_desktop_provider;
 mod summary;
 
+pub use acp_agent_provider::{
+    AcpAgentExtensionAgent, AcpAgentExtensionProvider, AcpAgentExtensionTransport,
+};
 pub use composite_provider::CompositeExtensionProvider;
 pub use database_driver_provider::DatabaseDriverExtensionProvider;
 pub use kind::ExtensionKind;
+pub use language_bundle_provider::LanguageBundleExtensionProvider;
 pub use language_provider::LanguageExtensionProvider;
 pub use mcp_helper_provider::McpHelperExtensionProvider;
 pub use provider::{ExtensionProvider, ExtensionRegistry, init_global};
@@ -21,7 +27,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use db_view::extension_menu::DbTreeExtensionMenuRegistry;
 use gpui::{App, BorrowAppContext};
-use gpui_component::highlighter::{LanguageRegistry, LoadReport, load_extensions_dir};
+use gpui_component::highlighter::{
+    LanguageRegistry, LoadReport, load_extensions_dir, register_extension_manifests_dir,
+};
 
 pub fn init(cx: &mut App) {
     let Some(root) = extensions_root() else {
@@ -30,7 +38,7 @@ pub fn init(cx: &mut App) {
     };
     let registry = builtin_registry(root.clone());
     init_global(registry);
-    load_language_extensions(&root);
+    register_language_extension_manifests(&root);
     crate::refresh_global_runtime_catalog(cx);
     refresh_runtime_contributions(cx);
     crate::extension_action_handler::register_db_tree_extension_action_handler(cx);
@@ -39,9 +47,11 @@ pub fn init(cx: &mut App) {
 pub fn builtin_registry(extensions_root: PathBuf) -> ExtensionRegistry {
     let mut registry = ExtensionRegistry::new(extensions_root);
     registry.register_provider(Arc::new(LanguageExtensionProvider));
+    registry.register_provider(Arc::new(LanguageBundleExtensionProvider));
     registry.register_provider(Arc::new(DatabaseDriverExtensionProvider));
     registry.register_provider(Arc::new(RemoteDesktopProviderExtensionProvider));
     registry.register_provider(Arc::new(McpHelperExtensionProvider));
+    registry.register_provider(Arc::new(AcpAgentExtensionProvider));
     registry.register_provider(Arc::new(CompositeExtensionProvider));
     registry
 }
@@ -58,26 +68,35 @@ pub fn load_language_extensions_from_root(root: &std::path::Path) -> anyhow::Res
     )
 }
 
-fn load_language_extensions(root: &std::path::Path) {
-    match load_language_extensions_from_root(root) {
+pub fn register_language_extension_manifests_from_root(
+    root: &std::path::Path,
+) -> anyhow::Result<LoadReport> {
+    register_extension_manifests_dir(
+        &root.join(ExtensionKind::Language.dir_name()),
+        LanguageRegistry::singleton(),
+    )
+}
+
+fn register_language_extension_manifests(root: &std::path::Path) {
+    match register_language_extension_manifests_from_root(root) {
         Ok(report) => {
             if !report.loaded.is_empty() {
                 tracing::info!(
-                    "已加载 {} 个语言扩展: {:?}",
+                    "已注册 {} 个语言扩展 manifest: {:?}",
                     report.loaded.len(),
                     report.loaded
                 );
             }
             if !report.failed.is_empty() {
                 tracing::warn!(
-                    "有 {} 个语言扩展加载失败: {:?}",
+                    "有 {} 个语言扩展 manifest 注册失败: {:?}",
                     report.failed.len(),
                     report.failed
                 );
             }
         }
         Err(err) => {
-            tracing::warn!("加载语言扩展失败: {err:?}");
+            tracing::warn!("注册语言扩展 manifest 失败: {err:?}");
         }
     }
 }

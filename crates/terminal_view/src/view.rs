@@ -18,10 +18,7 @@ use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::{
     action_id, keystroke_matches_shortcuts, rebind_keybindings, shortcuts_for,
 };
-use one_core::llm::{
-    ChatRequest, Message, MessageBlock, Role, extract_stream_content, extract_stream_reasoning,
-};
-use one_core::settings::AppSettings;
+use one_core::settings::{AppSettings, resolve_installed_grid_monospace_font_family};
 use std::borrow::Cow;
 use std::cell::{Cell as StdCell, RefCell};
 use std::collections::HashMap;
@@ -30,10 +27,16 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+mod broadcast;
+mod history_prompt_rules;
+mod mouse_input;
+mod paste_safety;
+
 use crate::addon::{
     AddonManager, CustomHighlightAddon, SearchAddon, TerminalAddonFrameContext,
     TerminalAddonMouseContext, register_default_addons,
 };
+use crate::broadcast_input::BroadcastClientId;
 use crate::cd_completion::{
     CdCompletionQuery, build_cd_completion_suggestions, parse_cd_completion_query,
 };
@@ -43,17 +46,47 @@ use crate::settings::{
     GlobalTerminalLocalSettings, TerminalHighlightRule, TerminalSettings, TerminalSettingsEvent,
     current_settings, update_settings,
 };
-use crate::sidebar::{SidebarPanel, TerminalSidebar, TerminalSidebarEvent};
+use crate::sidebar::{
+    SidebarPanel, TerminalSidebar, TerminalSidebarEvent, TerminalSidebarToolPanel,
+    TerminalSidebarToolbar,
+};
 use crate::terminal_element::{RenderCache, TerminalElement};
 use crate::theme::{
     DEFAULT_LINE_HEIGHT_SCALE, MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalTheme, default_font_fallbacks,
-    default_monospace_font,
+    default_monospace_font, normalize_terminal_primary_font, terminal_cell_width_from_advances,
 };
-use one_core::layout::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
+use broadcast::{BroadcastInputRegistry, init_broadcast_input_registry};
+#[cfg(test)]
+use history_prompt_rules::should_refresh_history_commands_for_terminal_event;
+use history_prompt_rules::{
+    HISTORY_PROMPT_DROPDOWN_MAX_WIDTH, HISTORY_PROMPT_DROPDOWN_MIN_WIDTH, history_prompt_available,
+    history_prompt_dropdown_origin, history_prompt_overlay_bounds,
+    should_confirm_local_terminal_close, should_dismiss_history_prompt_for_keystroke,
+    should_dismiss_history_prompt_for_mouse, should_dismiss_history_prompt_for_scroll,
+    should_reset_history_prompt_for_terminal_event, terminal_history_scope,
+};
+use mouse_input::{
+    encode_mouse_modifiers, mouse_button_code, sgr_mouse_button_report, sgr_mouse_mode_enabled,
+    sgr_mouse_wheel_report, should_defer_inline_history_prompt_input_to_text_system,
+    should_defer_sgr_left_press, should_extend_selection_on_shift_click,
+    should_scroll_to_bottom_on_user_input, should_start_selection_from_pending_sgr_press,
+    take_whole_scroll_lines,
+};
+use one_core::layout::{
+    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, TOOLBAR_WIDTH,
+};
+use one_core::sidebar_contribution::{
+    SidebarContribution, SidebarContributionActions, SidebarPanelChrome, SidebarPanelId,
+    SidebarPanelPolicy, SidebarPanelSize, SidebarPanelStyle, SidebarPlacement, SidebarPlacementSet,
+};
 use one_core::storage::models::{ActiveConnections, StoredConnection};
-use one_core::tab_container::{TabContent, TabContentEvent};
+use one_core::tab_container::{TabContent, TabContentEvent, TabContentView};
 use one_ui::resize_handle::{HandlePlacement, ResizePanel, resize_handle};
-use one_ui::workbench;
+use paste_safety::{
+    UnbracketedPasteHazard, detect_unbracketed_paste_hazard, multiline_non_empty_line_count,
+};
+#[cfg(test)]
+use paste_safety::{has_trailing_line_continuation, has_unterminated_shell_quote};
 use rust_i18n::t;
 use serde::Deserialize;
 use sftp::{RusshSftpClient, SftpClient};
@@ -545,6 +578,12 @@ fn truncate_agent_history_output(output: &str, max_chars: usize) -> String {
     truncated
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSidebarRenderMode {
+    Embedded,
+    External,
+}
+
 #[cfg(target_os = "macos")]
 const TERMINAL_COPY_SHORTCUT: &str = "cmd-c";
 #[cfg(not(target_os = "macos"))]
@@ -577,171 +616,6 @@ const DEFAULT_ROWS: usize = 24;
 const TERMINAL_RESET_FONT_SIZE: f32 = 15.0;
 const HISTORY_SUGGESTION_LIMIT: usize = 6;
 
-fn take_whole_scroll_lines(scroll_lines_accumulated: &mut f32) -> i32 {
-    let lines = scroll_lines_accumulated.trunc() as i32;
-    *scroll_lines_accumulated -= lines as f32;
-    lines
-}
-
-fn sgr_mouse_wheel_report(lines: i32, col: usize, row: usize) -> Option<String> {
-    if lines == 0 {
-        return None;
-    }
-
-    let button = if lines > 0 { 64 } else { 65 };
-    Some(format!("\x1b[<{};{};{}M", button, col + 1, row + 1))
-}
-
-/// 生成 SGR 鼠标按钮报告。
-///
-/// - `button`：xterm 按钮编码（0=左键、1=中键、2=右键，加上 shift/alt/ctrl/拖动等位）
-/// - `pressed`：true 用 `M` 表示按下，false 用 `m` 表示释放（SGR 协议规定）
-/// - `col` / `row`：0-based，输出转为 1-based
-///
-/// 抽出为独立纯函数，便于单元测试和后续扩展（拖动 32 位、wheel-with-modifiers 等）。
-fn sgr_mouse_button_report(button: u8, col: usize, row: usize, pressed: bool) -> String {
-    let suffix = if pressed { 'M' } else { 'm' };
-    format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, suffix)
-}
-
-/// 将 GPUI 鼠标按钮映射为 xterm 按钮基础编码：左=0、中=1、右=2。
-/// 其它按钮（X1/X2 等）当前未在 SGR 报告中使用，返回 None。
-fn mouse_button_code(button: MouseButton) -> Option<u8> {
-    match button {
-        MouseButton::Left => Some(0),
-        MouseButton::Middle => Some(1),
-        MouseButton::Right => Some(2),
-        _ => None,
-    }
-}
-
-/// 将修饰键编码到 xterm 鼠标按钮的高位：shift=4、alt=8、control=16。
-fn encode_mouse_modifiers(modifiers: Modifiers) -> u8 {
-    let mut bits = 0u8;
-    if modifiers.shift {
-        bits |= 4;
-    }
-    if modifiers.alt {
-        bits |= 8;
-    }
-    if modifiers.control {
-        bits |= 16;
-    }
-    bits
-}
-
-fn sgr_mouse_mode_enabled(mode: TermMode) -> bool {
-    mode.contains(TermMode::SGR_MOUSE) && mode.intersects(TermMode::MOUSE_MODE)
-}
-
-fn should_defer_sgr_left_press(button: MouseButton, modifiers: Modifiers, mode: TermMode) -> bool {
-    button == MouseButton::Left
-        && !modifiers.shift
-        && !modifiers.alt
-        && !modifiers.control
-        && !modifiers.platform
-        && sgr_mouse_mode_enabled(mode)
-}
-
-fn should_start_selection_from_pending_sgr_press(start: AlacPoint, current: AlacPoint) -> bool {
-    start != current
-}
-
-fn should_scroll_to_bottom_on_user_input(
-    display_offset: usize,
-    pending_display_offset: &StdCell<Option<usize>>,
-) -> bool {
-    pending_display_offset.take();
-    display_offset > 0
-}
-
-fn should_defer_inline_history_prompt_input_to_text_system(keystroke: &Keystroke) -> bool {
-    let modifiers = keystroke.modifiers;
-    !modifiers.control
-        && !modifiers.alt
-        && !modifiers.platform
-        && (keystroke.key == "space" || keystroke.key.chars().count() == 1)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnbracketedPasteHazard {
-    HereDoc,
-    UnterminatedQuote,
-    LineContinuation,
-}
-
-fn multiline_non_empty_line_count(text: &str) -> usize {
-    text.lines().filter(|line| !line.trim().is_empty()).count()
-}
-
-fn contains_heredoc_operator(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        !line.is_empty() && !line.starts_with('#') && line.contains("<<")
-    })
-}
-
-fn has_trailing_line_continuation(text: &str) -> bool {
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        if lines.peek().is_none() {
-            break;
-        }
-
-        let trimmed = line.trim_end();
-        if !trimmed.is_empty() && trimmed.ends_with('\\') {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn has_unterminated_shell_quote(text: &str) -> bool {
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut escaped = false;
-
-    for ch in text.chars() {
-        if in_single_quote {
-            if ch == '\'' {
-                in_single_quote = false;
-            }
-            continue;
-        }
-
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        match ch {
-            '\\' => escaped = true,
-            '\'' => in_single_quote = true,
-            '"' => in_double_quote = !in_double_quote,
-            _ => {}
-        }
-    }
-
-    in_single_quote || in_double_quote
-}
-
-fn detect_unbracketed_paste_hazard(text: &str) -> Option<UnbracketedPasteHazard> {
-    if contains_heredoc_operator(text) {
-        return Some(UnbracketedPasteHazard::HereDoc);
-    }
-
-    if has_trailing_line_continuation(text) {
-        return Some(UnbracketedPasteHazard::LineContinuation);
-    }
-
-    if has_unterminated_shell_quote(text) {
-        return Some(UnbracketedPasteHazard::UnterminatedQuote);
-    }
-
-    None
-}
-
 fn terminal_shortcut_label(shortcut: &str) -> SharedString {
     Kbd::format(&Keystroke::parse(shortcut).expect("终端快捷键定义非法")).into()
 }
@@ -757,149 +631,6 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
-fn should_dismiss_history_prompt_for_keystroke(keystroke: &Keystroke) -> bool {
-    let modifiers = keystroke.modifiers;
-    let key = keystroke.key.as_str();
-
-    if modifiers.platform {
-        return true;
-    }
-
-    if modifiers.control && !modifiers.alt {
-        return !matches!(key, "r" | "u" | "c");
-    }
-
-    if modifiers.alt && !modifiers.control {
-        return key != "f";
-    }
-
-    if !modifiers.control && !modifiers.alt {
-        return matches!(
-            key,
-            "left" | "home" | "end" | "delete" | "pageup" | "pagedown" | "escape" | "tab"
-        );
-    }
-
-    true
-}
-
-fn should_dismiss_history_prompt_for_mouse(button: MouseButton) -> bool {
-    matches!(
-        button,
-        MouseButton::Left | MouseButton::Middle | MouseButton::Right
-    )
-}
-
-fn should_dismiss_history_prompt_for_scroll(lines: i32) -> bool {
-    lines != 0
-}
-
-fn should_reset_history_prompt_for_terminal_event(event: &TerminalModelEvent) -> bool {
-    matches!(
-        event,
-        TerminalModelEvent::PromptStart
-            | TerminalModelEvent::InputStart
-            | TerminalModelEvent::CommandStart
-    )
-}
-
-fn history_prompt_available(
-    autocomplete_enabled: bool,
-    connection_kind: TerminalConnectionKind,
-    mode: TermMode,
-    shell_prompt_input_active: bool,
-) -> bool {
-    autocomplete_enabled
-        && connection_kind == TerminalConnectionKind::Ssh
-        && shell_prompt_input_active
-        && !terminal_application_mode_active(mode)
-        && !mode.contains(TermMode::ALT_SCREEN)
-        && !mode.contains(TermMode::VI)
-}
-
-fn terminal_application_mode_active(mode: TermMode) -> bool {
-    mode.intersects(TermMode::MOUSE_MODE)
-        || mode.contains(TermMode::FOCUS_IN_OUT)
-        || mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
-}
-
-fn local_tui_application_active(mode: TermMode) -> bool {
-    mode.contains(TermMode::ALT_SCREEN) || terminal_application_mode_active(mode)
-}
-
-fn should_confirm_local_terminal_close(
-    connection_kind: TerminalConnectionKind,
-    command_running: bool,
-    mode: TermMode,
-    child_exited: Option<i32>,
-) -> bool {
-    connection_kind == TerminalConnectionKind::Local
-        && child_exited.is_none()
-        && (command_running || local_tui_application_active(mode))
-}
-
-const HISTORY_PROMPT_DROPDOWN_MIN_WIDTH: f32 = 300.0;
-const HISTORY_PROMPT_DROPDOWN_MAX_WIDTH: f32 = 500.0;
-const HISTORY_PROMPT_DROPDOWN_GAP_Y: f32 = 6.0;
-const HISTORY_PROMPT_DROPDOWN_EDGE_PADDING: f32 = 8.0;
-const HISTORY_PROMPT_DROPDOWN_ROW_PADDING_Y: f32 = 12.0;
-const HISTORY_PROMPT_DROPDOWN_CONTAINER_PADDING_Y: f32 = 16.0;
-const HISTORY_PROMPT_DROPDOWN_SEARCH_HEADER_HEIGHT: f32 = 20.0;
-
-fn estimate_history_prompt_dropdown_height(
-    line_height: Pixels,
-    match_count: usize,
-    search_mode: bool,
-) -> Pixels {
-    let row_count = match_count.max(1) as f32;
-    let rows_height = (line_height + px(HISTORY_PROMPT_DROPDOWN_ROW_PADDING_Y)) * row_count;
-    let header_height = if search_mode {
-        px(HISTORY_PROMPT_DROPDOWN_SEARCH_HEADER_HEIGHT)
-    } else {
-        px(0.0)
-    };
-
-    px(HISTORY_PROMPT_DROPDOWN_CONTAINER_PADDING_Y) + header_height + rows_height
-}
-
-fn history_prompt_dropdown_origin(
-    terminal_bounds: Bounds<Pixels>,
-    cell_width: Pixels,
-    line_height: Pixels,
-    cursor_line: i32,
-    cursor_col: usize,
-    match_count: usize,
-    search_mode: bool,
-) -> Point<Pixels> {
-    let cursor_left = terminal_bounds.origin.x + cell_width * cursor_col as f32;
-    let cursor_top = terminal_bounds.origin.y + line_height * cursor_line as f32;
-    let dropdown_width = (terminal_bounds.size.width
-        - px(HISTORY_PROMPT_DROPDOWN_EDGE_PADDING * 2.0))
-    .min(px(HISTORY_PROMPT_DROPDOWN_MAX_WIDTH))
-    .max(px(HISTORY_PROMPT_DROPDOWN_MIN_WIDTH));
-    let dropdown_height =
-        estimate_history_prompt_dropdown_height(line_height, match_count, search_mode);
-    let min_left = terminal_bounds.origin.x;
-    let max_left = (terminal_bounds.right() - dropdown_width).max(min_left);
-    let left = cursor_left.min(max_left).max(min_left);
-    let below_top = cursor_top + line_height + px(HISTORY_PROMPT_DROPDOWN_GAP_Y);
-    let min_top = terminal_bounds.origin.y;
-    let max_top = (terminal_bounds.bottom() - dropdown_height).max(min_top);
-    let fits_below = below_top + dropdown_height <= terminal_bounds.bottom();
-    let preferred_above_top = cursor_top - dropdown_height - px(HISTORY_PROMPT_DROPDOWN_GAP_Y);
-    let top = if fits_below {
-        below_top.min(max_top)
-    } else {
-        preferred_above_top.max(min_top).min(max_top)
-    };
-
-    Point::new(left, top)
-}
-
-fn history_prompt_overlay_bounds(terminal_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
-    Bounds::new(Point::new(px(0.0), px(0.0)), terminal_bounds.size)
-}
-
 /// 正在调整大小的面板
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResizingPanel {
@@ -909,6 +640,7 @@ enum ResizingPanel {
 pub fn init(cx: &mut App) {
     crate::settings::init_settings(cx);
     crate::public_mcp::init(cx);
+    init_broadcast_input_registry(cx);
     cx.bind_keys(init_keybindings(cx));
 }
 
@@ -1149,16 +881,39 @@ struct SshMfaInput {
     input: Entity<InputState>,
 }
 
+#[derive(Clone)]
+enum TerminalDuplicateSource {
+    Local(LocalConfig),
+    Ssh {
+        connection: StoredConnection,
+        working_dir: Option<String>,
+        sync_path_with_terminal: bool,
+    },
+    Serial(StoredConnection),
+}
+
+fn terminal_tab_duplicate_supported(source: &TerminalDuplicateSource) -> bool {
+    matches!(
+        source,
+        TerminalDuplicateSource::Local(_)
+            | TerminalDuplicateSource::Ssh { .. }
+            | TerminalDuplicateSource::Serial(_)
+    )
+}
+
 /// Terminal view component - supports both Local and SSH backends
 pub struct TerminalView {
     /// Terminal model entity
     terminal: Entity<Terminal>,
+    duplicate_source: TerminalDuplicateSource,
     /// 本地终端工作目录
     local_working_dir: Option<PathBuf>,
     /// 光标闪烁管理器
     blink_manager: Entity<BlinkCursor>,
     /// 侧边栏
     sidebar: Entity<TerminalSidebar>,
+    sidebar_toolbar: Entity<TerminalSidebarToolbar>,
+    sidebar_tool_panels: HashMap<SidebarPanel, Entity<TerminalSidebarToolPanel>>,
 
     font_size: Pixels,
     line_height: Pixels,
@@ -1166,6 +921,7 @@ pub struct TerminalView {
     font_fallbacks: Vec<SharedString>,
     line_height_scale: f32,
     cell_width: Pixels,
+    font_metrics: Option<TerminalFontMetrics>,
 
     last_size: Option<(usize, usize)>,
     /// 上一帧 alacritty 是否处于 alt screen 模式。
@@ -1224,9 +980,13 @@ pub struct TerminalView {
     middle_click_paste: bool,
     /// 在 vim/less/man 等 alt-screen TUI 中,把鼠标滚轮转为方向键发送到 PTY
     vim_scroll_to_arrow_keys: bool,
+    /// SSH 多窗口同步输入开关，按同一连接 ID 分组。
+    broadcast_input_enabled: bool,
+    broadcast_client_id: Option<BroadcastClientId>,
 
     /// 侧边栏面板大小
     sidebar_panel_size: Pixels,
+    sidebar_render_mode: TerminalSidebarRenderMode,
     /// 正在调整大小的面板
     resizing: Option<ResizingPanel>,
     /// 视图边界
@@ -1271,6 +1031,28 @@ impl Default for TerminalScrollbarMetrics {
             line_height: px(1.0),
             cell_width: px(1.0),
         }
+    }
+}
+
+#[derive(Clone)]
+struct TerminalFontMetrics {
+    requested_family: SharedString,
+    fallbacks: Vec<SharedString>,
+    font_size: Pixels,
+    effective_family: SharedString,
+    cell_width: Pixels,
+}
+
+impl TerminalFontMetrics {
+    fn matches(
+        &self,
+        requested_family: &SharedString,
+        fallbacks: &[SharedString],
+        font_size: Pixels,
+    ) -> bool {
+        &self.requested_family == requested_family
+            && self.fallbacks == fallbacks
+            && self.font_size == font_size
     }
 }
 
@@ -1346,6 +1128,7 @@ impl TerminalView {
     }
 
     fn close_terminal_now(&mut self, cx: &mut Context<Self>) {
+        self.unregister_broadcast_input(cx);
         self.unregister_public_mcp_session(cx);
         self.release_active_connection(cx);
         self.terminal.read(cx).shutdown();
@@ -1377,7 +1160,8 @@ impl TerminalView {
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(t!("Common.close").to_string())
-                        .cancel_text(t!("Common.cancel").to_string()),
+                        .cancel_text(t!("Common.cancel").to_string())
+                        .show_cancel(true),
                 )
                 .on_ok(move |_, _, _| {
                     TerminalView::send_close_confirmation(&tx_ok, true);
@@ -1419,6 +1203,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         // 创建 Terminal Entity
+        let duplicate_source = TerminalDuplicateSource::Local(config.clone());
         let local_working_dir = resolve_local_working_dir(config.working_dir.clone());
         let init_error = Rc::new(RefCell::new(None));
         let init_error_clone = init_error.clone();
@@ -1434,6 +1219,7 @@ impl TerminalView {
             true,
             local_working_dir,
             tab_index,
+            duplicate_source,
             window,
             cx,
         );
@@ -1463,6 +1249,11 @@ impl TerminalView {
         // 创建 SSH Terminal Entity
         let connection_id = conn.id;
         let stored_conn = conn.clone();
+        let duplicate_source = TerminalDuplicateSource::Ssh {
+            connection: stored_conn.clone(),
+            working_dir: working_dir.map(str::to_string),
+            sync_path_with_terminal,
+        };
         let terminal =
             cx.new(|cx| Terminal::new_ssh(conn, cx, working_dir, sync_path_with_terminal));
         Self::new_with_terminal(
@@ -1472,6 +1263,7 @@ impl TerminalView {
             sync_path_with_terminal,
             None,
             tab_index,
+            duplicate_source,
             window,
             cx,
         )
@@ -1488,6 +1280,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let connection_id = conn.id;
+        let duplicate_source = TerminalDuplicateSource::Serial(conn.clone());
         let terminal = cx.new(|cx| Terminal::new_serial(conn, cx));
         // 串口不传 stored_connection，避免创建文件管理器面板
         Self::new_with_terminal(
@@ -1497,6 +1290,7 @@ impl TerminalView {
             true,
             None,
             tab_index,
+            duplicate_source,
             window,
             cx,
         )
@@ -1509,6 +1303,7 @@ impl TerminalView {
         sync_path_enabled: bool,
         local_working_dir: Option<PathBuf>,
         tab_index: Option<usize>,
+        duplicate_source: TerminalDuplicateSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1527,6 +1322,8 @@ impl TerminalView {
         let default_line_height_scale = DEFAULT_LINE_HEIGHT_SCALE;
         let ssh_config = terminal.read(cx).ssh_config().cloned();
         let ssh_session_manager = terminal.read(cx).ssh_session_manager().cloned();
+        let history_scope =
+            terminal_history_scope(terminal.read(cx).connection_kind(), connection_id);
 
         // 创建侧边栏（传递 StoredConnection 用于文件管理器）
         let sidebar = cx.new(|cx| {
@@ -1539,10 +1336,24 @@ impl TerminalView {
                 default_font_size,
                 default_font_family.clone(),
                 sync_path_enabled,
+                false,
+                history_scope,
                 window,
                 cx,
             )
         });
+        let sidebar_toolbar = cx.new(|_| TerminalSidebarToolbar::new(sidebar.clone()));
+        let sidebar_tool_panels = SidebarPanel::all()
+            .iter()
+            .copied()
+            .map(|panel| {
+                let sidebar = sidebar.clone();
+                (
+                    panel,
+                    cx.new(move |_| TerminalSidebarToolPanel::new(sidebar.clone(), panel)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         // 订阅侧边栏事件（需要 window 以便弹确认对话框）
         let sidebar_subscription = cx.subscribe_in(&sidebar, window, Self::handle_sidebar_event);
@@ -1595,6 +1406,7 @@ impl TerminalView {
 
         let mut this = Self {
             terminal,
+            duplicate_source,
             local_working_dir: if is_local_terminal {
                 local_working_dir
             } else {
@@ -1602,12 +1414,15 @@ impl TerminalView {
             },
             blink_manager,
             sidebar,
+            sidebar_toolbar,
+            sidebar_tool_panels,
             font_size: default_font_size,
             line_height: default_font_size * default_line_height_scale,
             font_family: default_font_family,
             font_fallbacks: default_font_fallbacks,
             line_height_scale: default_line_height_scale,
             cell_width: DEFAULT_CELL_WIDTH,
+            font_metrics: None,
             // 初始化为 None，确保首次渲染时会触发 resize，
             // 将正确的终端尺寸发送给 PTY
             last_size: None,
@@ -1639,7 +1454,10 @@ impl TerminalView {
             autocomplete_enabled: true,
             middle_click_paste: true,
             vim_scroll_to_arrow_keys: true,
+            broadcast_input_enabled: false,
+            broadcast_client_id: None,
             sidebar_panel_size: SIDEBAR_DEFAULT_WIDTH,
+            sidebar_render_mode: TerminalSidebarRenderMode::Embedded,
             resizing: None,
             view_bounds: Bounds::default(),
             agent_window_handle: None,
@@ -1650,8 +1468,14 @@ impl TerminalView {
         };
         let initial_settings = current_settings(cx);
         this.apply_settings_snapshot(&initial_settings, window, cx);
+        this.register_broadcast_input(cx);
         this.register_public_mcp_session(cx);
         this
+    }
+
+    pub fn with_external_sidebar(mut self) -> Self {
+        self.sidebar_render_mode = TerminalSidebarRenderMode::External;
+        self
     }
 
     fn register_public_mcp_session(&mut self, cx: &mut Context<Self>) {
@@ -1660,6 +1484,76 @@ impl TerminalView {
             return;
         };
         self.public_mcp_registration = Some(registration);
+    }
+
+    fn register_broadcast_input(&mut self, cx: &mut Context<Self>) {
+        if self.broadcast_client_id.is_some() {
+            return;
+        }
+
+        let connection_id = {
+            let terminal = self.terminal.read(cx);
+            if terminal.connection_kind() != TerminalConnectionKind::Ssh {
+                return;
+            }
+            let Some(connection_id) = terminal.connection_id() else {
+                return;
+            };
+            connection_id
+        };
+
+        init_broadcast_input_registry(cx);
+        let view = cx.entity().downgrade();
+        let client_id = cx
+            .global_mut::<BroadcastInputRegistry>()
+            .register(connection_id, view);
+        self.broadcast_client_id = Some(client_id);
+    }
+
+    fn unregister_broadcast_input(&mut self, cx: &mut Context<Self>) {
+        let Some(client_id) = self.broadcast_client_id.take() else {
+            return;
+        };
+        if cx.try_global::<BroadcastInputRegistry>().is_some() {
+            cx.global_mut::<BroadcastInputRegistry>()
+                .unregister(client_id);
+        }
+        self.broadcast_input_enabled = false;
+    }
+
+    fn apply_broadcast_input_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.terminal.read(cx).connection_kind() != TerminalConnectionKind::Ssh {
+            return;
+        }
+        self.register_broadcast_input(cx);
+        let Some(client_id) = self.broadcast_client_id else {
+            return;
+        };
+        init_broadcast_input_registry(cx);
+        cx.global_mut::<BroadcastInputRegistry>()
+            .set_enabled(client_id, enabled);
+        self.broadcast_input_enabled = cx
+            .try_global::<BroadcastInputRegistry>()
+            .is_some_and(|registry| registry.is_enabled(client_id));
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_broadcast_input_enabled(self.broadcast_input_enabled, cx);
+        });
+        cx.notify();
+    }
+
+    fn broadcast_user_input(&self, data: &[u8], cx: &mut Context<Self>) {
+        let Some(client_id) = self.broadcast_client_id else {
+            return;
+        };
+        let Some(registry) = cx.try_global::<BroadcastInputRegistry>() else {
+            return;
+        };
+        let deliveries = registry.deliveries_from(client_id, data);
+        for (view, data) in deliveries {
+            let _ = view.update(cx, |view, cx| {
+                view.write_broadcast_input(data, cx);
+            });
+        }
     }
 
     fn refresh_public_mcp_session(&self, cx: &mut Context<Self>) {
@@ -1704,6 +1598,7 @@ impl TerminalView {
     ) {
         match event {
             TerminalSidebarEvent::PanelChanged(_panel) => {
+                cx.emit(TabContentEvent::StateChanged);
                 cx.notify();
             }
             TerminalSidebarEvent::SearchPatternChanged(pattern) => {
@@ -1775,6 +1670,9 @@ impl TerminalView {
             }
             TerminalSidebarEvent::VimScrollToArrowKeysChanged(enabled) => {
                 self.set_vim_scroll_to_arrow_keys(*enabled, cx);
+            }
+            TerminalSidebarEvent::BroadcastInputChanged(enabled) => {
+                self.apply_broadcast_input_enabled(*enabled, cx);
             }
             TerminalSidebarEvent::SyncPathChanged(enabled) => {
                 let enabled = *enabled;
@@ -2433,7 +2331,14 @@ impl TerminalView {
                 self.focus_terminal_after_connect_if_ready(window, cx);
                 self.finish_pending_agent_command_from_prompt(cx);
                 self.refresh_history_prompt_matches(cx);
+                cx.emit(TabContentEvent::ContentChanged);
                 cx.notify();
+            }
+            TerminalModelEvent::CommandHistoryChanged => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.refresh_history_commands(cx);
+                });
+                self.refresh_history_prompt_matches(cx);
             }
             TerminalModelEvent::SshMfaChanged => {
                 self.sync_ssh_mfa_inputs(window, cx);
@@ -2679,10 +2584,14 @@ impl TerminalView {
         if (current - clamped).abs() >= f32::EPSILON {
             self.font_size = px(clamped);
             self.line_height = self.font_size * self.line_height_scale;
+            self.font_metrics = None;
+            self.last_size = None;
         }
-        let font_family = SharedString::from(font_family);
+        let font_family = SharedString::from(normalize_terminal_primary_font(&font_family));
         if self.font_family != font_family {
             self.font_family = font_family.clone();
+            self.font_metrics = None;
+            self.last_size = None;
         }
 
         self.auto_copy_on_select = auto_copy;
@@ -2894,15 +2803,9 @@ impl TerminalView {
 
     /// 设置主字体
     pub fn set_font_family(&mut self, family: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let family: SharedString = family.into();
-        if self.font_family == family {
-            return;
-        }
-        self.font_family = family.clone();
-        let persisted_family = family.to_string();
-        let _ = update_settings(cx, move |settings| {
-            settings.font_family = persisted_family;
-        });
+        self.font_family = normalize_terminal_primary_font(family.into().as_ref()).into();
+        self.font_metrics = None;
+        self.last_size = None;
         cx.notify();
     }
 
@@ -2915,6 +2818,7 @@ impl TerminalView {
     pub fn set_line_height_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
         self.line_height_scale = scale.clamp(1.0, 2.5);
         self.line_height = self.font_size * self.line_height_scale;
+        self.last_size = None;
         cx.notify();
     }
 
@@ -3680,6 +3584,15 @@ impl TerminalView {
     }
 
     fn write_to_pty(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
+        self.write_input_to_terminal(&data, cx);
+        self.broadcast_user_input(&data, cx);
+    }
+
+    fn write_broadcast_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
+        self.write_input_to_terminal(&data, cx);
+    }
+
+    fn write_input_to_terminal(&mut self, data: &[u8], cx: &mut Context<Self>) {
         // 用户输入时自动滚动到底部
         let display_offset = self.terminal.read(cx).term().lock().grid().display_offset();
         if should_scroll_to_bottom_on_user_input(
@@ -3693,7 +3606,7 @@ impl TerminalView {
                     .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             });
         }
-        self.terminal.read(cx).write(&data);
+        self.terminal.read(cx).write(data);
     }
 
     fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -3842,14 +3755,6 @@ impl TerminalView {
                     }
                 }
                 "enter" => {
-                    if self.connection_kind(cx) == TerminalConnectionKind::Local
-                        && self.history_prompt.is_valid()
-                    {
-                        let command = self.history_prompt.input().to_string();
-                        self.terminal.update(cx, |terminal, cx| {
-                            terminal.record_command(&command, cx);
-                        });
-                    }
                     self.clear_history_prompt();
                 }
                 "left" | "home" | "end" | "delete" => {
@@ -4399,7 +4304,79 @@ impl TerminalView {
             .to_string()
     }
 
-    fn render_terminal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn terminal_font_metrics(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalFontMetrics {
+        if let Some(metrics) = &self.font_metrics {
+            if metrics.matches(&self.font_family, &self.font_fallbacks, self.font_size) {
+                return metrics.clone();
+            }
+        }
+
+        let metrics = self.refresh_terminal_font_metrics(window, cx);
+        self.font_metrics = Some(metrics.clone());
+        metrics
+    }
+
+    fn refresh_terminal_font_metrics(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalFontMetrics {
+        let installed_font_names = cx.text_system().all_font_names();
+        let effective_family: SharedString = resolve_installed_grid_monospace_font_family(
+            self.font_family.as_ref(),
+            &installed_font_names,
+        )
+        .into();
+        let font = self.terminal_font(effective_family.clone());
+        let font_id = window.text_system().resolve_font(&font);
+        let measured_widths = "mMW@#0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            .chars()
+            .filter_map(|ch| {
+                window
+                    .text_system()
+                    .advance(font_id, self.font_size, ch)
+                    .map(|size| size.width)
+                    .ok()
+            });
+        TerminalFontMetrics {
+            requested_family: self.font_family.clone(),
+            fallbacks: self.font_fallbacks.clone(),
+            font_size: self.font_size,
+            effective_family,
+            cell_width: terminal_cell_width_from_advances(self.font_size, measured_widths),
+        }
+    }
+
+    fn terminal_font(&self, family: SharedString) -> Font {
+        let fallbacks = if self.font_fallbacks.is_empty() {
+            None
+        } else {
+            Some(FontFallbacks::from_fonts(
+                self.font_fallbacks
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let features = FontFeatures(Arc::new(vec![("calt".to_string(), 0)]));
+        Font {
+            family,
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+            features,
+            fallbacks,
+        }
+    }
+
+    fn render_terminal(
+        &mut self,
+        font_family: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Prepare addons before rendering
         {
             let is_local =
@@ -4435,7 +4412,7 @@ impl TerminalView {
 
         TerminalElement::new(
             &self.render_cache,
-            self.font_family.clone(),
+            font_family,
             self.font_size,
             self.font_fallbacks.iter().map(|s| s.to_string()).collect(),
             self.line_height_scale,
@@ -4914,6 +4891,17 @@ impl TerminalView {
         let bounds = self.terminal_bounds;
 
         let point = self.pixel_to_point(event.position, bounds, cx);
+        let has_selection = self.terminal.read(cx).term().lock().selection.is_some();
+        if should_extend_selection_on_shift_click(event.button, event.modifiers, has_selection) {
+            let side = self.pixel_to_side(event.position, bounds);
+            self.terminal.update(cx, |terminal, _| {
+                terminal.update_selection(point, side);
+            });
+            self.mouse_state.selecting = true;
+            cx.notify();
+            return;
+        }
+
         let screen_line = point.line.0 as usize;
         let column = point.column.0;
         let line_text = self.get_line_text(screen_line, cx);
@@ -5305,6 +5293,135 @@ impl TabContent for TerminalView {
         true
     }
 
+    fn can_split(&self, _cx: &App) -> bool {
+        true
+    }
+
+    fn can_duplicate(&self, _cx: &App) -> bool {
+        terminal_tab_duplicate_supported(&self.duplicate_source)
+    }
+
+    fn duplicate(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn TabContentView>> {
+        let source = self.duplicate_source.clone();
+        let sidebar_mode = self.sidebar_render_mode;
+        let duplicate = cx.new(|cx| {
+            let view = match source {
+                TerminalDuplicateSource::Local(config) => {
+                    TerminalView::new_with_index(config, None, window, cx)
+                }
+                TerminalDuplicateSource::Ssh {
+                    connection,
+                    working_dir,
+                    sync_path_with_terminal,
+                } => TerminalView::new_ssh_with_index(
+                    connection,
+                    None,
+                    window,
+                    cx,
+                    working_dir.as_deref(),
+                    sync_path_with_terminal,
+                ),
+                TerminalDuplicateSource::Serial(connection) => {
+                    TerminalView::new_serial_with_index(connection, None, window, cx)
+                }
+            };
+            if sidebar_mode == TerminalSidebarRenderMode::External {
+                view.with_external_sidebar()
+            } else {
+                view
+            }
+        });
+        Some(Arc::new(duplicate))
+    }
+
+    fn sidebar_contributions(&self, cx: &App) -> Vec<SidebarContribution> {
+        if self.sidebar_render_mode != TerminalSidebarRenderMode::External {
+            return Vec::new();
+        }
+        let colors = self.current_theme.colors();
+        let style = SidebarPanelStyle {
+            background: Some(colors.background),
+            header_background: Some(colors.muted),
+            border: Some(colors.border),
+            text: Some(colors.foreground),
+        };
+        let open_panels = self.sidebar.read(cx).open_tool_panels();
+        let mut contributions = Vec::new();
+
+        for (panel, placement) in open_panels {
+            let Some(view) = self.sidebar_tool_panels.get(&panel).cloned() else {
+                continue;
+            };
+            let sidebar_for_close = self.sidebar.clone();
+            let sidebar_for_move = self.sidebar.clone();
+            contributions.push(SidebarContribution {
+                id: SidebarPanelId::new(self.sidebar.entity_id(), panel.local_id()),
+                title: SharedString::from(panel.title()),
+                icon: panel.icon_name(),
+                view: view.into(),
+                default_placement: placement,
+                policy: SidebarPanelPolicy {
+                    hideable: true,
+                    movable: true,
+                    allowed_placements: SidebarPlacementSet::all(),
+                    initially_visible: true,
+                },
+                style,
+                size: SidebarPanelSize {
+                    side_width: Some(self.sidebar_panel_size),
+                    bottom_height: Some(self.sidebar_panel_size),
+                },
+                chrome: SidebarPanelChrome::Host,
+                actions: SidebarContributionActions {
+                    close: Some(Arc::new(move |_window, cx| {
+                        sidebar_for_close.update(cx, |sidebar, cx| {
+                            sidebar.close_tool(panel, cx);
+                        });
+                    })),
+                    move_to: Some(Arc::new(move |placement, _window, cx| {
+                        sidebar_for_move.update(cx, |sidebar, cx| {
+                            sidebar.move_tool(panel, placement, cx);
+                        });
+                    })),
+                },
+            });
+        }
+
+        if self.sidebar.read(cx).toolbar_visible() {
+            contributions.push(SidebarContribution {
+                id: SidebarPanelId::new(self.sidebar.entity_id(), "terminal.toolbar"),
+                title: SharedString::from("Terminal"),
+                icon: IconName::Terminal,
+                view: self.sidebar_toolbar.clone().into(),
+                default_placement: SidebarPlacement::Right,
+                policy: SidebarPanelPolicy {
+                    hideable: false,
+                    movable: false,
+                    allowed_placements: SidebarPlacementSet::right_only(),
+                    initially_visible: true,
+                },
+                style: SidebarPanelStyle {
+                    background: Some(colors.background),
+                    header_background: Some(colors.muted),
+                    border: Some(colors.border),
+                    text: Some(colors.foreground),
+                },
+                size: SidebarPanelSize {
+                    side_width: Some(TOOLBAR_WIDTH),
+                    bottom_height: Some(TOOLBAR_WIDTH),
+                },
+                chrome: SidebarPanelChrome::None,
+                actions: SidebarContributionActions::default(),
+            });
+        }
+
+        contributions
+    }
+
     fn try_close(
         &mut self,
         _tab_id: &str,
@@ -5332,37 +5449,12 @@ impl TabContent for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 创建与 terminal_element 一致的字体配置（包含 fallbacks）
-        let fallbacks = if self.font_fallbacks.is_empty() {
-            None
-        } else {
-            Some(FontFallbacks::from_fonts(
-                self.font_fallbacks
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
-            ))
-        };
-        let features = FontFeatures(std::sync::Arc::new(vec![("calt".to_string(), 0)]));
+        let font_metrics = self.terminal_font_metrics(window, cx);
+        let effective_font_family = font_metrics.effective_family.clone();
 
-        let font = Font {
-            family: self.font_family.clone(),
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-            features,
-            fallbacks,
-        };
-        let font_id = window.text_system().resolve_font(&font);
-        // 使用 advance('m').width 计算 cell_width
-        // advance 返回字符的前进宽度，比 em_width 更准确反映等宽字体的单元格宽度
-        let new_cell_width = window
-            .text_system()
-            .advance(font_id, self.font_size, 'm')
-            .map(|size| size.width)
-            .unwrap_or(self.font_size * 0.6);
-
-        if self.cell_width != new_cell_width {
-            self.cell_width = new_cell_width;
+        if self.cell_width != font_metrics.cell_width {
+            self.cell_width = font_metrics.cell_width;
+            self.last_size = None;
         }
 
         self.line_height = self.font_size * self.line_height_scale;
@@ -5383,7 +5475,9 @@ impl Render for TerminalView {
         let bg_color = self.current_theme.background;
         let has_selection = self.terminal.read(cx).term().lock().selection.is_some();
         let selection_text = self.terminal.read(cx).selection_text();
-        let sidebar_visible = self.sidebar.read(cx).is_visible();
+        let render_embedded_sidebar =
+            self.sidebar_render_mode == TerminalSidebarRenderMode::Embedded;
+        let sidebar_visible = render_embedded_sidebar && self.sidebar.read(cx).is_visible();
         let sidebar_panel_size = self.sidebar_panel_size;
         let view = cx.entity().clone();
         let terminal_mode = self.terminal.read(cx).mode();
@@ -5493,7 +5587,7 @@ impl Render for TerminalView {
                             .bottom(px(12.))
                             .bg(self.current_theme.background)
                             .overflow_hidden()
-                            .child(self.render_terminal(cx))
+                            .child(self.render_terminal(effective_font_family.clone(), cx))
                             .when_some(self.render_history_prompt_overlay(cx), |this, overlay| {
                                 this.child(overlay)
                             })
@@ -5587,7 +5681,9 @@ impl Render for TerminalView {
                         .child(self.sidebar.clone()),
                 )
             })
-            .when(!sidebar_visible, |this| this.child(self.sidebar.clone()))
+            .when(render_embedded_sidebar && !sidebar_visible, |this| {
+                this.child(self.sidebar.clone())
+            })
             .child(ResizeEventHandler { view })
     }
 }
@@ -5783,27 +5879,26 @@ impl Element for ResizeEventHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalAgentDecision, UnbracketedPasteHazard, detect_unbracketed_paste_hazard,
+        TerminalDuplicateSource, UnbracketedPasteHazard, detect_unbracketed_paste_hazard,
         encode_mouse_modifiers, has_trailing_line_continuation, has_unterminated_shell_quote,
         history_prompt_available, history_prompt_dropdown_origin, history_prompt_overlay_bounds,
-        json_object_candidates, mouse_button_code, multiline_non_empty_line_count,
-        parse_terminal_agent_decision, prepare_terminal_agent_command,
-        prepend_terminal_agent_system_prompt, salvage_terminal_agent_final_response,
-        sgr_mouse_button_report, sgr_mouse_mode_enabled, sgr_mouse_wheel_report,
-        should_confirm_local_terminal_close,
+        mouse_button_code, multiline_non_empty_line_count, sgr_mouse_button_report,
+        sgr_mouse_mode_enabled, sgr_mouse_wheel_report, should_confirm_local_terminal_close,
         should_defer_inline_history_prompt_input_to_text_system, should_defer_sgr_left_press,
         should_dismiss_history_prompt_for_keystroke, should_dismiss_history_prompt_for_mouse,
-        should_dismiss_history_prompt_for_scroll, should_reset_history_prompt_for_terminal_event,
-        should_scroll_to_bottom_on_user_input, should_start_selection_from_pending_sgr_press,
-        take_whole_scroll_lines, terminal_agent_command_completed_by_prompt,
-        terminal_agent_protocol_error_message, terminal_agent_response_payload,
+        should_dismiss_history_prompt_for_scroll, should_extend_selection_on_shift_click,
+        should_refresh_history_commands_for_terminal_event,
+        should_reset_history_prompt_for_terminal_event, should_scroll_to_bottom_on_user_input,
+        should_start_selection_from_pending_sgr_press, take_whole_scroll_lines,
+        terminal_history_scope, terminal_tab_duplicate_supported,
     };
     use crate::history_prompt::{HistoryPromptAccept, HistoryPromptState};
     use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
     use alacritty_terminal::term::TermMode;
     use gpui::{Bounds, Keystroke, Modifiers, MouseButton, Point, px, size};
-    use one_core::llm::{Message, MessageBlock, Role};
+    use one_core::storage::models::{SerialParams, SshAuthMethod, SshParams, StoredConnection};
     use std::cell::Cell as StdCell;
+    use terminal::LocalConfig;
     use terminal::terminal::{TerminalConnectionKind, TerminalModelEvent};
 
     #[test]
@@ -5833,6 +5928,73 @@ mod tests {
             false,
             TermMode::empty(),
             None,
+        ));
+    }
+
+    #[test]
+    fn tab_duplicate_is_supported_for_local_ssh_and_serial_terminals() {
+        let ssh = StoredConnection::new_ssh(
+            "ssh".to_string(),
+            SshParams {
+                host: "localhost".to_string(),
+                port: 22,
+                username: "user".to_string(),
+                auth_method: SshAuthMethod::Agent,
+                connect_timeout: None,
+                keepalive_interval: None,
+                keepalive_max: None,
+                default_directory: None,
+                init_script: None,
+                disable_shell_integration: None,
+                jump_server: None,
+                proxy: None,
+            },
+            None,
+        );
+        let serial = StoredConnection::new_serial(
+            "serial".to_string(),
+            SerialParams {
+                port_name: "/dev/ttyS0".to_string(),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert!(terminal_tab_duplicate_supported(
+            &TerminalDuplicateSource::Local(LocalConfig::default())
+        ));
+        assert!(terminal_tab_duplicate_supported(
+            &TerminalDuplicateSource::Ssh {
+                connection: ssh,
+                working_dir: None,
+                sync_path_with_terminal: true,
+            },
+        ));
+        assert!(terminal_tab_duplicate_supported(
+            &TerminalDuplicateSource::Serial(serial)
+        ));
+    }
+
+    #[test]
+    fn terminal_history_scope_matches_supported_connection_kinds() {
+        let local = terminal_history_scope(TerminalConnectionKind::Local, None)
+            .expect("local terminal should have history scope");
+        let ssh = terminal_history_scope(TerminalConnectionKind::Ssh, Some(42))
+            .expect("ssh terminal with id should have history scope");
+
+        assert_eq!("local", local.scope_key);
+        assert_eq!("ssh:42", ssh.scope_key);
+        assert!(terminal_history_scope(TerminalConnectionKind::Ssh, None).is_none());
+        assert!(terminal_history_scope(TerminalConnectionKind::Serial, Some(7)).is_none());
+    }
+
+    #[test]
+    fn command_history_changed_refreshes_history_command_panel() {
+        assert!(should_refresh_history_commands_for_terminal_event(
+            &TerminalModelEvent::CommandHistoryChanged
+        ));
+        assert!(!should_refresh_history_commands_for_terminal_event(
+            &TerminalModelEvent::Wakeup
         ));
     }
 
@@ -5915,6 +6077,22 @@ mod tests {
         assert!(!source.contains("pub font_family"));
         assert!(!source.contains("pub font_fallbacks"));
         assert!(!source.contains("pub line_height_scale"));
+    }
+
+    #[test]
+    fn terminal_render_uses_cached_font_metrics() {
+        let source = include_str!("view.rs");
+        let render_start = source
+            .find("fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)")
+            .expect("render method should exist");
+        let render_end = render_start
+            + source[render_start..]
+                .find("        self.line_height = self.font_size * self.line_height_scale;")
+                .expect("render setup should update line height");
+        let render_setup = &source[render_start..render_end];
+
+        assert!(source.contains("fn refresh_terminal_font_metrics("));
+        assert!(!render_setup.contains("cx.text_system().all_font_names()"));
     }
 
     #[test]
@@ -6064,6 +6242,36 @@ mod tests {
         assert!(should_start_selection_from_pending_sgr_press(
             start,
             AlacPoint::new(Line(2), Column(1))
+        ));
+    }
+
+    #[test]
+    fn shift_left_click_extends_existing_terminal_selection_only() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let none = Modifiers::default();
+
+        assert!(should_extend_selection_on_shift_click(
+            MouseButton::Left,
+            shift,
+            true
+        ));
+        assert!(!should_extend_selection_on_shift_click(
+            MouseButton::Left,
+            shift,
+            false
+        ));
+        assert!(!should_extend_selection_on_shift_click(
+            MouseButton::Left,
+            none,
+            true
+        ));
+        assert!(!should_extend_selection_on_shift_click(
+            MouseButton::Right,
+            shift,
+            true
         ));
     }
 
@@ -6283,7 +6491,7 @@ mod tests {
     fn history_prompt_requires_global_autocomplete_switch() {
         let mode = TermMode::empty();
 
-        assert!(!history_prompt_available(
+        assert!(history_prompt_available(
             true,
             TerminalConnectionKind::Local,
             mode,
@@ -6298,10 +6506,10 @@ mod tests {
     }
 
     #[test]
-    fn history_prompt_only_remains_available_for_ssh() {
+    fn history_prompt_is_available_for_local_and_ssh_prompt_input() {
         let mode = TermMode::empty();
 
-        assert!(!history_prompt_available(
+        assert!(history_prompt_available(
             true,
             TerminalConnectionKind::Local,
             mode,
@@ -6309,7 +6517,7 @@ mod tests {
         ));
         assert!(!history_prompt_available(
             true,
-            TerminalConnectionKind::Local,
+            TerminalConnectionKind::Serial,
             mode,
             true,
         ));
@@ -6323,17 +6531,16 @@ mod tests {
 
     #[test]
     fn history_prompt_is_unavailable_in_terminal_application_modes() {
-        for mode in [
-            TermMode::FOCUS_IN_OUT,
-            TermMode::MOUSE_MODE,
-            TermMode::DISAMBIGUATE_ESC_CODES,
-        ] {
-            assert!(!history_prompt_available(
-                true,
-                TerminalConnectionKind::Ssh,
-                mode,
-                true,
-            ));
+        for connection_kind in [TerminalConnectionKind::Local, TerminalConnectionKind::Ssh] {
+            for mode in [
+                TermMode::FOCUS_IN_OUT,
+                TermMode::MOUSE_MODE,
+                TermMode::DISAMBIGUATE_ESC_CODES,
+                TermMode::ALT_SCREEN,
+                TermMode::VI,
+            ] {
+                assert!(!history_prompt_available(true, connection_kind, mode, true));
+            }
         }
     }
 
@@ -6341,13 +6548,13 @@ mod tests {
     fn history_prompt_requires_active_shell_prompt_input() {
         assert!(!history_prompt_available(
             true,
-            TerminalConnectionKind::Ssh,
+            TerminalConnectionKind::Local,
             TermMode::empty(),
             false,
         ));
         assert!(history_prompt_available(
             true,
-            TerminalConnectionKind::Ssh,
+            TerminalConnectionKind::Local,
             TermMode::empty(),
             true,
         ));

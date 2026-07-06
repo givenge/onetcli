@@ -1,6 +1,6 @@
 use db::DbNodeType;
 use db::ipc::{IpcDriverManifest, IpcDriverRegistry};
-use db::plugin::DatabasePlugin;
+use db::plugin::{DatabasePlugin, DatabaseUserOperationRequest};
 use db::plugin_manifest::{
     DatabaseActionDescriptor, DatabaseActionId, DatabaseActionPlacement,
     DatabaseActionToolbarScope, DatabaseCapabilities, DatabaseFormKind, DatabaseUiManifest,
@@ -17,7 +17,10 @@ use crate::common::manifest_bridge::{
     find_form, matches_node_type, to_column_editor_capabilities, to_connection_form_config,
     to_connection_form_config_with_text_resolver, to_table_designer_capabilities, translate,
 };
-use crate::common::{DatabaseEditorView, GenericDatabaseForm, GenericSchemaForm, SchemaEditorView};
+use crate::common::{
+    DatabaseEditorView, GenericDatabaseForm, GenericSchemaForm, GenericUserForm, SchemaEditorView,
+    UserEditorView,
+};
 use crate::database_objects_tab::DatabaseObjectsEvent;
 use crate::db_tree_view::{DbTreeViewEvent, SqlDumpMode};
 use std::collections::HashMap;
@@ -308,6 +311,39 @@ impl ManifestDatabaseViewPlugin {
         Some(cx.new(|cx| {
             let form = cx.new(|cx| GenericSchemaForm::new(manifest, window, cx));
             SchemaEditorView::new(form, database_type, window, cx)
+        }))
+    }
+
+    fn create_user_editor_view(
+        &self,
+        operation: DatabaseFormKind,
+        initial: Option<DatabaseUserOperationRequest>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Entity<UserEditorView>> {
+        let manifest = find_form(&self.manifest, operation)?;
+        let database_type = self.database_type.clone();
+        let text_resolver = self.text_resolver();
+        Some(cx.new(|cx| {
+            let form = cx.new(|cx| {
+                GenericUserForm::new_with_text_resolver(
+                    database_type.clone(),
+                    manifest,
+                    initial,
+                    text_resolver,
+                    window,
+                    cx,
+                )
+            });
+            let initial_request = form.read(cx).current_request(cx);
+            UserEditorView::new(
+                form,
+                database_type,
+                operation,
+                Some(initial_request),
+                window,
+                cx,
+            )
         }))
     }
 
@@ -611,7 +647,17 @@ pub fn create_connection_form_for(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<DbConnectionForm> {
-    if let Some(config) = duckdb_ipc_connection_form_config(&database_type, cx) {
+    let registry = IpcDriverRegistry::load_default();
+    create_connection_form_for_with_registry(database_type, &registry, window, cx)
+}
+
+pub fn create_connection_form_for_with_registry(
+    database_type: DatabaseType,
+    registry: &IpcDriverRegistry,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<DbConnectionForm> {
+    if let Some(config) = duckdb_ipc_connection_form_config(&database_type, registry, cx) {
         return cx.new(|cx| DbConnectionForm::new(config, window, cx));
     }
     manifest_plugin(database_type, cx).create_connection_form(window, cx)
@@ -622,7 +668,17 @@ pub fn create_external_connection_form_for(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Entity<DbConnectionForm>> {
-    let driver = IpcDriverRegistry::load_default().find(driver_id)?;
+    let registry = IpcDriverRegistry::load_default();
+    create_external_connection_form_for_with_registry(driver_id, &registry, window, cx)
+}
+
+pub fn create_external_connection_form_for_with_registry(
+    driver_id: &str,
+    registry: &IpcDriverRegistry,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<DbConnectionForm>> {
+    let driver = registry.find(driver_id)?;
     let config = external_form_config(&driver, cx)?;
     Some(cx.new(|cx| DbConnectionForm::new(config, window, cx)))
 }
@@ -634,6 +690,7 @@ fn external_form_config(driver: &IpcDriverManifest, cx: &mut App) -> Option<DbFo
 
 fn duckdb_ipc_connection_form_config(
     database_type: &DatabaseType,
+    registry: &IpcDriverRegistry,
     cx: &mut App,
 ) -> Option<DbFormConfig> {
     if database_type != &DatabaseType::DuckDB {
@@ -644,7 +701,7 @@ fn duckdb_ipc_connection_form_config(
     if duckdb_plugin.name() != DatabaseType::external("duckdb") {
         return None;
     }
-    let driver = IpcDriverRegistry::load_default().find("duckdb")?;
+    let driver = registry.find("duckdb")?;
     let plugin_type = DatabaseType::external(driver.id.clone());
     let plugin = db_state.get_plugin(&plugin_type).ok()?;
     duckdb_ipc_form_config_with_plugin(&driver, plugin.as_ref())
@@ -956,6 +1013,16 @@ pub fn create_schema_editor_view_for(
     )
 }
 
+pub fn create_user_editor_view_for(
+    database_type: DatabaseType,
+    operation: DatabaseFormKind,
+    initial: Option<DatabaseUserOperationRequest>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<UserEditorView>> {
+    manifest_plugin(database_type, cx).create_user_editor_view(operation, initial, window, cx)
+}
+
 pub fn build_context_menu_for(
     database_type: DatabaseType,
     node_id: &str,
@@ -992,13 +1059,21 @@ fn append_er_diagram_item(items: &mut Vec<ContextMenuItem>, node_id: &str, node_
     ));
 }
 
-#[cfg(feature = "compare")]
 fn append_compare_items(items: &mut Vec<ContextMenuItem>, node_id: &str, node_type: DbNodeType) {
-    // 数据比较：仅对表显示
-    if matches!(node_type, DbNodeType::Table) {
-        if !items.is_empty() {
-            items.push(ContextMenuItem::separator());
-        }
+    let can_compare_data = matches!(
+        node_type,
+        DbNodeType::Database | DbNodeType::Schema | DbNodeType::Table
+    );
+    let can_compare_schema = matches!(node_type, DbNodeType::Database | DbNodeType::Schema);
+    if !(can_compare_data || can_compare_schema) {
+        return;
+    }
+
+    if !items.is_empty() && !matches!(items.last(), Some(ContextMenuItem::Separator)) {
+        items.push(ContextMenuItem::separator());
+    }
+
+    if can_compare_data {
         items.push(ContextMenuItem::item(
             "数据比较",
             DbTreeViewEvent::CompareData {
@@ -1007,11 +1082,7 @@ fn append_compare_items(items: &mut Vec<ContextMenuItem>, node_id: &str, node_ty
         ));
     }
 
-    // 结构比较：对数据库和 Schema 显示
-    if matches!(node_type, DbNodeType::Database | DbNodeType::Schema) {
-        if items.is_empty() || !matches!(items.last(), Some(ContextMenuItem::Separator)) {
-            items.push(ContextMenuItem::separator());
-        }
+    if can_compare_schema {
         items.push(ContextMenuItem::item(
             "结构比较",
             DbTreeViewEvent::CompareSchema {
@@ -1019,10 +1090,6 @@ fn append_compare_items(items: &mut Vec<ContextMenuItem>, node_id: &str, node_ty
             },
         ));
     }
-}
-
-#[cfg(not(feature = "compare"))]
-fn append_compare_items(_items: &mut Vec<ContextMenuItem>, _node_id: &str, _node_type: DbNodeType) {
 }
 
 pub fn get_table_designer_capabilities_for(
@@ -1705,33 +1772,20 @@ driver:
     }
 
     #[test]
-    #[cfg(not(feature = "compare"))]
-    fn compare_context_menu_items_are_hidden_without_compare_feature() {
-        let mut table_items = Vec::new();
-        append_compare_items(&mut table_items, "table-1", DbNodeType::Table);
-        assert!(
-            !has_label(&table_items, "数据比较"),
-            "默认构建不应暴露未完成的数据比较入口"
-        );
-
-        let mut database_items = Vec::new();
-        append_compare_items(&mut database_items, "database-1", DbNodeType::Database);
-        assert!(
-            !has_label(&database_items, "结构比较"),
-            "默认构建不应暴露未完成的结构比较入口"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "compare")]
-    fn compare_context_menu_items_are_available_with_compare_feature() {
+    fn compare_context_menu_items_are_available() {
         let mut table_items = Vec::new();
         append_compare_items(&mut table_items, "table-1", DbNodeType::Table);
         assert!(has_label(&table_items, "数据比较"));
 
         let mut database_items = Vec::new();
         append_compare_items(&mut database_items, "database-1", DbNodeType::Database);
+        assert!(has_label(&database_items, "数据比较"));
         assert!(has_label(&database_items, "结构比较"));
+
+        let mut schema_items = Vec::new();
+        append_compare_items(&mut schema_items, "schema-1", DbNodeType::Schema);
+        assert!(has_label(&schema_items, "数据比较"));
+        assert!(has_label(&schema_items, "结构比较"));
     }
 
     #[test]

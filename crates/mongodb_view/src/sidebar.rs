@@ -1,13 +1,16 @@
+use ai_chat_view::{
+    AskAiEvent, DefaultAgentChatPanel, DefaultAgentChatPanelEvent, DefaultTargetReason,
+    build_sidebar_resource_state, get_ask_ai_notifier,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Window, div,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size};
-use one_core::ai_chat::ask_ai::{AskAiEvent, get_ask_ai_notifier};
-use one_core::ai_chat::{AiChatPanel, AiChatPanelEvent};
-use one_ui::workbench;
+use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex, v_flex};
+use one_core::layout::TOOLBAR_WIDTH;
+use one_core::storage::StoredConnection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPanel {
@@ -30,27 +33,47 @@ pub enum MongoSidebarEvent {
 
 pub struct MongoSidebar {
     active_panel: Option<SidebarPanel>,
-    ai_chat_panel: Entity<AiChatPanel>,
+    ai_chat_panel: Entity<DefaultAgentChatPanel>,
     focus_handle: FocusHandle,
     is_active: bool,
     _subs: Vec<Subscription>,
 }
 
 impl MongoSidebar {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let ai_chat_panel = cx.new(|cx| AiChatPanel::new(window, cx));
+    pub fn new(
+        connections: Vec<StoredConnection>,
+        active_conn_id: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let active_connection = active_conn_id
+            .and_then(|id| connections.iter().find(|conn| conn.id == Some(id)))
+            .or_else(|| connections.first());
+        let ai_chat_panel = if let Some(connection) = active_connection {
+            let (scope, catalog, mentions) = build_sidebar_resource_state(
+                connection,
+                &connections,
+                DefaultTargetReason::CurrentConnection,
+            );
+            cx.new(|cx| {
+                DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(
+                    scope, catalog, mentions, window, cx,
+                )
+            })
+        } else {
+            cx.new(|cx| DefaultAgentChatPanel::new(window, cx))
+        };
 
         let mut subs = Vec::new();
 
-        subs.push(
-            cx.subscribe(&ai_chat_panel, |this, _, event: &AiChatPanelEvent, cx| {
-                if let AiChatPanelEvent::Close = event {
-                    this.active_panel = None;
-                    cx.emit(MongoSidebarEvent::PanelChanged);
-                    cx.notify();
-                }
-            }),
-        );
+        subs.push(cx.subscribe(
+            &ai_chat_panel,
+            |this, _, _event: &DefaultAgentChatPanelEvent, cx| {
+                this.active_panel = None;
+                cx.emit(MongoSidebarEvent::PanelChanged);
+                cx.notify();
+            },
+        ));
 
         if let Some(notifier) = get_ask_ai_notifier(cx) {
             subs.push(
@@ -163,17 +186,26 @@ impl Focusable for MongoSidebar {
 
 impl Render for MongoSidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let bg_color = cx.theme().background;
+        let active_panel = self.active_panel;
+
+        h_flex()
             .h_full()
             .flex_shrink_0()
-            .when_some(self.active_panel, |this, panel| {
-                this.w_full().child(
-                    workbench::side_panel_surface(cx)
+            .bg(bg_color)
+            .when(active_panel.is_some(), |this| this.w_full())
+            .when(active_panel.is_none(), |this| this.w(TOOLBAR_WIDTH))
+            .when_some(active_panel, |this, panel| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .bg(bg_color)
                         .child(self.render_panel_content(panel, window, cx)),
                 )
             })
-            .when(!self.is_panel_visible(), |this| {
-                this.child(self.render_toolbar(window, cx))
-            })
+            .child(self.render_toolbar(window, cx))
     }
 }

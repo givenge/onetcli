@@ -8,6 +8,7 @@ use crate::storage::models::has_decrypt_failure_in_sensitive_fields;
 use crate::storage::quick_command::QuickCommandRepository;
 use crate::storage::row_mapping::FromSqliteRow;
 use crate::storage::sftp_favorite_path::SftpFavoritePathRepository;
+use crate::storage::terminal_command_history::TerminalCommandHistoryRepository;
 use crate::storage::traits::Repository;
 use crate::storage::{ConnectionType, StoredConnection, Workspace};
 
@@ -90,6 +91,8 @@ struct WorkspaceRow {
     created_at: i64,
     updated_at: i64,
     cloud_id: Option<String>,
+    last_synced_at: Option<i64>,
+    sort_order: Option<i32>,
 }
 
 impl FromSqliteRow for WorkspaceRow {
@@ -102,6 +105,8 @@ impl FromSqliteRow for WorkspaceRow {
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             cloud_id: row.get("cloud_id")?,
+            last_synced_at: row.get("last_synced_at").unwrap_or(None),
+            sort_order: row.get("sort_order").unwrap_or(Some(0)),
         })
     }
 }
@@ -116,6 +121,8 @@ impl From<WorkspaceRow> for Workspace {
             created_at: Some(row.created_at),
             updated_at: Some(row.updated_at),
             cloud_id: row.cloud_id,
+            last_synced_at: row.last_synced_at,
+            sort_order: row.sort_order,
         }
     }
 }
@@ -225,7 +232,7 @@ impl Repository for ConnectionRepository {
     fn list(&self) -> Result<Vec<Self::Entity>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, connection_type, params, sort_order, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, created_at, updated_at, team_id, owner_id FROM connections ORDER BY sort_order ASC, COALESCE(last_used_at, updated_at, created_at) DESC, id ASC",
+                "SELECT id, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id FROM connections ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
             )?;
             let rows = stmt.query_map([], |row| ConnectionRow::from_row(row))?;
             let mut results = Vec::new();
@@ -260,9 +267,9 @@ impl ConnectionRepository {
     pub fn list_by_workspace(&self, workspace_id: Option<i64>) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let sql = if workspace_id.is_some() {
-                "SELECT id, name, connection_type, params, sort_order, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, created_at, updated_at, team_id, owner_id FROM connections WHERE workspace_id = ?1 ORDER BY sort_order ASC, COALESCE(last_used_at, updated_at, created_at) DESC, id ASC"
+                "SELECT id, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id FROM connections WHERE workspace_id = ?1 ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC"
             } else {
-                "SELECT id, name, connection_type, params, sort_order, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, created_at, updated_at, team_id, owner_id FROM connections WHERE workspace_id IS NULL ORDER BY sort_order ASC, COALESCE(last_used_at, updated_at, created_at) DESC, id ASC"
+                "SELECT id, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id FROM connections WHERE workspace_id IS NULL ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC"
             };
             let mut stmt = conn.prepare(sql)?;
 
@@ -328,7 +335,8 @@ impl ConnectionRepository {
         })
     }
 
-    /// 批量更新连接的 sort_order（拖拽排序后持久化）
+    /// 暂停连接拖拽排序：当前连接列表以 LRU 为准，后续重新设计手动排序与 LRU 的关系后再启用。
+    #[allow(dead_code)]
     pub fn update_sort_orders(&self, orders: &[(i64, i32)]) -> Result<()> {
         self.conn.with_connection(|conn| {
             for (id, sort_order) in orders {
@@ -405,7 +413,7 @@ impl ConnectionRepository {
     pub fn list_by_team(&self, team_id: &str) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, connection_type, params, sort_order, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, created_at, updated_at, team_id, owner_id FROM connections WHERE team_id = ?1 ORDER BY sort_order ASC, COALESCE(last_used_at, updated_at, created_at) DESC, id ASC",
+                "SELECT id, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id FROM connections WHERE team_id = ?1 ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
             )?;
             let rows = stmt.query_map(params![team_id], |row| ConnectionRow::from_row(row))?;
             let mut results = Vec::new();
@@ -420,7 +428,7 @@ impl ConnectionRepository {
     pub fn list_personal(&self) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, connection_type, params, sort_order, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, created_at, updated_at, team_id, owner_id FROM connections WHERE team_id IS NULL ORDER BY sort_order ASC, COALESCE(last_used_at, updated_at, created_at) DESC, id ASC",
+                "SELECT id, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id FROM connections WHERE team_id IS NULL ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
             )?;
             let rows = stmt.query_map([], |row| ConnectionRow::from_row(row))?;
             let mut results = Vec::new();
@@ -507,12 +515,14 @@ impl WorkspaceRepository {
         let color = item.color.clone();
         let icon = item.icon.clone();
         let cloud_id = item.cloud_id.clone();
+        let last_synced_at = item.last_synced_at;
+        let sort_order = item.sort_order;
         let updated_at = item.updated_at.unwrap_or_else(now);
 
         self.conn.with_connection(|conn| {
             conn.execute(
-                "UPDATE workspaces SET name = ?1, color = ?2, icon = ?3, cloud_id = ?4, updated_at = ?5 WHERE id = ?6",
-                params![name, color, icon, cloud_id, updated_at, id],
+                "UPDATE workspaces SET name = ?1, color = ?2, icon = ?3, cloud_id = ?4, last_synced_at = ?5, sort_order = COALESCE(?6, sort_order), updated_at = ?7 WHERE id = ?8",
+                params![name, color, icon, cloud_id, last_synced_at, sort_order, updated_at, id],
             )?;
             Ok(())
         })
@@ -526,6 +536,47 @@ impl WorkspaceRepository {
                 params![cloud_id, local_id],
             )?;
             Ok(())
+        })
+    }
+
+    /// 更新工作空间的云端同步状态和最后同步时间。
+    pub fn update_sync_status(
+        &self,
+        local_id: i64,
+        cloud_id: Option<String>,
+        last_synced_at: Option<i64>,
+    ) -> Result<()> {
+        self.conn.with_connection(|conn| {
+            conn.execute(
+                "UPDATE workspaces SET cloud_id = ?1, last_synced_at = ?2 WHERE id = ?3",
+                params![cloud_id, last_synced_at, local_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_sort_orders(&self, orders: &[(i64, i32)]) -> Result<()> {
+        self.conn.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ts = now();
+            for (id, sort_order) in orders {
+                tx.execute(
+                    "UPDATE workspaces SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![sort_order, ts, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn next_sort_order(&self) -> Result<i32> {
+        self.conn.with_connection(|conn| {
+            let max_order: Option<i32> =
+                conn.query_row("SELECT MAX(sort_order) FROM workspaces", [], |row| {
+                    row.get(0)
+                })?;
+            Ok(max_order.unwrap_or(-1) + 1)
         })
     }
 }
@@ -542,17 +593,20 @@ impl Repository for WorkspaceRepository {
         let color = item.color.clone();
         let icon = item.icon.clone();
         let cloud_id = item.cloud_id.clone();
+        let last_synced_at = item.last_synced_at;
+        let sort_order = item.sort_order.unwrap_or(self.next_sort_order()?);
         let ts = now();
 
         let id = self.conn.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO workspaces (name, color, icon, cloud_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![name, color, icon, cloud_id, ts, ts],
+                "INSERT INTO workspaces (name, color, icon, cloud_id, last_synced_at, sort_order, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![name, color, icon, cloud_id, last_synced_at, sort_order, ts, ts],
             )?;
             Ok(conn.last_insert_rowid())
         })?;
 
         item.id = Some(id);
+        item.sort_order = Some(sort_order);
         item.created_at = Some(ts);
         item.updated_at = Some(ts);
 
@@ -567,12 +621,14 @@ impl Repository for WorkspaceRepository {
         let color = item.color.clone();
         let icon = item.icon.clone();
         let cloud_id = item.cloud_id.clone();
+        let last_synced_at = item.last_synced_at;
+        let sort_order = item.sort_order;
         let ts = now();
 
         self.conn.with_connection(|conn| {
             conn.execute(
-                "UPDATE workspaces SET name = ?1, color = ?2, icon = ?3, cloud_id = ?4, updated_at = ?5 WHERE id = ?6",
-                params![name, color, icon, cloud_id, ts, id],
+                "UPDATE workspaces SET name = ?1, color = ?2, icon = ?3, cloud_id = ?4, last_synced_at = ?5, sort_order = COALESCE(?6, sort_order), updated_at = ?7 WHERE id = ?8",
+                params![name, color, icon, cloud_id, last_synced_at, sort_order, ts, id],
             )?;
             Ok(())
         })
@@ -591,7 +647,7 @@ impl Repository for WorkspaceRepository {
 
     fn get(&self, id: i64) -> Result<Option<Self::Entity>> {
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, color, icon, created_at, updated_at, cloud_id FROM workspaces WHERE id = ?1")?;
+            let mut stmt = conn.prepare("SELECT id, name, color, icon, created_at, updated_at, cloud_id, last_synced_at, sort_order FROM workspaces WHERE id = ?1")?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
                 Ok(Some(WorkspaceRow::from_row(row)?.into()))
@@ -603,7 +659,7 @@ impl Repository for WorkspaceRepository {
 
     fn list(&self) -> Result<Vec<Self::Entity>> {
         self.conn.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name, color, icon, created_at, updated_at, cloud_id FROM workspaces ORDER BY updated_at DESC")?;
+            let mut stmt = conn.prepare("SELECT id, name, color, icon, created_at, updated_at, cloud_id, last_synced_at, sort_order FROM workspaces ORDER BY sort_order ASC, updated_at DESC, id DESC")?;
             let rows = stmt.query_map([], |row| WorkspaceRow::from_row(row))?;
             let mut results = Vec::new();
             for row in rows {
@@ -739,6 +795,7 @@ pub struct TeamKeyCache {
     pub team_id: String,
     pub team_name: String,
     pub key_version: u32,
+    pub key_verification: Option<String>,
     /// 用 personal_key 加密后的 team_key
     pub encrypted_team_key: Option<String>,
     pub last_verified_at: Option<i64>,
@@ -762,7 +819,7 @@ impl TeamKeyCacheRepository {
     pub fn get(&self, team_id: &str) -> Result<Option<TeamKeyCache>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT team_id, team_name, key_version, encrypted_team_key, last_verified_at, updated_at, role FROM team_key_cache WHERE team_id = ?1",
+                "SELECT team_id, team_name, key_version, key_verification, encrypted_team_key, last_verified_at, updated_at, role FROM team_key_cache WHERE team_id = ?1",
             )?;
             let mut rows = stmt.query(params![team_id])?;
             if let Some(row) = rows.next()? {
@@ -770,10 +827,11 @@ impl TeamKeyCacheRepository {
                     team_id: row.get(0)?,
                     team_name: row.get(1)?,
                     key_version: row.get::<_, i64>(2)? as u32,
-                    encrypted_team_key: row.get(3)?,
-                    last_verified_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    role: row.get(6).unwrap_or(None),
+                    key_verification: row.get(3)?,
+                    encrypted_team_key: row.get(4)?,
+                    last_verified_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    role: row.get(7).unwrap_or(None),
                 }))
             } else {
                 Ok(None)
@@ -786,16 +844,17 @@ impl TeamKeyCacheRepository {
         let ts = now();
         self.conn.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO team_key_cache (team_id, team_name, key_version, encrypted_team_key, last_verified_at, updated_at, role)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO team_key_cache (team_id, team_name, key_version, key_verification, encrypted_team_key, last_verified_at, updated_at, role)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(team_id) DO UPDATE SET
                  team_name = excluded.team_name,
                  key_version = excluded.key_version,
+                 key_verification = excluded.key_verification,
                  encrypted_team_key = excluded.encrypted_team_key,
                  last_verified_at = excluded.last_verified_at,
                  updated_at = excluded.updated_at,
                  role = excluded.role",
-                params![cache.team_id, cache.team_name, cache.key_version as i64, cache.encrypted_team_key, cache.last_verified_at, ts, cache.role],
+                params![cache.team_id, cache.team_name, cache.key_version as i64, cache.key_verification, cache.encrypted_team_key, cache.last_verified_at, ts, cache.role],
             )?;
             Ok(())
         })
@@ -805,17 +864,18 @@ impl TeamKeyCacheRepository {
     pub fn list(&self) -> Result<Vec<TeamKeyCache>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT team_id, team_name, key_version, encrypted_team_key, last_verified_at, updated_at, role FROM team_key_cache ORDER BY updated_at DESC",
+                "SELECT team_id, team_name, key_version, key_verification, encrypted_team_key, last_verified_at, updated_at, role FROM team_key_cache ORDER BY updated_at DESC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(TeamKeyCache {
                     team_id: row.get(0)?,
                     team_name: row.get(1)?,
                     key_version: row.get::<_, i64>(2)? as u32,
-                    encrypted_team_key: row.get(3)?,
-                    last_verified_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    role: row.get(6).unwrap_or(None),
+                    key_verification: row.get(3)?,
+                    encrypted_team_key: row.get(4)?,
+                    last_verified_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    role: row.get(7).unwrap_or(None),
                 })
             })?;
             let mut results = Vec::new();
@@ -840,12 +900,12 @@ impl TeamKeyCacheRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectionRepository;
-    use crate::storage::StoredConnection;
+    use super::{ConnectionRepository, WorkspaceRepository};
     use crate::storage::connection::SqliteConnection;
     use crate::storage::migration::run_migrations;
     use crate::storage::models::{SshAuthMethod, SshParams};
     use crate::storage::traits::Repository;
+    use crate::storage::{StoredConnection, Workspace};
     use rusqlite::params;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -890,6 +950,61 @@ mod tests {
         )
     }
 
+    fn workspace(name: &str) -> Workspace {
+        Workspace::new(name.to_string())
+    }
+
+    #[test]
+    fn workspace_list_uses_manual_sort_order() {
+        let (conn, _) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut first = workspace("first");
+        let mut second = workspace("second");
+        let mut third = workspace("third");
+        let first_id = repo.insert(&mut first).unwrap();
+        let second_id = repo.insert(&mut second).unwrap();
+        let third_id = repo.insert(&mut third).unwrap();
+
+        repo.update_sort_orders(&[(third_id, 0), (first_id, 1), (second_id, 2)])
+            .unwrap();
+
+        let listed_ids = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![Some(third_id), Some(first_id), Some(second_id)],
+            listed_ids
+        );
+    }
+
+    #[test]
+    fn workspace_update_persists_sort_order() {
+        let (conn, _) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut first = workspace("first");
+        first.sort_order = Some(0);
+        let first_id = repo.insert(&mut first).unwrap();
+        let mut second = workspace("second");
+        second.sort_order = Some(1);
+        let second_id = repo.insert(&mut second).unwrap();
+
+        second.sort_order = Some(-1);
+        repo.update(&second).unwrap();
+
+        let listed_ids = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(vec![Some(second_id), Some(first_id)], listed_ids);
+    }
+
     #[test]
     fn list_orders_by_recent_use_without_touching_updated_at() {
         let (conn, repo) = test_repository();
@@ -932,6 +1047,33 @@ mod tests {
         assert_eq!(1000, updated_at);
         assert!(last_used_at.is_some());
     }
+
+    #[test]
+    fn list_ignores_legacy_sort_order_for_recent_use() {
+        let (conn, repo) = test_repository();
+        let mut old_connection = ssh_connection("old");
+        let old_id = repo.insert(&mut old_connection).unwrap();
+        let mut new_connection = ssh_connection("new");
+        let new_id = repo.insert(&mut new_connection).unwrap();
+
+        conn.with_connection(|conn| {
+            conn.execute(
+                "UPDATE connections SET created_at = ?1, updated_at = ?1, sort_order = ?2 WHERE id = ?3",
+                params![1000i64, 0i32, old_id],
+            )?;
+            conn.execute(
+                "UPDATE connections SET created_at = ?1, updated_at = ?1, sort_order = ?2 WHERE id = ?3",
+                params![2000i64, 100i32, new_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            Some(new_id),
+            repo.list().unwrap().first().and_then(|c| c.id)
+        );
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -943,13 +1085,21 @@ pub fn init(cx: &mut App) {
     let workspace_repo = WorkspaceRepository::new(conn.clone());
     let quick_cmd_repo = QuickCommandRepository::new(conn.clone());
     let sftp_favorite_path_repo = SftpFavoritePathRepository::new(conn.clone());
+    let terminal_command_history_repo = TerminalCommandHistoryRepository::new(conn.clone());
     let pending_deletion_repo = PendingCloudDeletionRepository::new(conn.clone());
     let team_key_cache_repo = TeamKeyCacheRepository::new(conn.clone());
+    let personal_conflict_repo =
+        crate::cloud_sync::personal::PersonalSyncConflictRepository::new(conn.clone());
+    let personal_status_repo =
+        crate::cloud_sync::personal::PersonalSyncStatusRepository::new(conn.clone());
 
     storage.register(workspace_repo);
     storage.register(conn_repo);
     storage.register(quick_cmd_repo);
     storage.register(sftp_favorite_path_repo);
+    storage.register(terminal_command_history_repo);
     storage.register(pending_deletion_repo);
     storage.register(team_key_cache_repo);
+    storage.register(personal_conflict_repo);
+    storage.register(personal_status_repo);
 }

@@ -11,6 +11,7 @@ use gpui::App;
 rust_i18n::i18n!("locales", fallback = "zh-CN");
 
 // 核心模块
+pub mod agent_tools;
 pub mod connection;
 pub mod manager;
 pub mod types;
@@ -47,7 +48,7 @@ pub use types::*;
 // 视图导出
 pub use key_value_view::{KeyValueView, KeyValueViewEvent};
 pub use redis_cli_view::{RedisCliView, RedisCliViewEvent, refresh_keybindings};
-pub use redis_form_window::{RedisFormWindow, RedisFormWindowConfig};
+pub use redis_form_window::{RedisFormSavedCallback, RedisFormWindow, RedisFormWindowConfig};
 pub use redis_tab::RedisTabView;
 pub use redis_tool_data::RedisToolKind;
 pub use redis_tool_view::RedisToolView;

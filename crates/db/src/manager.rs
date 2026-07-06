@@ -1008,13 +1008,32 @@ impl GlobalDbState {
         database: String,
         table_name: String,
     ) -> anyhow::Result<SqlResult> {
-        let config = self
+        self.truncate_table_with_schema(cx, config_id, database, None, table_name)
+            .await
+    }
+
+    /// Truncate table with an optional schema.
+    pub async fn truncate_table_with_schema(
+        &self,
+        cx: &mut AsyncApp,
+        config_id: String,
+        database: String,
+        schema: Option<String>,
+        table_name: String,
+    ) -> anyhow::Result<SqlResult> {
+        let mut config = self
             .get_config(&config_id)
             .ok_or_else(|| anyhow::anyhow!("Connection not found: {}", config_id))?;
         let plugin = self.get_plugin(&config.database_type)?;
-        let sql = plugin.truncate_table(&database, &table_name);
+        let sql = plugin.truncate_table_with_schema(&database, schema.as_deref(), &table_name);
 
-        let result = self.execute_with_session(cx, config, sql, None).await?;
+        if config.database_type != DatabaseType::Oracle {
+            config.database = Some(database);
+        }
+
+        let result = self
+            .execute_with_session_internal(cx, config, sql, None, schema)
+            .await?;
 
         Self::wrapper_result(result)
     }
@@ -1214,6 +1233,23 @@ impl GlobalDbState {
         conn.execute(plugin.as_ref(), &script, opts.unwrap_or_default())
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    pub async fn switch_session_schema(
+        &self,
+        session_id: String,
+        schema: String,
+    ) -> anyhow::Result<()> {
+        let mut guard = self
+            .connection_manager
+            .get_session_connection(&session_id)
+            .await?;
+        let conn = guard
+            .connection()
+            .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
+        conn.switch_schema(&schema)
+            .await
+            .map_err(|error| anyhow::anyhow!("{}", error))
     }
 
     pub async fn list_databases_direct(
@@ -1503,9 +1539,22 @@ impl GlobalDbState {
 
         let clone_self = self.clone();
         Tokio::spawn(cx, async move {
+            let total_size = source.file_size().unwrap_or(0);
             let plugin = match clone_self.get_plugin(&config.database_type) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    let progress = StreamingProgress::with_file_progress(
+                        0,
+                        SqlResult::Error(SqlErrorInfo {
+                            sql: String::new(),
+                            message: format!("Failed to get database plugin: {}", e),
+                        }),
+                        0,
+                        total_size,
+                    );
+                    let _ = tx.send(progress).await;
+                    return;
+                }
             };
 
             let session_result = clone_self
@@ -1516,7 +1565,6 @@ impl GlobalDbState {
             let session_id = match session_result {
                 Ok(id) => id,
                 Err(e) => {
-                    let total_size = source.file_size().unwrap_or(0);
                     let progress = StreamingProgress::with_file_progress(
                         0,
                         SqlResult::Error(SqlErrorInfo {
@@ -1531,6 +1579,7 @@ impl GlobalDbState {
                 }
             };
 
+            let error_tx = tx.clone();
             let exec_result = async {
                 let mut guard = clone_self
                     .connection_manager
@@ -1560,6 +1609,16 @@ impl GlobalDbState {
 
             if let Err(e) = exec_result {
                 error!("Streaming execution error: {}", e);
+                let progress = StreamingProgress::with_file_progress(
+                    0,
+                    SqlResult::Error(SqlErrorInfo {
+                        sql: String::new(),
+                        message: e.to_string(),
+                    }),
+                    0,
+                    total_size,
+                );
+                let _ = error_tx.send(progress).await;
             }
         })
         .detach();
@@ -1948,6 +2007,26 @@ impl GlobalDbState {
     ) -> anyhow::Result<crate::types::ObjectView> {
         with_plugin_session!(self, cx, connection_id, |plugin, conn| {
             plugin.list_databases_view(&*conn).await
+        })
+    }
+
+    pub async fn list_users_view(
+        &self,
+        cx: &mut AsyncApp,
+        connection_id: String,
+        database: Option<String>,
+    ) -> anyhow::Result<crate::types::ObjectView> {
+        if let Some(database) = database {
+            return with_plugin_session_db!(
+                self,
+                cx,
+                connection_id,
+                database.clone(),
+                |plugin, conn| { plugin.list_users_view(&*conn, Some(&database)).await }
+            );
+        }
+        with_plugin_session!(self, cx, connection_id, |plugin, conn| {
+            plugin.list_users_view(&*conn, None).await
         })
     }
 
@@ -2857,6 +2936,7 @@ mod tests {
         healthy: bool,
         disconnect_count: Arc<AtomicUsize>,
         executed_sql: Option<Arc<StdMutex<Vec<String>>>>,
+        switched_schemas: Option<Arc<StdMutex<Vec<String>>>>,
     }
 
     impl MockConnection {
@@ -2866,6 +2946,7 @@ mod tests {
                 healthy,
                 disconnect_count: Arc::new(AtomicUsize::new(0)),
                 executed_sql: None,
+                switched_schemas: None,
             }
         }
 
@@ -2879,6 +2960,7 @@ mod tests {
                 healthy,
                 disconnect_count,
                 executed_sql: None,
+                switched_schemas: None,
             }
         }
 
@@ -2891,6 +2973,20 @@ mod tests {
                 healthy: true,
                 disconnect_count: Arc::new(AtomicUsize::new(0)),
                 executed_sql: Some(executed_sql),
+                switched_schemas: None,
+            }
+        }
+
+        fn with_switched_schemas(
+            config: DbConnectionConfig,
+            switched_schemas: Arc<StdMutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                config,
+                healthy: true,
+                disconnect_count: Arc::new(AtomicUsize::new(0)),
+                executed_sql: None,
+                switched_schemas: Some(switched_schemas),
             }
         }
     }
@@ -3281,6 +3377,13 @@ mod tests {
             Ok(())
         }
 
+        async fn switch_schema(&self, schema: &str) -> Result<(), DbError> {
+            if let Some(switched_schemas) = &self.switched_schemas {
+                switched_schemas.lock().unwrap().push(schema.to_string());
+            }
+            Ok(())
+        }
+
         async fn execute_streaming(
             &self,
             _plugin: &dyn DatabasePlugin,
@@ -3494,6 +3597,41 @@ mod tests {
                 .get_session_config(&session_id)
                 .await
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_session_schema_uses_existing_connection_session() {
+        let state = GlobalDbState::new();
+        let config = test_config("conn1");
+        let session_id = "conn1:session:test".to_string();
+        let switched_schemas = Arc::new(StdMutex::new(Vec::new()));
+        let mut session = ConnectionSession::new(
+            Box::new(MockConnection::with_switched_schemas(
+                config.clone(),
+                switched_schemas.clone(),
+            )),
+            session_id.clone(),
+            false,
+        );
+        session.mark_in_use();
+        state
+            .connection_manager
+            .sessions
+            .write()
+            .await
+            .entry(config.id.clone())
+            .or_default()
+            .push(session);
+
+        state
+            .switch_session_schema(session_id, "analytics".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vec!["analytics".to_string()],
+            *switched_schemas.lock().unwrap()
         );
     }
 

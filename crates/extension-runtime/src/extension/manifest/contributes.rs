@@ -9,6 +9,8 @@ use super::menus::{MenuCommandRef, MenuContrib};
 pub struct ContributesManifest {
     #[serde(default)]
     pub languages: Vec<LanguageContrib>,
+    #[serde(default, rename = "connectionImporters")]
+    pub connection_importers: Vec<ConnectionImporterContrib>,
     #[serde(default)]
     pub drivers: Vec<Value>,
     #[serde(default)]
@@ -21,6 +23,8 @@ pub struct ContributesManifest {
     pub toolbars: BTreeMap<String, Vec<ToolbarContrib>>,
     #[serde(default)]
     pub keybindings: Vec<KeybindingContrib>,
+    #[serde(default, rename = "htmlPreviewTransforms")]
+    pub html_preview_transforms: Vec<HtmlPreviewTransformContrib>,
     #[serde(default)]
     pub views: Vec<Value>,
     #[serde(default)]
@@ -46,12 +50,14 @@ pub struct ContributesManifest {
 impl ContributesManifest {
     pub fn total_count(&self) -> usize {
         self.languages.len()
+            + self.connection_importers.len()
             + self.drivers.len()
             + self.connections.len()
             + self.commands.len()
             + self.menus.len()
             + self.toolbars.len()
             + self.keybindings.len()
+            + self.html_preview_transforms.len()
             + self.views.len()
             + self.tasks.len()
             + self.data_types.len()
@@ -63,6 +69,50 @@ impl ContributesManifest {
             + self.themes.len()
             + self.icons.len()
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HtmlPreviewTransformContrib {
+    pub id: String,
+    #[serde(default, rename = "runtimeId")]
+    pub runtime_id: String,
+    #[serde(default = "default_html_transform_function")]
+    pub function: String,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub assets: String,
+}
+
+fn default_html_transform_function() -> String {
+    "transform-html".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectionImporterContrib {
+    pub id: String,
+    #[serde(default, rename = "runtimeId")]
+    pub runtime_id: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default, rename = "outputKinds")]
+    pub output_kinds: Vec<String>,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default, rename = "candidateFiles")]
+    pub candidate_files: Vec<CandidateFileContrib>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CandidateFileContrib {
+    pub id: String,
+    #[serde(default)]
+    pub platform: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

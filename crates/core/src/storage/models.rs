@@ -48,7 +48,6 @@ pub enum ConnectionType {
     SshSftp,
     Redis,
     MongoDB,
-    ChatDB,
     Serial,
     PortForwarding,
     Rdp,
@@ -63,7 +62,6 @@ impl fmt::Display for ConnectionType {
             ConnectionType::SshSftp => "SshSftp",
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
-            ConnectionType::ChatDB => "ChatDB",
             ConnectionType::Serial => "Serial",
             ConnectionType::PortForwarding => "PortForwarding",
             ConnectionType::Rdp => "Rdp",
@@ -81,7 +79,6 @@ impl ConnectionType {
             ConnectionType::Database,
             ConnectionType::Redis,
             ConnectionType::MongoDB,
-            ConnectionType::ChatDB,
             ConnectionType::Serial,
             ConnectionType::PortForwarding,
             ConnectionType::Rdp,
@@ -94,7 +91,6 @@ impl ConnectionType {
             "SshSftp" => ConnectionType::SshSftp,
             "Redis" => ConnectionType::Redis,
             "MongoDB" => ConnectionType::MongoDB,
-            "ChatDB" => ConnectionType::ChatDB,
             "Serial" => ConnectionType::Serial,
             "PortForwarding" => ConnectionType::PortForwarding,
             "Rdp" => ConnectionType::Rdp,
@@ -110,7 +106,6 @@ impl ConnectionType {
             ConnectionType::SshSftp => "SSH/SFTP",
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
-            ConnectionType::ChatDB => "ChatDB",
             ConnectionType::Serial => "Serial",
             ConnectionType::PortForwarding => "Port Forwarding",
             ConnectionType::Rdp => "RDP",
@@ -125,7 +120,6 @@ impl ConnectionType {
             ConnectionType::SshSftp => IconName::TerminalColor,
             ConnectionType::Redis => IconName::Redis,
             ConnectionType::MongoDB => IconName::MongoDB,
-            ConnectionType::ChatDB => IconName::ChatDB,
             ConnectionType::Serial => IconName::SerialPort,
             ConnectionType::PortForwarding => IconName::PortForwardingColor,
             ConnectionType::Rdp => IconName::Rdp,
@@ -838,6 +832,12 @@ pub struct Workspace {
     /// 云端 ID（用于同步）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_id: Option<String>,
+    /// 最后同步时间戳
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<i64>,
+    /// 手动排序位序，用于跨设备同步工作区列表顺序。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i32>,
 }
 
 impl Entity for Workspace {
@@ -866,6 +866,8 @@ impl Workspace {
             created_at: None,
             updated_at: None,
             cloud_id: None,
+            last_synced_at: None,
+            sort_order: None,
         }
     }
 }
@@ -893,6 +895,10 @@ impl SyncableItem for Workspace {
 
     fn updated_at(&self) -> Option<i64> {
         self.updated_at
+    }
+
+    fn last_synced_at(&self) -> Option<i64> {
+        self.last_synced_at
     }
 }
 
@@ -1716,8 +1722,8 @@ mod serial_tests {
         assert_eq!(parsed.port, 3389);
         assert_eq!(parsed.username.as_deref(), Some("administrator"));
         assert_eq!(parsed.domain.as_deref(), Some("corp"));
-        let raw_params = serde_json::from_str::<serde_json::Value>(&conn.params)
-            .expect("RDP params parse as JSON");
+        let raw_params =
+            serde_json::from_str::<Value>(&conn.params).expect("RDP params parse as JSON");
         assert!(raw_params.get("width").is_none());
         assert!(raw_params.get("height").is_none());
         assert_eq!(RemoteDesktopProtocol::Vnc.default_port(), 5900);

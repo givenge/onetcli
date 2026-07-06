@@ -15,6 +15,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{RenderableContent, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::*;
+use one_core::settings::default_grid_font_fallback_families;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -27,6 +28,10 @@ pub struct FontVariants {
     pub bold: Font,
     pub italic: Font,
     pub bold_italic: Font,
+    pub cjk_normal: Font,
+    pub cjk_bold: Font,
+    pub cjk_italic: Font,
+    pub cjk_bold_italic: Font,
 }
 
 impl FontVariants {
@@ -40,6 +45,7 @@ impl FontVariants {
 
         // 只禁用 calt（上下文替代），避免等宽字符出现连字影响栅格对齐
         let features = FontFeatures(Arc::new(vec![("calt".to_string(), 0)]));
+        let cjk_family = terminal_cjk_font_family();
 
         Self {
             normal: Font {
@@ -67,6 +73,34 @@ impl FontVariants {
                 family,
                 weight: FontWeight::BOLD,
                 style: FontStyle::Italic,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_normal: Font {
+                family: cjk_family.clone(),
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Normal,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_bold: Font {
+                family: cjk_family.clone(),
+                weight: FontWeight::BOLD,
+                style: FontStyle::Normal,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_italic: Font {
+                family: cjk_family.clone(),
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Italic,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_bold_italic: Font {
+                family: cjk_family,
+                weight: FontWeight::BOLD,
+                style: FontStyle::Italic,
                 features,
                 fallbacks,
             },
@@ -74,14 +108,26 @@ impl FontVariants {
     }
 
     #[inline]
-    pub fn get(&self, bold: bool, italic: bool) -> &Font {
-        match (bold, italic) {
-            (false, false) => &self.normal,
-            (true, false) => &self.bold,
-            (false, true) => &self.italic,
-            (true, true) => &self.bold_italic,
+    pub fn get(&self, role: TextRunFontRole, bold: bool, italic: bool) -> &Font {
+        match (role, bold, italic) {
+            (TextRunFontRole::Primary, false, false) => &self.normal,
+            (TextRunFontRole::Primary, true, false) => &self.bold,
+            (TextRunFontRole::Primary, false, true) => &self.italic,
+            (TextRunFontRole::Primary, true, true) => &self.bold_italic,
+            (TextRunFontRole::CjkFallback, false, false) => &self.cjk_normal,
+            (TextRunFontRole::CjkFallback, true, false) => &self.cjk_bold,
+            (TextRunFontRole::CjkFallback, false, true) => &self.cjk_italic,
+            (TextRunFontRole::CjkFallback, true, true) => &self.cjk_bold_italic,
         }
     }
+}
+
+fn terminal_cjk_font_family() -> SharedString {
+    default_grid_font_fallback_families()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "Noto Sans CJK SC".to_string())
+        .into()
 }
 
 /// 检查是否为装饰字符（边框、块元素、Powerline 等）
@@ -96,6 +142,33 @@ fn is_decorative_character(ch: char) -> bool {
         | 0x25A0..=0x25FF   // Geometric Shapes: ■ □ ▪ ▫ ● ○
         | 0xE0B0..=0xE0D7   // Powerline symbols
         | 0x2800..=0x28FF   // Braille Patterns
+    )
+}
+
+#[inline]
+fn terminal_text_font_role(ch: char) -> TextRunFontRole {
+    if is_cjk_terminal_character(ch) {
+        TextRunFontRole::CjkFallback
+    } else {
+        TextRunFontRole::Primary
+    }
+}
+
+#[inline]
+fn is_cjk_terminal_character(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(
+        code,
+        0x3000..=0x303F   // CJK Symbols and Punctuation
+        | 0x3040..=0x309F // Hiragana
+        | 0x30A0..=0x30FF // Katakana
+        | 0x31F0..=0x31FF // Katakana Phonetic Extensions
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF // Hangul Syllables
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0x20000..=0x2FA1F // CJK Unified Ideographs Extensions
     )
 }
 
@@ -266,9 +339,17 @@ impl DecorationManager {
 #[derive(Clone)]
 pub struct CachedLine {
     pub background_rects: Vec<(usize, usize, Hsla)>,
+    pub underline_rects: Vec<CachedUnderlineRect>,
     pub text_runs: Vec<CachedTextRun>,
     /// 块状字符（U+2580..U+259F）使用几何绘制，避免字体回退导致的接缝
     pub block_glyphs: Vec<CachedBlockGlyph>,
+}
+
+#[derive(Clone)]
+pub struct CachedUnderlineRect {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub color: Hsla,
 }
 
 #[derive(Clone)]
@@ -279,8 +360,15 @@ pub struct CachedTextRun {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
-    /// 该文本 run 占用的终端 cell 数量，CJK/emoji 宽字符按 2 个 cell 计算。
-    pub char_count: usize,
+    pub cell_width_cols: usize,
+    pub column_count: usize,
+    pub font_role: TextRunFontRole,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRunFontRole {
+    Primary,
+    CjkFallback,
 }
 
 /// 单个 cell 内的几何块字符渲染数据
@@ -360,6 +448,7 @@ impl RenderCache {
             lines: vec![
                 CachedLine {
                     background_rects: Vec::new(),
+                    underline_rects: Vec::new(),
                     text_runs: Vec::new(),
                     block_glyphs: Vec::new(),
                 };
@@ -518,6 +607,7 @@ impl RenderCache {
             num_lines,
             CachedLine {
                 background_rects: Vec::new(),
+                underline_rects: Vec::new(),
                 text_runs: Vec::new(),
                 block_glyphs: Vec::new(),
             },
@@ -540,6 +630,7 @@ impl RenderCache {
         // Clear all lines
         for line in &mut self.lines {
             line.background_rects.clear();
+            line.underline_rects.clear();
             line.text_runs.clear();
             line.block_glyphs.clear();
         }
@@ -593,7 +684,7 @@ impl RenderCache {
                 "[{idx}] bg={} text={} chars={}",
                 l.background_rects.len(),
                 l.text_runs.len(),
-                l.text_runs.iter().map(|r| r.char_count).sum::<usize>(),
+                l.text_runs.iter().map(|r| r.column_count).sum::<usize>(),
             ));
         }
         tracing::debug!(
@@ -647,6 +738,7 @@ impl RenderCache {
         for &line_idx in &lines_set {
             if line_idx < self.num_lines {
                 self.lines[line_idx].background_rects.clear();
+                self.lines[line_idx].underline_rects.clear();
                 self.lines[line_idx].text_runs.clear();
                 self.lines[line_idx].block_glyphs.clear();
                 let cells = std::mem::take(&mut line_cells[line_idx]);
@@ -796,6 +888,7 @@ impl RenderCache {
 
         let line = &mut self.lines[line_idx];
         let mut bg_span: Option<(usize, Hsla)> = None;
+        let mut underline_span: Option<(usize, Hsla)> = None;
         let mut text_run: Option<CachedTextRun> = None;
 
         for cell in &cells {
@@ -819,6 +912,9 @@ impl RenderCache {
                 fg = deco_fg;
                 bg = deco_bg;
                 underline = deco_underline;
+            }
+            if !cell.is_selected && terminal_underline_flags(cell.flags) {
+                underline = true;
             }
 
             // Apply custom foreground for default foreground color (lowest priority)
@@ -870,6 +966,29 @@ impl RenderCache {
                 }
             }
 
+            if underline {
+                match &mut underline_span {
+                    Some((_, span_color)) if hsla_eq(*span_color, fg) => {}
+                    Some((start, color)) => {
+                        line.underline_rects.push(CachedUnderlineRect {
+                            start_col: *start,
+                            end_col: cell.column,
+                            color: *color,
+                        });
+                        underline_span = Some((cell.column, fg));
+                    }
+                    None => {
+                        underline_span = Some((cell.column, fg));
+                    }
+                }
+            } else if let Some((start, color)) = underline_span.take() {
+                line.underline_rects.push(CachedUnderlineRect {
+                    start_col: start,
+                    end_col: cell.column,
+                    color,
+                });
+            }
+
             // Skip wide character spacer
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
@@ -898,31 +1017,19 @@ impl RenderCache {
 
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
-            let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            let cell_width_cols = if cell.flags.contains(Flags::WIDE_CHAR) {
                 2
             } else {
                 1
             };
-            if cell_width > 1 {
-                if let Some(run) = text_run.take() {
-                    line.text_runs.push(run);
-                }
-                line.text_runs.push(CachedTextRun {
-                    start_col: cell.column,
-                    text: cell.c.to_string(),
-                    color: fg,
-                    bold,
-                    italic,
-                    underline,
-                    char_count: cell_width,
-                });
-                continue;
-            }
+            let font_role = terminal_text_font_role(cell.c);
 
             // Check if we can merge with existing run
             let can_merge = if let Some(ref run) = text_run {
                 // Merge only if columns are consecutive
-                run.start_col + run.char_count == cell.column
+                run.start_col + run.column_count == cell.column
+                    && run.cell_width_cols == cell_width_cols
+                    && run.font_role == font_role
                     && hsla_eq(run.color, fg)
                     && run.bold == bold
                     && run.italic == italic
@@ -934,7 +1041,7 @@ impl RenderCache {
             if can_merge {
                 let run = text_run.as_mut().unwrap();
                 run.text.push(cell.c);
-                run.char_count += cell_width;
+                run.column_count += cell_width_cols;
             } else {
                 if let Some(run) = text_run.take() {
                     line.text_runs.push(run);
@@ -946,7 +1053,9 @@ impl RenderCache {
                     bold,
                     italic,
                     underline,
-                    char_count: cell_width,
+                    cell_width_cols,
+                    column_count: cell_width_cols,
+                    font_role,
                 });
             }
         }
@@ -954,6 +1063,13 @@ impl RenderCache {
         // Flush remaining
         if let Some((start, color)) = bg_span {
             line.background_rects.push((start, self.num_cols, color));
+        }
+        if let Some((start, color)) = underline_span {
+            line.underline_rects.push(CachedUnderlineRect {
+                start_col: start,
+                end_col: self.num_cols,
+                color,
+            });
         }
         if let Some(run) = text_run {
             line.text_runs.push(run);
@@ -1277,7 +1393,7 @@ impl Element for TerminalElementImpl {
         for line_idx in first_visible..visible_end {
             let line = &self.lines[line_idx];
             for run in &line.text_runs {
-                let font = fonts.get(run.bold, run.italic);
+                let font = fonts.get(run.font_role, run.bold, run.italic);
 
                 let underline = if run.underline {
                     Some(UnderlineStyle {
@@ -1300,7 +1416,7 @@ impl Element for TerminalElementImpl {
                         underline,
                         strikethrough: None,
                     }],
-                    Some(tb.cell_width),
+                    Some(tb.cell_width * run.cell_width_cols as f32),
                 );
                 let _ = shaped.paint(
                     tb.cell_origin(line_idx, run.start_col),
@@ -1310,6 +1426,22 @@ impl Element for TerminalElementImpl {
                     window,
                     cx,
                 );
+            }
+        }
+
+        // Paint terminal underline attributes as cell-level decorations so
+        // cursorline underlines remain visible even on blank cells.
+        for line_idx in first_visible..visible_end {
+            let line = &self.lines[line_idx];
+            for underline in &line.underline_rects {
+                let thickness = px(1.0);
+                let origin = tb.cell_origin(line_idx, underline.start_col);
+                let width = tb.cell_width * (underline.end_col - underline.start_col) as f32;
+                let rect = Bounds::new(
+                    Point::new(origin.x, origin.y + tb.cell_height - thickness),
+                    size(width, thickness),
+                );
+                window.paint_quad(fill(rect, underline.color));
             }
         }
 
@@ -1381,6 +1513,17 @@ fn colors_equal(a: &Colors, b: &Colors) -> bool {
         }
     }
     true
+}
+
+#[inline]
+fn terminal_underline_flags(flags: Flags) -> bool {
+    flags.intersects(
+        Flags::UNDERLINE
+            | Flags::DOUBLE_UNDERLINE
+            | Flags::UNDERCURL
+            | Flags::DOTTED_UNDERLINE
+            | Flags::DASHED_UNDERLINE,
+    )
 }
 
 #[inline]
@@ -1562,15 +1705,13 @@ fn indexed_color_to_hsla(idx: u8) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockRect, RenderCache, block_element_geometry};
-    use crate::TerminalTheme;
-    use crate::addon::AddonManager;
-    use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::term::{Config as TermConfig, Term};
-    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-    use terminal::TerminalEvent;
-    use terminal::pty_backend::GpuiEventProxy;
-    use tokio::sync::mpsc::unbounded_channel;
+    use super::{
+        BlockRect, CellData, RenderCache, TextRunFontRole, block_element_geometry,
+        terminal_text_font_role,
+    };
+    use alacritty_terminal::term::cell::Flags;
+    use alacritty_terminal::term::color::Colors;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
@@ -1584,6 +1725,75 @@ mod tests {
                 && approx_eq(actual.h, h),
             "expected ({x}, {y}, {w}, {h}) got {actual:?}"
         );
+    }
+
+    fn plain_cell(column: usize, c: char, flags: Flags) -> CellData {
+        CellData {
+            column,
+            c,
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags,
+            is_selected: false,
+        }
+    }
+
+    #[test]
+    fn text_run_tracks_terminal_columns_for_wide_characters() {
+        let mut cache = RenderCache::new(1, 8, Colors::default());
+        cache.build_line_cache(
+            0,
+            vec![
+                plain_cell(0, 'A', Flags::empty()),
+                plain_cell(1, '协', Flags::WIDE_CHAR),
+                plain_cell(3, '同', Flags::WIDE_CHAR),
+                plain_cell(5, 'B', Flags::empty()),
+            ],
+        );
+
+        let runs = &cache.lines[0].text_runs;
+        assert_eq!(3, runs.len());
+        assert_eq!("A", runs[0].text);
+        assert_eq!(0, runs[0].start_col);
+        assert_eq!(1, runs[0].cell_width_cols);
+        assert_eq!(1, runs[0].column_count);
+        assert_eq!(TextRunFontRole::Primary, runs[0].font_role);
+        assert_eq!("协同", runs[1].text);
+        assert_eq!(1, runs[1].start_col);
+        assert_eq!(2, runs[1].cell_width_cols);
+        assert_eq!(4, runs[1].column_count);
+        assert_eq!(TextRunFontRole::CjkFallback, runs[1].font_role);
+        assert_eq!("B", runs[2].text);
+        assert_eq!(5, runs[2].start_col);
+        assert_eq!(1, runs[2].cell_width_cols);
+        assert_eq!(1, runs[2].column_count);
+        assert_eq!(TextRunFontRole::Primary, runs[2].font_role);
+    }
+
+    #[test]
+    fn terminal_underline_flags_create_cell_decorations_including_spaces() {
+        let mut cache = RenderCache::new(1, 8, Colors::default());
+        cache.build_line_cache(
+            0,
+            vec![
+                plain_cell(0, 'A', Flags::UNDERLINE),
+                plain_cell(1, ' ', Flags::UNDERLINE),
+                plain_cell(2, 'B', Flags::empty()),
+            ],
+        );
+
+        let underlines = &cache.lines[0].underline_rects;
+        assert_eq!(1, underlines.len());
+        assert_eq!(0, underlines[0].start_col);
+        assert_eq!(2, underlines[0].end_col);
+    }
+
+    #[test]
+    fn terminal_text_font_role_routes_cjk_to_fallback_font() {
+        assert_eq!(TextRunFontRole::Primary, terminal_text_font_role('A'));
+        assert_eq!(TextRunFontRole::CjkFallback, terminal_text_font_role('协'));
+        assert_eq!(TextRunFontRole::CjkFallback, terminal_text_font_role('，'));
+        assert_eq!(TextRunFontRole::CjkFallback, terminal_text_font_role('あ'));
     }
 
     #[test]

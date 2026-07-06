@@ -1,8 +1,8 @@
 use std::{fs, sync::Arc};
 
 use crate::extension::{
-    CompositeExtensionProvider, DatabaseDriverExtensionProvider, ExtensionKind, ExtensionRegistry,
-    ExtensionSummary, LanguageExtensionProvider,
+    AcpAgentExtensionProvider, CompositeExtensionProvider, DatabaseDriverExtensionProvider,
+    ExtensionKind, ExtensionRegistry, ExtensionSummary, LanguageExtensionProvider,
 };
 use crate::extension_downloader::{
     MarketplaceManifest, detect_package_kind, install_from_staging_generic,
@@ -49,6 +49,97 @@ fn marketplace_manifest_accepts_v2_universal_language_artifact() {
 }
 
 #[test]
+fn marketplace_manifest_accepts_language_bundle_artifact() {
+    let manifest: MarketplaceManifest = serde_json::from_str(
+        r#"{
+            "schema_version": 2,
+            "release_version": "2026.07",
+            "extensions": [{
+                "id": "tree-sitter-languages",
+                "kind": "language_bundle",
+                "name": "Tree-sitter Languages",
+                "version": "0.1.0",
+                "release_tag": "tree-sitter-languages-v0.1.0",
+                "description": "Tree-sitter syntax bundle",
+                "file_extensions": ["js", "rs"],
+                "artifacts": {
+                    "universal": {
+                        "file": "tree-sitter-languages-language-bundle-universal.tar.gz",
+                        "sha256": "abc"
+                    }
+                }
+            }]
+        }"#,
+    )
+    .unwrap();
+
+    let entries = manifest.into_entries();
+
+    assert_eq!(1, entries.len());
+    assert_eq!("tree-sitter-languages", entries[0].id);
+    assert_eq!(ExtensionKind::LanguageBundle, entries[0].kind);
+    assert_eq!(
+        vec!["js".to_string(), "rs".to_string()],
+        entries[0].file_extensions
+    );
+}
+
+#[test]
+fn marketplace_manifest_accepts_string_schema_version() {
+    let manifest: MarketplaceManifest = serde_json::from_str(
+        r#"{
+            "schema_version": "2",
+            "release_version": "2026.05",
+            "extensions": []
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(2, manifest.schema_version);
+    assert_eq!("2026.05", manifest.release_version);
+    assert!(manifest.into_entries().is_empty());
+}
+
+#[test]
+fn marketplace_manifest_skips_entries_with_future_extension_kind() {
+    let manifest: MarketplaceManifest = serde_json::from_str(
+        r#"{
+            "schema_version": 3,
+            "release_version": "2026.07",
+            "extensions": [
+                {
+                    "id": "future_tool",
+                    "kind": "future_tool",
+                    "name": "Future Tool",
+                    "version": "1.0.0",
+                    "manifest": "future_tool/manifest.json"
+                },
+                {
+                    "id": "rust",
+                    "kind": "language",
+                    "name": "rust",
+                    "version": "0.24.0",
+                    "release_tag": "rust-v0.24.0",
+                    "file_extensions": ["rs"],
+                    "artifacts": {
+                        "universal": {
+                            "file": "rust-universal.tar.gz"
+                        }
+                    }
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let entries = manifest.into_entries();
+
+    assert_eq!(1, entries.len());
+    assert_eq!("rust", entries[0].id);
+    assert_eq!(ExtensionKind::Language, entries[0].kind);
+}
+
+#[test]
 fn detect_package_kind_identifies_language_database_composite() {
     let tmp = tempfile::TempDir::new().unwrap();
     let language_dir = tmp.path().join("language");
@@ -64,6 +155,10 @@ fn detect_package_kind_identifies_language_database_composite() {
     fs::create_dir_all(&composite_dir).unwrap();
     fs::write(composite_dir.join("extension.json"), "{}").unwrap();
 
+    let acp_agent_dir = tmp.path().join("acp_agent");
+    fs::create_dir_all(&acp_agent_dir).unwrap();
+    fs::write(acp_agent_dir.join("acp_agent.json"), "{}").unwrap();
+
     assert_eq!(
         ExtensionKind::Language,
         detect_package_kind(&language_dir).unwrap()
@@ -75,6 +170,60 @@ fn detect_package_kind_identifies_language_database_composite() {
     assert_eq!(
         ExtensionKind::Composite,
         detect_package_kind(&composite_dir).unwrap()
+    );
+    assert_eq!(
+        ExtensionKind::AcpAgent,
+        detect_package_kind(&acp_agent_dir).unwrap()
+    );
+}
+
+#[test]
+fn detect_package_kind_identifies_language_bundle() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bundle_dir = tmp.path().join("tree-sitter-languages");
+    fs::create_dir_all(bundle_dir.join("rust")).unwrap();
+    fs::create_dir_all(bundle_dir.join("javascript")).unwrap();
+    fs::write(
+        bundle_dir.join("manifest.json"),
+        r#"{
+            "id": "tree-sitter-languages",
+            "name": "Tree-sitter Languages",
+            "version": "0.1.0",
+            "languages": ["javascript", "rust"]
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        bundle_dir.join("rust/manifest.json"),
+        r#"{"name":"rust","version":"0.24.0","file_extensions":["rs"]}"#,
+    )
+    .unwrap();
+    fs::write(bundle_dir.join("rust/parser.wasm"), [0u8; 4]).unwrap();
+    fs::write(
+        bundle_dir.join("javascript/manifest.json"),
+        r#"{"name":"javascript","version":"0.23.1","file_extensions":["js"]}"#,
+    )
+    .unwrap();
+    fs::write(bundle_dir.join("javascript/parser.wasm"), [0u8; 4]).unwrap();
+
+    assert_eq!(
+        ExtensionKind::LanguageBundle,
+        detect_package_kind(&bundle_dir).unwrap()
+    );
+}
+
+#[test]
+fn detect_package_kind_keeps_single_wrapped_language_as_language() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let wrapped = tmp.path().join("wrapped");
+    let language = wrapped.join("rust");
+    fs::create_dir_all(&language).unwrap();
+    fs::write(language.join("manifest.json"), r#"{"name":"rust"}"#).unwrap();
+    fs::write(language.join("parser.wasm"), [0u8; 4]).unwrap();
+
+    assert_eq!(
+        ExtensionKind::Language,
+        detect_package_kind(&wrapped).unwrap()
     );
 }
 
@@ -107,6 +256,105 @@ fn install_from_staging_generic_installs_database_driver() {
     );
     assert!(root.join("database_drivers/fake_pg/driver.json").exists());
     assert!(root.join("database_drivers/fake_pg/driver-bin").exists());
+}
+
+#[test]
+fn install_from_staging_generic_installs_acp_agent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("extensions");
+    let staging = tmp.path().join("staging");
+    fs::create_dir_all(staging.join("bin")).unwrap();
+    fs::write(staging.join("bin/codex-acp"), b"#!/bin/sh\n").unwrap();
+    make_executable(&staging.join("bin/codex-acp"));
+    write_acp_agent_manifest(&staging);
+
+    let mut registry = ExtensionRegistry::new(root.clone());
+    registry.register_provider(Arc::new(AcpAgentExtensionProvider));
+
+    let summary = install_from_staging_generic(&staging, &registry, None).unwrap();
+
+    assert_eq!(
+        ExtensionSummary::new(
+            ExtensionKind::AcpAgent,
+            "codex",
+            "1.2.3",
+            root.join("acp_agents").join("codex")
+        )
+        .with_description("Codex ACP agent"),
+        summary
+    );
+    assert!(root.join("acp_agents/codex/acp_agent.json").exists());
+    assert!(root.join("acp_agents/codex/bin/codex-acp").exists());
+}
+
+#[test]
+fn install_from_staging_generic_installs_language_bundle_children_and_marker() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("extensions");
+    let staging = tmp.path().join("staging");
+    write_language_bundle_staging(&staging);
+
+    let mut registry = ExtensionRegistry::new(root.clone());
+    registry.register_provider(Arc::new(LanguageExtensionProvider));
+
+    let summary =
+        install_from_staging_generic(&staging, &registry, Some(ExtensionKind::LanguageBundle))
+            .unwrap();
+
+    assert_eq!(ExtensionKind::LanguageBundle, summary.kind);
+    assert_eq!("tree-sitter-languages", summary.name);
+    assert_eq!("0.1.0", summary.version);
+    assert_eq!(
+        vec!["js".to_string(), "rs".to_string()],
+        summary.file_extensions
+    );
+    assert!(root.join("languages/rust/manifest.json").exists());
+    assert!(root.join("languages/javascript/manifest.json").exists());
+    assert!(
+        root.join("language_bundles/tree-sitter-languages/manifest.json")
+            .exists()
+    );
+}
+
+#[test]
+fn install_from_staging_generic_rejects_malformed_language_bundle_before_copy() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("extensions");
+    let staging = tmp.path().join("staging");
+    fs::create_dir_all(staging.join("rust")).unwrap();
+    fs::create_dir_all(staging.join("javascript")).unwrap();
+    fs::write(
+        staging.join("manifest.json"),
+        r#"{
+            "id": "tree-sitter-languages",
+            "name": "Tree-sitter Languages",
+            "version": "0.1.0",
+            "languages": ["javascript", "rust"]
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        staging.join("rust/manifest.json"),
+        r#"{"name":"rust","version":"0.24.0","file_extensions":["rs"]}"#,
+    )
+    .unwrap();
+    fs::write(staging.join("rust/parser.wasm"), [0u8; 4]).unwrap();
+    fs::write(
+        staging.join("javascript/manifest.json"),
+        r#"{"name":"javascript","version":"0.23.1","file_extensions":["js"]}"#,
+    )
+    .unwrap();
+
+    let mut registry = ExtensionRegistry::new(root.clone());
+    registry.register_provider(Arc::new(LanguageExtensionProvider));
+
+    let err =
+        install_from_staging_generic(&staging, &registry, Some(ExtensionKind::LanguageBundle))
+            .unwrap_err();
+
+    assert!(err.to_string().contains("parser.wasm"));
+    assert!(!root.join("languages/rust").exists());
+    assert!(!root.join("language_bundles/tree-sitter-languages").exists());
 }
 
 #[test]
@@ -286,6 +534,68 @@ fn write_driver_manifest(dir: &std::path::Path, id: &str, name: &str) {
     )
     .unwrap();
 }
+
+fn write_acp_agent_manifest(dir: &std::path::Path) {
+    fs::write(
+        dir.join("acp_agent.json"),
+        r#"{
+            "id": "codex",
+            "name": "Codex",
+            "description": "Codex ACP agent",
+            "version": "1.2.3",
+            "agents": [{
+                "id": "codex",
+                "name": "Codex",
+                "transport": {
+                    "type": "stdio",
+                    "command": "bin/codex-acp",
+                    "args": ["--stdio"],
+                    "env": { "CODEX_HOME": "test-home" }
+                }
+            }]
+        }"#,
+    )
+    .unwrap();
+}
+
+fn write_language_bundle_staging(staging: &std::path::Path) {
+    fs::create_dir_all(staging.join("rust")).unwrap();
+    fs::create_dir_all(staging.join("javascript")).unwrap();
+    fs::write(
+        staging.join("manifest.json"),
+        r#"{
+            "id": "tree-sitter-languages",
+            "name": "Tree-sitter Languages",
+            "version": "0.1.0",
+            "languages": ["javascript", "rust"]
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        staging.join("rust/manifest.json"),
+        r#"{"name":"rust","version":"0.24.0","file_extensions":["rs"]}"#,
+    )
+    .unwrap();
+    fs::write(staging.join("rust/parser.wasm"), [0u8; 4]).unwrap();
+    fs::write(
+        staging.join("javascript/manifest.json"),
+        r#"{"name":"javascript","version":"0.23.1","file_extensions":["js"]}"#,
+    )
+    .unwrap();
+    fs::write(staging.join("javascript/parser.wasm"), [0u8; 4]).unwrap();
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) {}
 
 fn write_composite_manifest(dir: &std::path::Path, id: &str, permission: &str) {
     fs::write(

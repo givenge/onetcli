@@ -2,6 +2,10 @@
 
 rust_i18n::i18n!("locales", fallback = "en");
 
+mod auth;
+
+mod ai_chat_acp;
+mod ai_chat_acp_approval;
 mod app_init;
 mod auth;
 mod external_driver_display;
@@ -10,10 +14,17 @@ mod home_tab;
 mod license;
 pub mod new_connection;
 mod onetcli_app;
+mod personal_sync_conflicts;
+mod personal_sync_runtime;
+#[cfg(test)]
+mod personal_sync_runtime_tests;
+mod personal_sync_status;
 mod public_mcp_approval;
 mod public_mcp_runtime;
 mod setting_tab;
 mod settings;
+mod sync_conflict_dialog;
+mod team_management;
 mod update;
 mod user_avatar;
 mod webdav_backup;
@@ -97,19 +108,21 @@ fn main() {
         std::process::exit(exit_code);
     }
 
-    let app = Application::new()
+    let app = gpui_platform::application()
         .with_assets(AppAssets::new())
         .with_quit_mode(QuitMode::LastWindowClosed);
 
     app.run(move |cx| {
         onetcli_app::init(cx);
+        extension_runtime::set_current_host_version(env!("CARGO_PKG_VERSION"))
+            .expect("main package version must be valid semver");
         extension_runtime::init(cx);
 
-        let mut window_size = size(px(1600.0), px(1200.0));
+        let mut window_size = size(px(1800.0), px(1260.0));
         if let Some(display) = cx.primary_display() {
             let display_size = display.bounds().size;
-            window_size.width = window_size.width.min(display_size.width * 0.85);
-            window_size.height = window_size.height.min(display_size.height * 0.85);
+            window_size.width = window_size.width.min(display_size.width * 0.92);
+            window_size.height = window_size.height.min(display_size.height * 0.92);
         }
 
         let window_bounds = Bounds::centered(None, window_size, cx);

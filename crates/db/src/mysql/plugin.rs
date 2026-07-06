@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::types::ObjectViewColumn as Column;
 use anyhow::Result;
-use gpui_component::table::Column;
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 
 use crate::connection::{DbConnection, DbError};
@@ -12,7 +12,7 @@ use crate::import_export::{
     ImportResult,
 };
 use crate::mysql::connection::MysqlDbConnection;
-use crate::plugin::{DatabasePlugin, SqlCompletionInfo};
+use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
 use crate::plugin_manifest::{
     DatabaseActionDescriptor, DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement,
     DatabaseActionTarget, DatabaseActionToolbarScope, DatabaseCapabilities, DatabaseFormField,
@@ -71,9 +71,46 @@ const MYSQL_ENGINES: &[&str] = &[
 
 static MYSQL_UI_MANIFEST: LazyLock<DatabaseUiManifest> = LazyLock::new(build_mysql_ui_manifest);
 
+fn executable_mysql_option(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    if value.is_empty() || value.to_ascii_lowercase().starts_with("default ") {
+        return None;
+    }
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+        .then_some(value)
+}
+
 impl MySqlPlugin {
     pub fn new() -> Self {
         Self
+    }
+
+    fn foreign_key_action_sql(action: &str) -> Option<String> {
+        let action = action.trim();
+        if action.is_empty() {
+            return None;
+        }
+        let action = action
+            .split_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>()
+            .join(" ");
+        match action.as_str() {
+            "CASCADE" | "RESTRICT" | "NO ACTION" | "SET NULL" | "SET DEFAULT" => Some(action),
+            _ => None,
+        }
+    }
+
+    fn foreign_key_changed(left: &ForeignKeyDefinition, right: &ForeignKeyDefinition) -> bool {
+        left.columns != right.columns
+            || left.ref_table != right.ref_table
+            || left.ref_columns != right.ref_columns
+            || Self::foreign_key_action_sql(&left.on_delete)
+                != Self::foreign_key_action_sql(&right.on_delete)
+            || Self::foreign_key_action_sql(&left.on_update)
+                != Self::foreign_key_action_sql(&right.on_update)
     }
 
     fn column_change_reasons(
@@ -121,10 +158,22 @@ impl MySqlPlugin {
 }
 
 fn build_mysql_ui_manifest() -> DatabaseUiManifest {
+    let mut forms = vec![
+        mysql_connection_form(),
+        mysql_database_form(false),
+        mysql_database_form(true),
+    ];
+    forms.extend(mysql_user_forms());
+
     DatabaseUiManifest {
         capabilities: DatabaseUiCapabilities {
             supports_schema: false,
             uses_schema_as_database: false,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_sequences: false,
             supports_functions: true,
             supports_procedures: true,
@@ -140,11 +189,7 @@ fn build_mysql_ui_manifest() -> DatabaseUiManifest {
             show_collation_in_column_detail: true,
             table_engines: mysql_engine_names(),
         },
-        forms: vec![
-            mysql_connection_form(),
-            mysql_database_form(false),
-            mysql_database_form(true),
-        ],
+        forms,
         actions: mysql_action_manifest(),
         ..DatabaseUiManifest::default()
     }
@@ -227,6 +272,126 @@ fn parse_mysql_triggers(rows: Vec<Vec<Option<String>>>) -> Vec<TriggerInfo> {
             definition: row.get(4).and_then(|v| v.clone()),
         })
         .collect()
+}
+
+fn mysql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn mysql_user_host(request: &DatabaseUserOperationRequest) -> &str {
+    request
+        .field_values
+        .get("host")
+        .map(String::as_str)
+        .or(request.host.as_deref())
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or("%")
+}
+
+fn mysql_user_account(request: &DatabaseUserOperationRequest) -> String {
+    format!(
+        "{}@{}",
+        mysql_string_literal(&request.user_name),
+        mysql_string_literal(mysql_user_host(request))
+    )
+}
+
+fn mysql_user_password(request: &DatabaseUserOperationRequest) -> &str {
+    request
+        .field_values
+        .get("password")
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .unwrap_or("change_me")
+}
+
+fn mysql_user_privileges(request: &DatabaseUserOperationRequest) -> &str {
+    match request.field_values.get("privileges").map(String::as_str) {
+        Some("SELECT") => "SELECT",
+        Some("INSERT") => "INSERT",
+        Some("UPDATE") => "UPDATE",
+        Some("DELETE") => "DELETE",
+        Some("ALL PRIVILEGES") => "ALL PRIVILEGES",
+        _ => "SELECT",
+    }
+}
+
+fn mysql_user_forms() -> Vec<DatabaseFormManifest> {
+    vec![
+        mysql_user_form(DatabaseFormKind::CreateUser, true, true, false),
+        mysql_user_form(DatabaseFormKind::EditUser, true, true, false),
+        mysql_user_form(DatabaseFormKind::DeleteUser, true, false, false),
+        mysql_user_form(DatabaseFormKind::UserPrivileges, true, false, true),
+    ]
+}
+
+fn mysql_user_form(
+    kind: DatabaseFormKind,
+    include_host: bool,
+    include_password: bool,
+    include_privileges: bool,
+) -> DatabaseFormManifest {
+    let mut fields = vec![field(
+        "name",
+        "DatabaseUser.name",
+        DatabaseFormFieldType::Text,
+    )];
+    if include_host {
+        fields.push(
+            field("host", "DatabaseUser.host", DatabaseFormFieldType::Text)
+                .optional()
+                .with_default("%"),
+        );
+    }
+    if include_password {
+        fields.push(field(
+            "password",
+            "DatabaseUser.password",
+            DatabaseFormFieldType::Password,
+        ));
+    }
+    if include_privileges {
+        fields.push(field(
+            "database",
+            "DatabaseUser.database",
+            DatabaseFormFieldType::Text,
+        ));
+        fields.push(
+            field(
+                "privileges",
+                "DatabaseUser.privileges",
+                DatabaseFormFieldType::Select,
+            )
+            .with_default("SELECT")
+            .with_options(mysql_user_privilege_options()),
+        );
+    }
+    DatabaseFormManifest {
+        kind,
+        title_i18n_key: user_form_title_key(kind).into(),
+        submit_i18n_key: "Common.save".into(),
+        tabs: vec![tab("user", "DatabaseUser.user_tab", fields)],
+    }
+}
+
+fn mysql_user_privilege_options() -> Vec<FormSelectOption> {
+    vec![
+        option("SELECT", "DatabaseUser.privilege_select"),
+        option("INSERT", "DatabaseUser.privilege_insert"),
+        option("UPDATE", "DatabaseUser.privilege_update"),
+        option("DELETE", "DatabaseUser.privilege_delete"),
+        option("ALL PRIVILEGES", "DatabaseUser.privilege_all"),
+    ]
+}
+
+fn user_form_title_key(kind: DatabaseFormKind) -> &'static str {
+    match kind {
+        DatabaseFormKind::CreateUser => "DatabaseUser.create_title",
+        DatabaseFormKind::EditUser => "DatabaseUser.edit_title",
+        DatabaseFormKind::DeleteUser => "DatabaseUser.delete_title",
+        DatabaseFormKind::UserPrivileges => "DatabaseUser.privileges_title",
+        _ => "DatabaseUser.user_title",
+    }
 }
 
 fn mysql_connection_form() -> DatabaseFormManifest {
@@ -1031,17 +1196,15 @@ impl DatabasePlugin for MySqlPlugin {
     }
 
     async fn list_databases_view(&self, connection: &dyn DbConnection) -> Result<ObjectView> {
-        use gpui::px;
-
         let databases = self.list_databases_detailed(connection).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("charset", "Charset").width(px(120.0)),
-            Column::new("collation", "Collation").width(px(180.0)),
-            Column::new("size", "Size").width(px(100.0)).text_right(),
-            Column::new("tables", "Tables").width(px(80.0)).text_right(),
-            Column::new("comment", "Comment").width(px(250.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("charset", "Charset").width(120.0),
+            Column::new("collation", "Collation").width(180.0),
+            Column::new("size", "Size").width(100.0).text_right(),
+            Column::new("tables", "Tables").width(80.0).text_right(),
+            Column::new("comment", "Comment").width(250.0),
         ];
 
         let rows: Vec<Vec<String>> = databases
@@ -1191,16 +1354,14 @@ impl DatabasePlugin for MySqlPlugin {
         database: &str,
         _schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let tables = self.list_tables(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("engine", "Engine").width(px(150.0)),
-            Column::new("rows", "Rows").width(px(100.0)).text_right(),
-            Column::new("created", "Created").width(px(180.0)),
-            Column::new("comment", "Comment").width(px(300.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("engine", "Engine").width(150.0),
+            Column::new("rows", "Rows").width(100.0).text_right(),
+            Column::new("created", "Created").width(180.0),
+            Column::new("comment", "Comment").width(300.0),
         ];
 
         let rows: Vec<Vec<String>> = tables
@@ -1285,19 +1446,17 @@ impl DatabasePlugin for MySqlPlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns_data = self
             .list_columns(connection, database, schema, table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("nullable", "Nullable").width(px(80.0)),
-            Column::new("key", "Key").width(px(80.0)),
-            Column::new("default", "Default").width(px(120.0)),
-            Column::new("comment", "Comment").width(px(250.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("nullable", "Nullable").width(80.0),
+            Column::new("key", "Key").width(80.0),
+            Column::new("default", "Default").width(120.0),
+            Column::new("comment", "Comment").width(250.0),
         ];
 
         let rows: Vec<Vec<String>> = columns_data
@@ -1381,17 +1540,15 @@ impl DatabasePlugin for MySqlPlugin {
         schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self
             .list_indexes(connection, database, schema.map(|s| s.to_string()), table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("columns", "Columns").width(px(250.0)),
-            Column::new("unique", "Unique").width(px(80.0)),
-            Column::new("type", "Type").width(px(120.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("columns", "Columns").width(250.0),
+            Column::new("unique", "Unique").width(80.0),
+            Column::new("type", "Type").width(120.0),
         ];
 
         let rows: Vec<Vec<String>> = indexes
@@ -1535,13 +1692,11 @@ impl DatabasePlugin for MySqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let views = self.list_views(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("definition", "Definition").width(px(400.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("definition", "Definition").width(400.0),
         ];
 
         let rows: Vec<Vec<String>> = views
@@ -1604,13 +1759,11 @@ impl DatabasePlugin for MySqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let functions = self.list_functions(connection, database).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("return_type", "Return Type").width(px(150.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("return_type", "Return Type").width(150.0),
         ];
 
         let rows: Vec<Vec<String>> = functions
@@ -1638,6 +1791,11 @@ impl DatabasePlugin for MySqlPlugin {
             supports_functions: true,
             supports_procedures: true,
             supports_triggers: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_table_engine: true,
             supports_table_charset: true,
             supports_table_collation: true,
@@ -1740,11 +1898,9 @@ impl DatabasePlugin for MySqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let procedures = self.list_procedures(connection, database).await?;
 
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         let rows: Vec<Vec<String>> = procedures
             .iter()
@@ -1803,15 +1959,13 @@ impl DatabasePlugin for MySqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let triggers = self.list_triggers(connection, database).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("table", "Table").width(px(150.0)),
-            Column::new("event", "Event").width(px(100.0)),
-            Column::new("timing", "Timing").width(px(100.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("table", "Table").width(150.0),
+            Column::new("event", "Event").width(100.0),
+            Column::new("timing", "Timing").width(100.0),
         ];
 
         let rows: Vec<Vec<String>> = triggers
@@ -1848,9 +2002,7 @@ impl DatabasePlugin for MySqlPlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         Ok(ObjectView {
             db_node_type: DbNodeType::Sequence,
@@ -1890,6 +2042,126 @@ impl DatabasePlugin for MySqlPlugin {
     }
 
     // === Database Management Operations ===
+    fn build_list_users_sql(&self, _database: Option<&str>) -> Option<String> {
+        Some(
+            r#"SELECT
+  User,
+  Host,
+  plugin AS authentication_plugin,
+  account_locked,
+  password_expired,
+  password_last_changed,
+  password_lifetime,
+  max_questions,
+  max_updates,
+  max_connections,
+  max_user_connections,
+  ssl_type,
+  ssl_cipher,
+  x509_issuer,
+  x509_subject,
+  Select_priv,
+  Insert_priv,
+  Update_priv,
+  Delete_priv,
+  Create_priv,
+  Drop_priv,
+  Grant_priv
+FROM mysql.user
+ORDER BY User, Host;"#
+                .to_string(),
+        )
+    }
+
+    fn user_list_columns(&self) -> Vec<Column> {
+        vec![
+            Column::localized("user", "DatabaseUser.columns.user").width(180.0),
+            Column::localized("host", "DatabaseUser.columns.host").width(160.0),
+            Column::localized(
+                "authentication_plugin",
+                "DatabaseUser.columns.authentication_plugin",
+            )
+            .width(220.0),
+            Column::localized("account_locked", "DatabaseUser.columns.account_locked").width(120.0),
+            Column::localized("password_expired", "DatabaseUser.columns.password_expired")
+                .width(130.0),
+            Column::localized(
+                "password_last_changed",
+                "DatabaseUser.columns.password_last_changed",
+            )
+            .width(180.0),
+            Column::localized(
+                "password_lifetime",
+                "DatabaseUser.columns.password_lifetime",
+            )
+            .width(150.0),
+            Column::localized("max_questions", "DatabaseUser.columns.max_questions")
+                .width(120.0)
+                .text_right(),
+            Column::localized("max_updates", "DatabaseUser.columns.max_updates")
+                .width(120.0)
+                .text_right(),
+            Column::localized("max_connections", "DatabaseUser.columns.max_connections")
+                .width(140.0)
+                .text_right(),
+            Column::localized(
+                "max_user_connections",
+                "DatabaseUser.columns.max_user_connections",
+            )
+            .width(160.0)
+            .text_right(),
+            Column::localized("ssl_type", "DatabaseUser.columns.ssl_type").width(120.0),
+            Column::localized("ssl_cipher", "DatabaseUser.columns.ssl_cipher").width(160.0),
+            Column::localized("x509_issuer", "DatabaseUser.columns.x509_issuer").width(240.0),
+            Column::localized("x509_subject", "DatabaseUser.columns.x509_subject").width(240.0),
+            Column::localized("select_priv", "DatabaseUser.columns.select_priv").width(110.0),
+            Column::localized("insert_priv", "DatabaseUser.columns.insert_priv").width(110.0),
+            Column::localized("update_priv", "DatabaseUser.columns.update_priv").width(110.0),
+            Column::localized("delete_priv", "DatabaseUser.columns.delete_priv").width(110.0),
+            Column::localized("create_priv", "DatabaseUser.columns.create_priv").width(110.0),
+            Column::localized("drop_priv", "DatabaseUser.columns.drop_priv").width(110.0),
+            Column::localized("grant_priv", "DatabaseUser.columns.grant_priv").width(110.0),
+        ]
+    }
+
+    fn build_create_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "CREATE USER {} IDENTIFIED BY {};",
+            mysql_user_account(request),
+            mysql_string_literal(mysql_user_password(request))
+        ))
+    }
+
+    fn build_modify_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "ALTER USER {} IDENTIFIED BY {};",
+            mysql_user_account(request),
+            mysql_string_literal(mysql_user_password(request))
+        ))
+    }
+
+    fn build_drop_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!("DROP USER {};", mysql_user_account(request)))
+    }
+
+    fn build_user_privileges_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        let database = request
+            .field_values
+            .get("database")
+            .map(String::as_str)
+            .or(request.database.as_deref())
+            .filter(|database| !database.trim().is_empty());
+        let scope = database
+            .map(|database| format!("{}.*", self.quote_identifier(database)))
+            .unwrap_or_else(|| "*.*".to_string());
+        Some(format!(
+            "GRANT {} ON {} TO {};",
+            mysql_user_privileges(request),
+            scope,
+            mysql_user_account(request)
+        ))
+    }
+
     fn build_create_database_sql(
         &self,
         request: &crate::plugin::DatabaseOperationRequest,
@@ -2520,16 +2792,20 @@ impl DatabasePlugin for MySqlPlugin {
             ));
         }
 
+        for foreign_key in &design.foreign_keys {
+            definitions.push(format!("  {}", self.build_foreign_key_def(foreign_key)));
+        }
+
         sql.push_str(&definitions.join(",\n"));
         sql.push_str("\n)");
 
-        if let Some(engine) = &design.options.engine {
+        if let Some(engine) = executable_mysql_option(design.options.engine.as_deref()) {
             sql.push_str(&format!(" ENGINE={}", engine));
         }
-        if let Some(charset) = &design.options.charset {
+        if let Some(charset) = executable_mysql_option(design.options.charset.as_deref()) {
             sql.push_str(&format!(" DEFAULT CHARSET={}", charset));
         }
-        if let Some(collation) = &design.options.collation {
+        if let Some(collation) = executable_mysql_option(design.options.collation.as_deref()) {
             sql.push_str(&format!(" COLLATE={}", collation));
         }
         if !design.options.comment.is_empty() {
@@ -2586,6 +2862,27 @@ impl DatabasePlugin for MySqlPlugin {
                 ?new_existing,
                 "[table_designer_diag][mysql] detected existing-column order change"
             );
+        }
+
+        let original_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = original
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+        let new_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+
+        for (name, original_foreign_key) in &original_foreign_keys {
+            match new_foreign_keys.get(name) {
+                Some(new_foreign_key)
+                    if !Self::foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => {
+                    statements.push(self.build_drop_foreign_key_sql(&new.table_name, name));
+                }
+            }
         }
 
         for name in original_cols.keys() {
@@ -2727,6 +3024,17 @@ impl DatabasePlugin for MySqlPlugin {
             }
         }
 
+        for (name, new_foreign_key) in &new_foreign_keys {
+            match original_foreign_keys.get(name) {
+                Some(original_foreign_key)
+                    if !Self::foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => {
+                    statements
+                        .push(self.build_add_foreign_key_sql(&new.table_name, new_foreign_key));
+                }
+            }
+        }
+
         let mut options_changed = false;
         let mut option_parts: Vec<String> = Vec::new();
 
@@ -2734,7 +3042,7 @@ impl DatabasePlugin for MySqlPlugin {
             && original.options.engine.is_some()
             && new.options.engine.is_some()
         {
-            if let Some(engine) = &new.options.engine {
+            if let Some(engine) = executable_mysql_option(new.options.engine.as_deref()) {
                 option_parts.push(format!("ENGINE={}", engine));
                 options_changed = true;
             }
@@ -2744,7 +3052,7 @@ impl DatabasePlugin for MySqlPlugin {
             && original.options.charset.is_some()
             && new.options.charset.is_some()
         {
-            if let Some(charset) = &new.options.charset {
+            if let Some(charset) = executable_mysql_option(new.options.charset.as_deref()) {
                 option_parts.push(format!("DEFAULT CHARSET={}", charset));
                 options_changed = true;
             }
@@ -2754,7 +3062,7 @@ impl DatabasePlugin for MySqlPlugin {
             && original.options.collation.is_some()
             && new.options.collation.is_some()
         {
-            if let Some(collation) = &new.options.collation {
+            if let Some(collation) = executable_mysql_option(new.options.collation.as_deref()) {
                 option_parts.push(format!("COLLATE={}", collation));
                 options_changed = true;
             }
@@ -2784,6 +3092,14 @@ impl DatabasePlugin for MySqlPlugin {
         } else {
             statements.join("\n")
         }
+    }
+
+    fn build_drop_foreign_key_sql(&self, table_name: &str, foreign_key_name: &str) -> String {
+        format!(
+            "ALTER TABLE {} DROP FOREIGN KEY {};",
+            self.quote_identifier(table_name),
+            self.quote_identifier(foreign_key_name)
+        )
     }
 
     /// MySQL 使用 CHANGE COLUMN 语法进行列重命名，需要完整列定义。
@@ -2866,6 +3182,23 @@ mod tests {
         values.iter().map(|value| cell(value)).collect()
     }
 
+    fn user_request(
+        user_name: &str,
+        host: Option<&str>,
+        database: Option<&str>,
+        values: &[(&str, &str)],
+    ) -> crate::plugin::DatabaseUserOperationRequest {
+        crate::plugin::DatabaseUserOperationRequest {
+            user_name: user_name.to_string(),
+            host: host.map(str::to_string),
+            database: database.map(str::to_string),
+            field_values: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
     // ==================== Basic Plugin Info Tests ====================
 
     #[test]
@@ -2880,6 +3213,17 @@ mod tests {
         assert_eq!(plugin.quote_identifier("table_name"), "`table_name`");
         assert_eq!(plugin.quote_identifier("column"), "`column`");
         assert_eq!(plugin.quote_identifier("col`umn"), "`col``umn`");
+    }
+
+    #[test]
+    fn test_capabilities_support_users() {
+        let capabilities = create_plugin().capabilities();
+
+        assert!(capabilities.supports_users);
+        assert!(capabilities.supports_user_create);
+        assert!(capabilities.supports_user_edit);
+        assert!(capabilities.supports_user_delete);
+        assert!(capabilities.supports_user_privileges);
     }
 
     #[test]
@@ -3012,6 +3356,47 @@ mod tests {
         let sql = plugin.drop_view("test_db", "my_view");
         assert!(sql.contains("DROP VIEW"));
         assert!(sql.contains("`my_view`"));
+    }
+
+    #[test]
+    fn test_build_list_users_sql() {
+        let plugin = create_plugin();
+        let sql = plugin
+            .build_list_users_sql(Some("appdb"))
+            .expect("MySQL supports user listing");
+
+        assert!(sql.contains("FROM mysql.user"));
+        assert!(sql.contains("User"));
+        assert!(sql.contains("Host"));
+        assert!(sql.contains("account_locked"));
+    }
+
+    #[test]
+    fn test_build_mysql_user_operation_sql_escapes_user_host_and_password() {
+        let plugin = create_plugin();
+        let request = user_request(
+            "app'user",
+            Some("10.%"),
+            Some("app`db"),
+            &[("password", "pa'ss"), ("privileges", "SELECT")],
+        );
+
+        assert_eq!(
+            Some("CREATE USER 'app''user'@'10.%' IDENTIFIED BY 'pa''ss';".to_string()),
+            plugin.build_create_user_sql(&request)
+        );
+        assert_eq!(
+            Some("ALTER USER 'app''user'@'10.%' IDENTIFIED BY 'pa''ss';".to_string()),
+            plugin.build_modify_user_sql(&request)
+        );
+        assert_eq!(
+            Some("DROP USER 'app''user'@'10.%';".to_string()),
+            plugin.build_drop_user_sql(&request)
+        );
+        assert_eq!(
+            Some("GRANT SELECT ON `app``db`.* TO 'app''user'@'10.%';".to_string()),
+            plugin.build_user_privileges_sql(&request)
+        );
     }
 
     // ==================== Database Operations Tests ====================
@@ -3226,6 +3611,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_create_table_sql_skips_display_labels_in_options() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "products".to_string(),
+            columns: vec![ColumnDefinition::new("id").data_type("INT").nullable(false)],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions {
+                engine: Some("Default InnoDB".to_string()),
+                charset: Some("utf8mb4 - UTF-8 Unicode (4 bytes)".to_string()),
+                collation: Some("Default UTF-8".to_string()),
+                comment: String::new(),
+                auto_increment: None,
+            },
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+        assert!(!sql.contains("Default InnoDB"));
+        assert!(!sql.contains("UTF-8"));
+        assert!(!sql.contains("DEFAULT CHARSET"));
+        assert!(!sql.contains("COLLATE="));
+    }
+
+    #[test]
     fn test_build_create_table_sql_with_indexes() {
         let plugin = create_plugin();
         let design = TableDesign {
@@ -3260,6 +3670,37 @@ mod tests {
         assert!(sql.contains("UNIQUE INDEX `idx_email`"));
     }
 
+    #[test]
+    fn test_build_create_table_sql_with_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT").nullable(false),
+                ColumnDefinition::new("order_id")
+                    .data_type("INT")
+                    .nullable(false),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "RESTRICT".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT `fk_order_items_order` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`) ON DELETE CASCADE ON UPDATE RESTRICT"
+        ));
+    }
+
     // ==================== ALTER TABLE Tests ====================
 
     #[test]
@@ -3292,6 +3733,42 @@ mod tests {
         let sql = plugin.build_alter_table_sql(&original, &new);
         assert!(sql.contains("ADD COLUMN"));
         assert!(sql.contains("`email`"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_skips_display_labels_in_options() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![ColumnDefinition::new("id").data_type("INT")],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions {
+                engine: Some("InnoDB".to_string()),
+                charset: Some("utf8mb4".to_string()),
+                collation: Some("utf8mb4_general_ci".to_string()),
+                comment: String::new(),
+                auto_increment: None,
+            },
+        };
+        let new = TableDesign {
+            options: TableOptions {
+                engine: Some("Default InnoDB".to_string()),
+                charset: Some("utf8mb4 - UTF-8 Unicode (4 bytes)".to_string()),
+                collation: Some("Default UTF-8".to_string()),
+                comment: String::new(),
+                auto_increment: None,
+            },
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+        assert!(!sql.contains("Default InnoDB"));
+        assert!(!sql.contains("UTF-8"));
+        assert!(!sql.contains("DEFAULT CHARSET"));
+        assert!(!sql.contains("COLLATE="));
     }
 
     #[test]
@@ -3401,6 +3878,63 @@ mod tests {
         assert!(sql.contains("MODIFY COLUMN"));
         assert!(sql.contains("`name`"));
         assert!(sql.contains("VARCHAR(100)"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_add_and_drop_foreign_keys() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("order_id").data_type("INT"),
+                ColumnDefinition::new("legacy_order_id").data_type("INT"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_legacy".to_string(),
+                columns: vec!["legacy_order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: String::new(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("order_id").data_type("INT"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "RESTRICT".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert!(
+            sql.contains("ALTER TABLE `order_items` DROP FOREIGN KEY `fk_order_items_legacy`;")
+        );
+        assert!(
+            sql.find("DROP FOREIGN KEY `fk_order_items_legacy`")
+                .unwrap()
+                < sql.find("DROP COLUMN `legacy_order_id`").unwrap()
+        );
+        assert!(sql.contains(
+            "ALTER TABLE `order_items` ADD CONSTRAINT `fk_order_items_order` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`) ON DELETE CASCADE ON UPDATE RESTRICT;"
+        ));
     }
 
     #[test]
@@ -3593,7 +4127,7 @@ mod tests {
         let plugin = create_plugin();
         let manifest = plugin.ui_manifest();
 
-        assert_eq!(manifest.forms.len(), 3);
+        assert_eq!(manifest.forms.len(), 7);
         assert_eq!(
             manifest
                 .forms
@@ -3604,6 +4138,10 @@ mod tests {
                 DatabaseFormKind::Connection,
                 DatabaseFormKind::CreateDatabase,
                 DatabaseFormKind::EditDatabase,
+                DatabaseFormKind::CreateUser,
+                DatabaseFormKind::EditUser,
+                DatabaseFormKind::DeleteUser,
+                DatabaseFormKind::UserPrivileges,
             ]
         );
 

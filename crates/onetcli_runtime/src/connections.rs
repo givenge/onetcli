@@ -11,10 +11,12 @@ mod validation;
 use one_core::storage::traits::Repository;
 use one_core::storage::{ConnectionRepository, StoredConnection, WorkspaceRepository};
 use serde_json::{Value, json};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tool_runtime::{
-    ToolAdapter, ToolAnnotations, ToolContext, ToolDescriptor, ToolError, ToolFuture, ToolHandler,
-    ToolMode, ToolRegistry, ToolResult,
+    ResourceCapability, RiskLevel, ToolAdapter, ToolAnnotations, ToolContext, ToolDescriptor,
+    ToolError, ToolFuture, ToolHandler, ToolMode, ToolRegistry, ToolResult, ToolTargetSpec,
 };
 
 #[derive(Clone, Copy)]
@@ -24,12 +26,9 @@ enum ConnectionTool {
     ListKinds,
     GetSchema,
     Validate,
-    Create,
+    Save,
     Find,
-    Update,
     Delete,
-    MoveWorkspace,
-    SetSyncEnabled,
     Test,
     OpenSession,
 }
@@ -38,11 +37,48 @@ pub trait ConnectionSessionOpener: Send + Sync + 'static {
     fn open_session(&self, connection: StoredConnection) -> ToolFuture;
 }
 
+#[derive(Debug, Clone)]
+pub enum ConnectionSaveEvent {
+    Created(StoredConnection),
+    Updated(StoredConnection),
+}
+
+pub type ConnectionSaveNotifyFuture = Pin<Box<dyn Future<Output = Result<(), ToolError>> + Send>>;
+
+pub trait ConnectionSaveNotifier: Send + Sync + 'static {
+    fn notify_save(&self, event: ConnectionSaveEvent) -> ConnectionSaveNotifyFuture;
+}
+
+#[derive(Clone, Default)]
+pub struct ConnectionToolHooks {
+    session_opener: Option<Arc<dyn ConnectionSessionOpener>>,
+    save_notifier: Option<Arc<dyn ConnectionSaveNotifier>>,
+}
+
+impl ConnectionToolHooks {
+    pub fn with_session_opener(
+        mut self,
+        session_opener: Option<Arc<dyn ConnectionSessionOpener>>,
+    ) -> Self {
+        self.session_opener = session_opener;
+        self
+    }
+
+    pub fn with_save_notifier(
+        mut self,
+        save_notifier: Option<Arc<dyn ConnectionSaveNotifier>>,
+    ) -> Self {
+        self.save_notifier = save_notifier;
+        self
+    }
+}
+
 #[derive(Clone)]
 struct ConnectionToolHandler {
     repo: Arc<ConnectionRepository>,
     workspaces: Option<Arc<WorkspaceRepository>>,
     session_opener: Option<Arc<dyn ConnectionSessionOpener>>,
+    save_notifier: Option<Arc<dyn ConnectionSaveNotifier>>,
     tool: ConnectionTool,
 }
 
@@ -54,7 +90,11 @@ pub fn connection_tool_registry_with_workspaces(
     repo: Arc<ConnectionRepository>,
     workspaces: Option<Arc<WorkspaceRepository>>,
 ) -> ToolRegistry {
-    connection_tool_registry_with_workspaces_and_session_opener(repo, workspaces, None)
+    connection_tool_registry_with_workspaces_and_hooks(
+        repo,
+        workspaces,
+        ConnectionToolHooks::default(),
+    )
 }
 
 pub fn connection_tool_registry_with_workspaces_and_session_opener(
@@ -62,66 +102,58 @@ pub fn connection_tool_registry_with_workspaces_and_session_opener(
     workspaces: Option<Arc<WorkspaceRepository>>,
     session_opener: Option<Arc<dyn ConnectionSessionOpener>>,
 ) -> ToolRegistry {
+    connection_tool_registry_with_workspaces_and_hooks(
+        repo,
+        workspaces,
+        ConnectionToolHooks::default().with_session_opener(session_opener),
+    )
+}
+
+pub fn connection_tool_registry_with_workspaces_and_hooks(
+    repo: Arc<ConnectionRepository>,
+    workspaces: Option<Arc<WorkspaceRepository>>,
+    hooks: ConnectionToolHooks,
+) -> ToolRegistry {
     ToolRegistry::new(vec![
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::List)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Show)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::ListKinds)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::GetSchema)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Validate)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
-            ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Create)
-                .with_session_opener(session_opener.clone()),
+            ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Save)
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Find)
-                .with_session_opener(session_opener.clone()),
-        ),
-        Arc::new(
-            ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Update)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Delete)
-                .with_session_opener(session_opener.clone()),
-        ),
-        Arc::new(
-            ConnectionToolHandler::new(
-                repo.clone(),
-                workspaces.clone(),
-                ConnectionTool::MoveWorkspace,
-            )
-            .with_session_opener(session_opener.clone()),
-        ),
-        Arc::new(
-            ConnectionToolHandler::new(
-                repo.clone(),
-                workspaces.clone(),
-                ConnectionTool::SetSyncEnabled,
-            )
-            .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo.clone(), workspaces.clone(), ConnectionTool::Test)
-                .with_session_opener(session_opener.clone()),
+                .with_hooks(hooks.clone()),
         ),
         Arc::new(
             ConnectionToolHandler::new(repo, workspaces, ConnectionTool::OpenSession)
-                .with_session_opener(session_opener),
+                .with_hooks(hooks),
         ),
     ])
 }
@@ -136,15 +168,14 @@ impl ConnectionToolHandler {
             repo,
             workspaces,
             session_opener: None,
+            save_notifier: None,
             tool,
         }
     }
 
-    fn with_session_opener(
-        mut self,
-        session_opener: Option<Arc<dyn ConnectionSessionOpener>>,
-    ) -> Self {
-        self.session_opener = session_opener;
+    fn with_hooks(mut self, hooks: ConnectionToolHooks) -> Self {
+        self.session_opener = hooks.session_opener;
+        self.save_notifier = hooks.save_notifier;
         self
     }
 
@@ -157,19 +188,10 @@ impl ConnectionToolHandler {
             ConnectionTool::ListKinds => Ok(ToolResult::structured(schema::list_kinds())),
             ConnectionTool::GetSchema => Ok(ToolResult::structured(schema::schema_for(input)?)),
             ConnectionTool::Validate => Ok(ToolResult::structured(validation::validate(input))),
-            ConnectionTool::Create => self.create(input),
+            ConnectionTool::Save => self.save(input).await,
             ConnectionTool::Find => management::find(&self.repo, self.workspaces.as_ref(), input),
-            ConnectionTool::Update => {
-                management::update(&self.repo, self.workspaces.as_ref(), input)
-            }
             ConnectionTool::Delete => {
                 management::delete(&self.repo, self.workspaces.as_ref(), input)
-            }
-            ConnectionTool::MoveWorkspace => {
-                management::move_workspace(&self.repo, self.workspaces.as_ref(), input)
-            }
-            ConnectionTool::SetSyncEnabled => {
-                management::set_sync_enabled(&self.repo, self.workspaces.as_ref(), input)
             }
             ConnectionTool::Test => {
                 management::test_connection(&self.repo, self.workspaces.as_ref(), input).await
@@ -178,7 +200,21 @@ impl ConnectionToolHandler {
         }
     }
 
-    fn create(&self, input: Value) -> Result<ToolResult, ToolError> {
+    async fn save(&self, input: Value) -> Result<ToolResult, ToolError> {
+        if input.get("id").is_some() {
+            let id = input::optional_i64(&input, "id").ok_or_else(|| ToolError::Failed {
+                message: "missing integer field: id".to_string(),
+            })?;
+            let result = management::update(&self.repo, self.workspaces.as_ref(), input)?;
+            let connection = management::find_unique_connection(&self.repo, &id.to_string())?;
+            self.notify_save(ConnectionSaveEvent::Updated(connection))
+                .await?;
+            return Ok(result);
+        }
+        self.create_and_notify(input).await
+    }
+
+    async fn create_and_notify(&self, input: Value) -> Result<ToolResult, ToolError> {
         let validation = validation::validate(input.clone());
         if !validation["can_apply"].as_bool().unwrap_or(false) {
             return Ok(ToolResult::structured(validation));
@@ -187,10 +223,19 @@ impl ConnectionToolHandler {
         self.repo
             .insert(&mut connection)
             .map_err(input::tool_error)?;
+        self.notify_save(ConnectionSaveEvent::Created(connection.clone()))
+            .await?;
         Ok(ToolResult::structured(json!({
             "ok": true,
             "connection": management::summarize(&connection, self.workspaces.as_ref(), true)?
         })))
+    }
+
+    async fn notify_save(&self, event: ConnectionSaveEvent) -> Result<(), ToolError> {
+        if let Some(notifier) = &self.save_notifier {
+            notifier.notify_save(event).await?;
+        }
+        Ok(())
     }
 
     async fn open_session(
@@ -199,7 +244,7 @@ impl ConnectionToolHandler {
         context: ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let reference = input::required_str(&input, "connection")?;
-        let connection = management::find_unique_connection(&self.repo, &reference)?;
+        let connection = management::find_unique_connection(&self.repo, reference)?;
         let summary = management::summarize(&connection, self.workspaces.as_ref(), true)?;
         let adapter = adapter_name(context.adapter);
 
@@ -248,19 +293,19 @@ impl ToolHandler for ConnectionToolHandler {
             ConnectionTool::GetSchema => (
                 "connections.get_schema",
                 "Get connection schema",
-                "Return the required fields, optional fields, defaults, and enum values for creating a specific connection kind. Use this before connections.validate or connections.create so arguments match the selected kind.",
+                "Return the required fields, optional fields, defaults, and enum values for creating a specific connection kind. Use this before connections.validate or connections.save so arguments match the selected kind.",
                 true,
             ),
             ConnectionTool::Validate => (
                 "connections.validate",
                 "Validate connection",
-                "Validate a proposed connection creation request without saving it. Use the same arguments as connections.create, including kind and values, to check missing fields and type errors before mutating saved connections.",
+                "Validate a proposed connection creation request without saving it. Use the same creation arguments as connections.save, including kind and values, to check missing fields and type errors before mutating saved connections.",
                 true,
             ),
-            ConnectionTool::Create => (
-                "connections.create",
-                "Create connection",
-                "Create and save a new OnetCli connection profile from structured fields. Call connections.get_schema first for the selected kind, and call connections.validate first when unsure. Use top-level remark, not values.remark. Password-like values are redacted in responses but may still appear in MCP tool-call arguments/logs depending on the client.",
+            ConnectionTool::Save => (
+                "connections.save",
+                "Save connection",
+                "Create or update an OnetCli connection profile. Omit id and pass kind plus values to create; pass id plus patch to update top-level fields or connection params. Call connections.get_schema first for the selected kind, and call connections.validate first when unsure. Use top-level remark, not values.remark. Password-like values are redacted in responses but may still appear in MCP tool-call arguments/logs depending on the client.",
                 false,
             ),
             ConnectionTool::Find => (
@@ -269,28 +314,10 @@ impl ToolHandler for ConnectionToolHandler {
                 "Find saved connections using filters such as exact name, name_contains, kind, database_type, workspace_id, and host. Returns an array and never chooses among duplicate names; automation should prefer ids from this result.",
                 true,
             ),
-            ConnectionTool::Update => (
-                "connections.update",
-                "Update saved connection",
-                "Patch a saved connection by numeric id. Supports top-level fields name, remark, workspace_id, sync_enabled, database_type for database profiles, and values for connection params. Password-like values may be logged by the MCP client before OnetCli redacts responses.",
-                false,
-            ),
             ConnectionTool::Delete => (
                 "connections.delete",
                 "Delete saved connection",
                 "Delete a saved connection by numeric id. Use connections.find or connections.show first if the id is not known.",
-                false,
-            ),
-            ConnectionTool::MoveWorkspace => (
-                "connections.move_workspace",
-                "Move connection workspace",
-                "Move a saved connection to another workspace by id, or set workspace_id=null to remove the workspace association.",
-                false,
-            ),
-            ConnectionTool::SetSyncEnabled => (
-                "connections.set_sync_enabled",
-                "Set connection sync",
-                "Enable or disable cloud sync for a saved connection by numeric id.",
                 false,
             ),
             ConnectionTool::Test => (
@@ -319,13 +346,32 @@ impl ToolHandler for ConnectionToolHandler {
                 ToolAdapter::FunctionCalling,
                 ToolAdapter::Cli,
             ],
-            annotations: annotations(title, read_only),
+            annotations: match self.tool {
+                ConnectionTool::Save => save_annotations(title),
+                _ => annotations(title, read_only),
+            },
         }
     }
 
     fn call(&self, input: Value, context: ToolContext) -> tool_runtime::ToolFuture {
         let handler = self.clone();
         Box::pin(async move { handler.call_tool(input, context).await })
+    }
+
+    fn target_spec(&self) -> ToolTargetSpec {
+        match self.tool {
+            ConnectionTool::Show | ConnectionTool::Test => {
+                ToolTargetSpec::required_with_capabilities(
+                    Vec::new(),
+                    vec![ResourceCapability::ManageConnection],
+                )
+            }
+            ConnectionTool::OpenSession => ToolTargetSpec::required_with_capabilities(
+                Vec::new(),
+                vec![ResourceCapability::OpenSession],
+            ),
+            _ => ToolTargetSpec::none(),
+        }
     }
 }
 
@@ -334,6 +380,18 @@ fn annotations(title: &str, read_only: bool) -> ToolAnnotations {
         ToolAnnotations::read_only(title)
     } else {
         ToolAnnotations::mutating(title)
+    }
+}
+
+fn save_annotations(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.to_string(),
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+        supports_parallel: false,
+        risk: RiskLevel::Medium,
     }
 }
 
@@ -350,11 +408,9 @@ fn input_schema(tool: ConnectionTool) -> Value {
             "required": ["connection"]
         }),
         ConnectionTool::GetSchema => kind_schema(true),
-        ConnectionTool::Validate | ConnectionTool::Create => create_schema(),
-        ConnectionTool::Update => update_schema(),
+        ConnectionTool::Validate => create_schema(),
+        ConnectionTool::Save => save_schema(),
         ConnectionTool::Delete => id_schema(),
-        ConnectionTool::MoveWorkspace => move_workspace_schema(),
-        ConnectionTool::SetSyncEnabled => sync_schema(),
         ConnectionTool::Test | ConnectionTool::OpenSession => json!({
             "type": "object",
             "properties": { "connection": connection_ref_schema() },
@@ -433,24 +489,36 @@ fn create_schema() -> Value {
     })
 }
 
-fn update_schema() -> Value {
+fn save_schema() -> Value {
+    let mut schema = create_schema();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("id".to_string(), json!({ "type": "integer" }));
+        properties.insert("patch".to_string(), update_patch_schema());
+    }
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("required");
+        object.insert(
+            "oneOf".to_string(),
+            json!([
+                { "required": ["kind", "values"] },
+                { "required": ["id", "patch"] }
+            ]),
+        );
+    }
+    schema
+}
+
+fn update_patch_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "id": { "type": "integer" },
-            "patch": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "remark": { "type": ["string", "null"] },
-                    "workspace_id": { "type": ["integer", "null"] },
-                    "sync_enabled": { "type": "boolean" },
-                    "database_type": database_type_schema(),
-                    "values": { "type": "object" }
-                }
-            }
-        },
-        "required": ["id", "patch"]
+            "name": { "type": "string" },
+            "remark": { "type": ["string", "null"] },
+            "workspace_id": { "type": ["integer", "null"] },
+            "sync_enabled": { "type": "boolean" },
+            "database_type": database_type_schema(),
+            "values": { "type": "object" }
+        }
     })
 }
 
@@ -459,28 +527,6 @@ fn id_schema() -> Value {
         "type": "object",
         "properties": { "id": { "type": "integer" } },
         "required": ["id"]
-    })
-}
-
-fn move_workspace_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "id": { "type": "integer" },
-            "workspace_id": { "type": ["integer", "null"] }
-        },
-        "required": ["id", "workspace_id"]
-    })
-}
-
-fn sync_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "id": { "type": "integer" },
-            "enabled": { "type": "boolean" }
-        },
-        "required": ["id", "enabled"]
     })
 }
 

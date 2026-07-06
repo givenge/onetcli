@@ -1,19 +1,20 @@
-use db::{GlobalDbState, TableInfo};
+use db::GlobalDbState;
 use gpui::{AppContext, AsyncApp, Context, Entity};
 use gpui_component::{IndexPath, select::SearchableVec};
 use rust_i18n::t;
 
 use crate::compare::window_ui::register_connection_for_compare;
 use crate::db_object_selector::state::{
-    DbObjectSelectorPolicy, StringSelect, TargetConnectionControls, TargetStringControls,
-    policy_for_connection, selected_string,
+    StringSelect, TargetConnectionControls, TargetStringControls, policy_for_connection,
+    selected_connection_value, selected_string,
 };
 
-pub(crate) fn load_databases<T: 'static>(
+pub(crate) fn load_databases_then<T: 'static>(
     connection: TargetConnectionControls,
     database: TargetStringControls,
     status: Entity<String>,
     cx: &mut Context<T>,
+    after_load: impl FnOnce(&mut T, &mut Context<T>) + 'static,
 ) {
     let connection_id = selected_connection(&connection, cx);
     let policy = policy_for_connection(&connection, cx);
@@ -33,6 +34,8 @@ pub(crate) fn load_databases<T: 'static>(
     };
     prepare_load(&connection_id, &status, loading_key, cx);
     let db_state = cx.global::<GlobalDbState>().clone();
+    let view = cx.entity().clone();
+    let mut after_load = Some(after_load);
     cx.spawn(async move |_, cx: &mut AsyncApp| {
         let result = if policy.schema_as_database {
             db_state
@@ -41,21 +44,30 @@ pub(crate) fn load_databases<T: 'static>(
         } else {
             db_state.list_databases(cx, connection_id).await
         };
+        let loaded = result.is_ok();
         update_string_select_async(result, database.select, preferred, status, cx);
+        if loaded {
+            let _ = view.update(cx, move |this, cx| {
+                if let Some(after_load) = after_load.take() {
+                    after_load(this, cx);
+                }
+            });
+        }
     })
     .detach();
 }
 
-pub(crate) fn load_schemas<T: 'static>(
+pub(crate) fn load_schemas_then<T: 'static>(
     connection: TargetConnectionControls,
     database: TargetStringControls,
     schema: TargetStringControls,
     status: Entity<String>,
     cx: &mut Context<T>,
+    after_load: impl FnOnce(&mut T, &mut Context<T>) + 'static,
 ) {
     let connection_id = selected_connection(&connection, cx);
     let policy = policy_for_connection(&connection, cx);
-    let database_name = selected_select_string(&database.select, cx);
+    let database_name = selected_database_name_for_schema_load(&database, cx);
     let preferred = selected_string(&schema.select, &schema.fallback, cx);
     clear_string_select(&schema.select, cx);
     if !policy.show_schema {
@@ -75,49 +87,21 @@ pub(crate) fn load_schemas<T: 'static>(
         cx,
     );
     let db_state = cx.global::<GlobalDbState>().clone();
+    let view = cx.entity().clone();
+    let mut after_load = Some(after_load);
     cx.spawn(async move |_, cx: &mut AsyncApp| {
         let result = db_state
             .list_schemas(cx, connection_id, database_name)
             .await;
+        let loaded = result.is_ok();
         update_string_select_async(result, schema.select, preferred, status, cx);
-    })
-    .detach();
-}
-
-pub(crate) fn load_tables<T: 'static>(
-    connection: TargetConnectionControls,
-    database: TargetStringControls,
-    schema: TargetStringControls,
-    table: TargetStringControls,
-    status: Entity<String>,
-    cx: &mut Context<T>,
-) {
-    let connection_id = selected_connection(&connection, cx);
-    let policy = policy_for_connection(&connection, cx);
-    let database_name = selected_select_string(&database.select, cx);
-    let preferred = selected_string(&table.select, &table.fallback, cx);
-    clear_string_select(&table.select, cx);
-    if connection_id.trim().is_empty() || database_name.trim().is_empty() {
-        return set_status(
-            &status,
-            t!("DbObjectSelector.select_connection_database").to_string(),
-            cx,
-        );
-    }
-    let schema_name = table_schema_name(&database_name, &schema, policy, cx);
-    prepare_load(
-        &connection_id,
-        &status,
-        "DbObjectSelector.loading_tables",
-        cx,
-    );
-    let db_state = cx.global::<GlobalDbState>().clone();
-    cx.spawn(async move |_, cx: &mut AsyncApp| {
-        let result = db_state
-            .list_tables(cx, connection_id, database_name, schema_name)
-            .await
-            .map(table_names);
-        update_string_select_async(result, table.select, preferred, status, cx);
+        if loaded {
+            let _ = view.update(cx, move |this, cx| {
+                if let Some(after_load) = after_load.take() {
+                    after_load(this, cx);
+                }
+            });
+        }
     })
     .detach();
 }
@@ -146,36 +130,14 @@ fn prepare_load<T>(
 }
 
 fn selected_connection<T>(controls: &TargetConnectionControls, cx: &Context<T>) -> String {
-    controls
-        .select
-        .read(cx)
-        .selected_value()
-        .cloned()
-        .unwrap_or_default()
+    selected_connection_value(controls, cx)
 }
 
-fn selected_select_string<T>(select: &StringSelect, cx: &Context<T>) -> String {
-    select
-        .read(cx)
-        .selected_value()
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn table_schema_name<T>(
-    database_name: &str,
-    schema: &TargetStringControls,
-    policy: DbObjectSelectorPolicy,
-    cx: &Context<T>,
-) -> Option<String> {
-    if policy.schema_as_database {
-        return Some(database_name.to_string());
-    }
-    if policy.show_schema {
-        empty_to_none(selected_select_string(&schema.select, cx))
-    } else {
-        None
-    }
+fn selected_database_name_for_schema_load(
+    database: &TargetStringControls,
+    cx: &gpui::App,
+) -> String {
+    selected_string(&database.select, &database.fallback, cx)
 }
 
 fn update_string_select_async(
@@ -226,17 +188,50 @@ fn preferred_index(items: &[String], preferred: &str) -> Option<IndexPath> {
         .map(IndexPath::new)
 }
 
-fn table_names(tables: Vec<TableInfo>) -> Vec<String> {
-    tables.into_iter().map(|table| table.name).collect()
-}
-
-fn empty_to_none(value: String) -> Option<String> {
-    (!value.trim().is_empty()).then(|| value.trim().to_string())
-}
-
 fn set_status<T>(status: &Entity<String>, message: String, cx: &mut Context<T>) {
     status.update(cx, |status, cx| {
         *status = message;
         cx.notify();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{AppContext, Context, IntoElement, Render, TestAppContext, Window, div};
+    use gpui_component::input::InputState;
+
+    use crate::db_object_selector::state::{
+        StringSelect, TargetStringControls, string_select_state,
+    };
+
+    struct LoaderTestRoot {
+        database: TargetStringControls,
+    }
+
+    impl Render for LoaderTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn schema_load_database_name_uses_fallback_when_select_is_cleared(cx: &mut TestAppContext) {
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let fallback =
+                cx.new(|cx| InputState::new(window, cx).default_value("app_db".to_string()));
+            let select: StringSelect = string_select_state("app_db".to_string(), window, cx);
+            LoaderTestRoot {
+                database: TargetStringControls { select, fallback },
+            }
+        });
+
+        root.update_in(cx, |root, _, cx| {
+            super::clear_string_select(&root.database.select, cx);
+        });
+
+        let database_name = root.read_with(cx, |root, cx| {
+            super::selected_database_name_for_schema_load(&root.database, cx)
+        });
+        assert_eq!("app_db", database_name);
+    }
 }

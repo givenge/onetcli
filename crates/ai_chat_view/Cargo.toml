@@ -1,0 +1,36 @@
+[package]
+name = "ai_chat_view"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+one-core.workspace = true
+agent_runtime = { path = "../agent_runtime" }
+html-preview.workspace = true
+gpui-wry = { path = "../webview" }
+wry = { version = "0.53.3", package = "lb-wry" }
+agent-client-protocol.workspace = true
+llm-connector = { workspace = true, features = ["streaming"] }
+async-trait.workspace = true
+futures.workspace = true
+smol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rust-i18n.workspace = true
+base64.workspace = true
+image.workspace = true
+uuid.workspace = true
+lsp-types.workspace = true
+sum-tree.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

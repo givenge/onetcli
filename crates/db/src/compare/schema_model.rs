@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 /// 列定义
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnSchema {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
     pub default_value: Option<String>,
     pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
 }
 
 /// 索引定义
@@ -25,16 +29,26 @@ pub struct ForeignKeySchema {
     pub columns: Vec<String>,
     pub ref_table: String,
     pub ref_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_delete: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<String>,
 }
 
 /// 表结构
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnSchema>,
     pub indexes: Vec<IndexSchema>,
     pub foreign_keys: Vec<ForeignKeySchema>,
     pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
 }
 
 /// 差异状态
@@ -99,12 +113,24 @@ pub struct SchemaCompareResult {
 #[derive(Debug, Clone)]
 pub struct SchemaCompareOptions {
     pub ignore_comments: bool,
+    pub case_sensitive_identifiers: bool,
+    pub ignore_auto_increment: bool,
+    pub ignore_charset_collation: bool,
+    pub ignore_table_options: bool,
+    pub compare_indexes: bool,
+    pub compare_foreign_keys: bool,
 }
 
 impl Default for SchemaCompareOptions {
     fn default() -> Self {
         Self {
             ignore_comments: false,
+            case_sensitive_identifiers: false,
+            ignore_auto_increment: false,
+            ignore_charset_collation: false,
+            ignore_table_options: false,
+            compare_indexes: true,
+            compare_foreign_keys: true,
         }
     }
 }
@@ -114,4 +140,7 @@ impl Default for SchemaCompareOptions {
 pub enum SchemaCompareError {
     #[error("无效的表结构")]
     InvalidSchema,
+
+    #[error("存在重复标识符: {0}")]
+    DuplicateIdentifier(String),
 }

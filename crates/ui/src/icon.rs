@@ -4,6 +4,7 @@ use gpui::{
     Radians, Render, RenderOnce, SharedString, StyleRefinement, Styled, Svg, Transformation,
     Window, div, img, prelude::FluentBuilder as _, svg,
 };
+// use gpui_component_macros::icon_named;
 use std::path::PathBuf;
 
 /// Types implementing this trait can automatically be converted to [`Icon`].
@@ -20,6 +21,8 @@ impl<T: IconNamed> From<T> for Icon {
         Icon::build(value)
     }
 }
+
+// icon_named!(IconName, "../assets/assets/icons");
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IconColorMode {
@@ -49,6 +52,7 @@ pub enum IconName {
     BookOpen,
     Bot,
     Building2,
+    TeamColor,
     Calendar,
     CaseSensitive,
     ChartPie,
@@ -77,8 +81,10 @@ pub enum IconName {
     Folder,
     FolderClosed,
     FolderOpen,
+    FolderOpenColor,
     Frame,
     GalleryVerticalEnd,
+    ExtensionsColor,
     GitHub,
     Globe,
     HardDrive,
@@ -122,6 +128,7 @@ pub enum IconName {
     SortAscending,
     SortDescending,
     SquareTerminal,
+    SquareTerminalColor,
     Star,
     StarFill,
     StarOff,
@@ -166,6 +173,7 @@ pub enum IconName {
     Redis,
     Terminal,
     TerminalColor,
+    RichInputColor,
     Apps,
     AppsColor,
     MongoDB,
@@ -197,6 +205,8 @@ pub enum IconName {
     TableData,
     TableDesign,
     TableDesignTool,
+    SchemaCompare,
+    DataModel,
     Server,
     Export,
     AI,
@@ -217,11 +227,12 @@ impl IconName {
         Icon::build(self).view(cx)
     }
 
-    /// Return the icon in color mode (renders original colors)
+    /// Return the icon in color mode.
     pub fn color(self) -> Icon {
         Icon::build(self).color()
     }
 
+    /// Return the icon in monochrome mode.
     pub fn mono(self) -> Icon {
         Icon::build(self).mono()
     }
@@ -246,6 +257,7 @@ impl IconNamed for IconName {
             Self::BookOpen => "icons/book-open.svg",
             Self::Bot => "icons/bot.svg",
             Self::Building2 => "icons/building-2.svg",
+            Self::TeamColor => "icons/team_color.svg",
             Self::Calendar => "icons/calendar.svg",
             Self::CaseSensitive => "icons/case-sensitive.svg",
             Self::ChartPie => "icons/chart-pie.svg",
@@ -274,8 +286,10 @@ impl IconNamed for IconName {
             Self::Folder => "icons/folder.svg",
             Self::FolderClosed => "icons/folder-closed.svg",
             Self::FolderOpen => "icons/folder-open.svg",
+            Self::FolderOpenColor => "icons/folder_open_color.svg",
             Self::Frame => "icons/frame.svg",
             Self::GalleryVerticalEnd => "icons/gallery-vertical-end.svg",
+            Self::ExtensionsColor => "icons/extensions_color.svg",
             Self::GitHub => "icons/github.svg",
             Self::Globe => "icons/globe.svg",
             Self::HardDrive => "icons/hard-drive.svg",
@@ -319,6 +333,7 @@ impl IconNamed for IconName {
             Self::SortAscending => "icons/sort-ascending.svg",
             Self::SortDescending => "icons/sort-descending.svg",
             Self::SquareTerminal => "icons/square-terminal.svg",
+            Self::SquareTerminalColor => "icons/square_terminal_color.svg",
             Self::Star => "icons/star.svg",
             Self::StarFill => "icons/star-fill.svg",
             Self::StarOff => "icons/star-off.svg",
@@ -365,6 +380,7 @@ impl IconNamed for IconName {
             Self::Redis => "icons/redis.svg",
             Self::Terminal => "icons/terminal.svg",
             Self::TerminalColor => "icons/terminal_color.svg",
+            Self::RichInputColor => "icons/rich_input_color.svg",
             Self::Apps => "icons/apps.svg",
             Self::AppsColor => "icons/apps_color.svg",
             Self::MongoDB => "icons/mongodb.svg",
@@ -394,6 +410,8 @@ impl IconNamed for IconName {
             Self::TableData => "icons/table-data.svg",
             Self::TableDesign => "icons/table-design.svg",
             Self::TableDesignTool => "icons/table-design-tool.svg",
+            Self::SchemaCompare => "icons/schema-compare.svg",
+            Self::DataModel => "icons/data-model.svg",
             Self::Server => "icons/server.svg",
             Self::Export => "icons/export.svg",
             Self::AI => "icons/ai.svg",
@@ -431,8 +449,8 @@ pub struct Icon {
     image_source: Option<ImageSource>,
     text_color: Option<Hsla>,
     size: Option<Size>,
-    rotation: Option<Radians>,
     color_mode: IconColorMode,
+    rotation: Option<Radians>,
 }
 
 impl Default for Icon {
@@ -444,8 +462,8 @@ impl Default for Icon {
             image_source: None,
             text_color: None,
             size: None,
-            rotation: None,
             color_mode: IconColorMode::default(),
+            rotation: None,
         }
     }
 }
@@ -505,29 +523,29 @@ impl Icon {
         Self::default()
     }
 
-    /// Rotate the icon by the given angle
-    pub fn rotate(mut self, radians: impl Into<Radians>) -> Self {
-        self.base = self
-            .base
-            .with_transformation(Transformation::rotate(radians));
-        self
-    }
-
-    /// Set the icon color mode
+    /// Set the icon color mode.
     pub fn color_mode(mut self, mode: IconColorMode) -> Self {
         self.color_mode = mode;
         self
     }
 
-    /// Set the icon to color mode (renders original colors)
+    /// Set the icon to color mode.
     pub fn color(mut self) -> Self {
         self.color_mode = IconColorMode::Color;
         self
     }
 
-    /// Set the icon to mono mode (uses text_color tinting)
+    /// Set the icon to mono mode.
     pub fn mono(mut self) -> Self {
         self.color_mode = IconColorMode::Mono;
+        self
+    }
+
+    /// Rotate the icon by the given angle
+    pub fn rotate(mut self, radians: impl Into<Radians>) -> Self {
+        self.base = self
+            .base
+            .with_transformation(Transformation::rotate(radians));
         self
     }
 }
@@ -557,9 +575,7 @@ impl RenderOnce for Icon {
 
         match self.color_mode {
             IconColorMode::Mono => {
-                // Monochrome mode: use SVG with text_color tinting
                 let text_color = self.text_color.unwrap_or_else(|| window.text_style().color);
-
                 let mut base = self.base;
                 *base.style() = self.style;
 
@@ -577,7 +593,6 @@ impl RenderOnce for Icon {
                     .into_any_element()
             }
             IconColorMode::Color => {
-                // Color mode: use img to render original colors
                 let size = self.size.unwrap_or(Size::Medium);
                 let (w, h) = match size {
                     Size::Size(px) => (px, px),
@@ -616,9 +631,7 @@ impl Render for Icon {
 
         match self.color_mode {
             IconColorMode::Mono => {
-                // Monochrome mode: use SVG with text_color tinting
                 let text_color = self.text_color.unwrap_or_else(|| cx.theme().foreground);
-
                 let mut base = svg().flex_none();
                 *base.style() = self.style.clone();
 
@@ -639,7 +652,6 @@ impl Render for Icon {
                     .into_any_element()
             }
             IconColorMode::Color => {
-                // Color mode: use img to render original colors
                 let size = self.size.unwrap_or(Size::Medium);
                 let (w, h) = match size {
                     Size::Size(px) => (px, px),

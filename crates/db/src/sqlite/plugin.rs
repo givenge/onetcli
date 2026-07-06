@@ -1,6 +1,6 @@
+use crate::types::ObjectViewColumn as Column;
 use anyhow::Result;
 use async_trait::async_trait;
-use gpui_component::table::Column;
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -41,6 +41,34 @@ static SQLITE_UI_MANIFEST: LazyLock<DatabaseUiManifest> = LazyLock::new(build_sq
 impl SqlitePlugin {
     pub fn new() -> Self {
         Self
+    }
+
+    fn foreign_key_changed(left: &ForeignKeyDefinition, right: &ForeignKeyDefinition) -> bool {
+        left.columns != right.columns
+            || left.ref_table != right.ref_table
+            || left.ref_columns != right.ref_columns
+            || left.on_delete.trim().to_uppercase() != right.on_delete.trim().to_uppercase()
+            || left.on_update.trim().to_uppercase() != right.on_update.trim().to_uppercase()
+    }
+
+    fn foreign_keys_changed(original: &TableDesign, new: &TableDesign) -> bool {
+        let original_foreign_keys = original
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect::<HashMap<_, _>>();
+        let new_foreign_keys = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect::<HashMap<_, _>>();
+
+        original_foreign_keys.len() != new_foreign_keys.len()
+            || original_foreign_keys.iter().any(|(name, original_key)| {
+                new_foreign_keys
+                    .get(name)
+                    .is_none_or(|new_key| Self::foreign_key_changed(original_key, new_key))
+            })
     }
 
     fn build_sqlite_simple_alter_sql(&self, original: &TableDesign, new: &TableDesign) -> String {
@@ -164,6 +192,10 @@ impl SqlitePlugin {
                 .map(|c| self.quote_identifier(c))
                 .collect();
             column_defs.push(format!("primary key ({})", pk_cols.join(", ")));
+        }
+
+        for foreign_key in &new.foreign_keys {
+            column_defs.push(self.build_foreign_key_def(foreign_key));
         }
 
         statements.push(format!(
@@ -672,9 +704,7 @@ impl DatabasePlugin for SqlitePlugin {
     }
 
     async fn list_databases_view(&self, _connection: &dyn DbConnection) -> Result<ObjectView> {
-        use gpui::px;
-
-        let columns = vec![Column::new("name", "Name").width(px(180.0))];
+        let columns = vec![Column::new("name", "Name").width(180.0)];
 
         let rows = vec![vec!["main".to_string()]];
 
@@ -751,11 +781,9 @@ impl DatabasePlugin for SqlitePlugin {
         database: &str,
         _schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let tables = self.list_tables(connection, database, None).await?;
 
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         let rows: Vec<Vec<String>> = tables
             .iter()
@@ -829,18 +857,16 @@ impl DatabasePlugin for SqlitePlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns_data = self
             .list_columns(connection, database, schema, table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("nullable", "Nullable").width(px(80.0)),
-            Column::new("key", "Key").width(px(80.0)),
-            Column::new("default", "Default").width(px(120.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("nullable", "Nullable").width(80.0),
+            Column::new("key", "Key").width(80.0),
+            Column::new("default", "Default").width(120.0),
         ];
 
         let rows: Vec<Vec<String>> = columns_data
@@ -929,16 +955,14 @@ impl DatabasePlugin for SqlitePlugin {
         schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self
             .list_indexes(connection, database, schema.map(|s| s.to_string()), table)
             .await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("columns", "Columns").width(px(250.0)),
-            Column::new("unique", "Unique").width(px(80.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("columns", "Columns").width(250.0),
+            Column::new("unique", "Unique").width(80.0),
         ];
 
         let rows: Vec<Vec<String>> = indexes
@@ -994,13 +1018,11 @@ impl DatabasePlugin for SqlitePlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let views = self.list_views(connection, database, None).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("definition", "Definition").width(px(400.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("definition", "Definition").width(400.0),
         ];
 
         let rows: Vec<Vec<String>> = views
@@ -1034,9 +1056,7 @@ impl DatabasePlugin for SqlitePlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         Ok(ObjectView {
             db_node_type: DbNodeType::Function,
@@ -1059,9 +1079,7 @@ impl DatabasePlugin for SqlitePlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         Ok(ObjectView {
             db_node_type: DbNodeType::Procedure,
@@ -1106,13 +1124,11 @@ impl DatabasePlugin for SqlitePlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let triggers = self.list_triggers(connection, database).await?;
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("table", "Table").width(px(150.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("table", "Table").width(150.0),
         ];
 
         let rows: Vec<Vec<String>> = triggers
@@ -1142,9 +1158,7 @@ impl DatabasePlugin for SqlitePlugin {
         _connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
-        let columns = vec![Column::new("name", "Name").width(px(200.0))];
+        let columns = vec![Column::new("name", "Name").width(200.0)];
 
         Ok(ObjectView {
             db_node_type: DbNodeType::Sequence,
@@ -1341,6 +1355,10 @@ impl DatabasePlugin for SqlitePlugin {
             definitions.push(format!("  PRIMARY KEY ({})", pk_cols.join(", ")));
         }
 
+        for foreign_key in &design.foreign_keys {
+            definitions.push(format!("  {}", self.build_foreign_key_def(foreign_key)));
+        }
+
         sql.push_str(&definitions.join(",\n"));
         sql.push_str("\n);");
 
@@ -1388,7 +1406,9 @@ impl DatabasePlugin for SqlitePlugin {
             }
         }
 
-        let has_structure_change = !dropped_columns.is_empty() || !modified_columns.is_empty();
+        let has_structure_change = !dropped_columns.is_empty()
+            || !modified_columns.is_empty()
+            || Self::foreign_keys_changed(original, new);
 
         if has_structure_change {
             self.build_sqlite_recreate_table_sql(original, new)
@@ -1490,6 +1510,23 @@ mod tests {
                 .iter()
                 .any(|action| action.id == DatabaseActionId::OpenTableData)
         );
+    }
+
+    #[test]
+    fn test_user_management_defaults_to_unsupported() {
+        let plugin = create_plugin();
+        let request = crate::plugin::DatabaseUserOperationRequest {
+            user_name: "alice".to_string(),
+            host: None,
+            database: None,
+            field_values: HashMap::new(),
+        };
+
+        assert_eq!(None, plugin.build_list_users_sql(None));
+        assert_eq!(None, plugin.build_create_user_sql(&request));
+        assert_eq!(None, plugin.build_modify_user_sql(&request));
+        assert_eq!(None, plugin.build_drop_user_sql(&request));
+        assert_eq!(None, plugin.build_user_privileges_sql(&request));
     }
 
     // ==================== DDL SQL Generation Tests ====================
@@ -1677,6 +1714,35 @@ mod tests {
         assert!(sql.contains("UNIQUE INDEX \"idx_email\""));
     }
 
+    #[test]
+    fn test_build_create_table_sql_with_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INTEGER"),
+                ColumnDefinition::new("order_id").data_type("INTEGER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "NO ACTION".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE NO ACTION"
+        ));
+    }
+
     // ==================== ALTER TABLE Tests ====================
 
     #[test]
@@ -1766,6 +1832,49 @@ mod tests {
         let sql = plugin.build_alter_table_sql(&original, &new);
         assert!(sql.contains("create table"));
         assert!(sql.contains("_dg_tmp"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_recreate_preserves_foreign_keys() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INTEGER"),
+                ColumnDefinition::new("order_id").data_type("INTEGER"),
+                ColumnDefinition::new("legacy").data_type("TEXT"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INTEGER"),
+                ColumnDefinition::new("order_id").data_type("INTEGER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "NO ACTION".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert!(sql.contains("create table \"order_items_dg_tmp\""));
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE ON UPDATE NO ACTION"
+        ));
     }
 
     #[test]

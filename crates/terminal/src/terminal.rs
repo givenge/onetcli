@@ -22,6 +22,10 @@ use one_core::gpui_tokio::Tokio;
 use one_core::storage::models::{
     ActiveConnections, ProxyType as StorageProxyType, SerialParams, SshAuthMethod, StoredConnection,
 };
+use one_core::storage::{
+    GlobalStorageState, TerminalCommandHistoryRepository, TerminalCommandHistorySort,
+    TerminalHistoryScope,
+};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
@@ -41,16 +45,16 @@ use std::path::Path;
 
 use crate::history::{
     HistoryEntry, PERSISTED_HISTORY_LIMIT, SESSION_HISTORY_LIMIT, ShellHistoryFormat,
-    collect_history_search_results, collect_history_suggestions_with_cwd, parse_shell_history,
-    push_rich_history_entry,
+    collect_history_search_results, collect_history_suggestions_with_cwd,
+    normalize_recorded_command, parse_shell_history, push_rich_history_entry,
 };
 use crate::pty_backend::{GpuiEventProxy, LocalPtyBackend};
 #[cfg(not(target_os = "windows"))]
 use crate::shell_integration::embedded_shell_integration_script;
 
 use crate::{
-    LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalEvent, TerminalSize,
-    ensure_utf8_locale_env,
+    LocalConfig, SerialBackend, SshBackend, TerminalBackend, TerminalEvent, TerminalExecHandle,
+    TerminalInputHandle, TerminalSize,
 };
 use ssh::{
     ChannelEvent, KeyboardInteractiveRequest, KeyboardInteractiveResponder,
@@ -79,6 +83,8 @@ pub enum TerminalModelEvent {
     Bell,
     /// 子进程已退出
     ChildExit(i32),
+    /// 成功命令历史已写入数据库
+    CommandHistoryChanged,
     /// 终端程序请求存储到剪贴板
     ClipboardStore(String),
     /// 远程工作目录变更（OSC 7）
@@ -109,6 +115,64 @@ fn clear_screen_remote_redraw_bytes(kind: TerminalConnectionKind) -> Option<&'st
     match kind {
         TerminalConnectionKind::Ssh => Some(SSH_CLEAR_SCREEN_REDRAW_BYTES),
         TerminalConnectionKind::Local | TerminalConnectionKind::Serial => None,
+    }
+}
+
+#[derive(Default)]
+struct CommandRecordGate {
+    command_started: bool,
+    exit_code: Option<i32>,
+    recorded_command: Option<String>,
+}
+
+impl CommandRecordGate {
+    fn command_started(&mut self) {
+        self.command_started = true;
+        self.exit_code = None;
+        self.recorded_command = None;
+    }
+
+    fn command_finished(&mut self, exit_code: i32) -> Option<(String, i32)> {
+        if !self.command_started {
+            self.clear();
+            return None;
+        }
+        self.exit_code = Some(exit_code);
+        if exit_code != 0 {
+            self.clear();
+            return None;
+        }
+        self.recorded_command
+            .take()
+            .map(|command| self.accept(command, exit_code))
+    }
+
+    fn command_recorded(&mut self, command: String) -> Option<(String, i32)> {
+        if !self.command_started {
+            return None;
+        }
+        match self.exit_code {
+            Some(0) => Some(self.accept(command, 0)),
+            Some(_) => {
+                self.clear();
+                None
+            }
+            None => {
+                self.recorded_command = Some(command);
+                None
+            }
+        }
+    }
+
+    fn accept(&mut self, command: String, exit_code: i32) -> (String, i32) {
+        self.clear();
+        (command, exit_code)
+    }
+
+    fn clear(&mut self) {
+        self.command_started = false;
+        self.exit_code = None;
+        self.recorded_command = None;
     }
 }
 
@@ -510,18 +574,26 @@ fn prepare_shell_integration(shell: Option<&str>) -> (Vec<(String, String)>, Vec
             return (extra_env, extra_args);
         }
 
-        let script = integration_path.display();
+        let script = shell_escape_arg(&integration_path.to_string_lossy());
+        let onetcli_zdotdir = shell_escape_arg(&zsh_dir.to_string_lossy());
 
         // .zshenv — 恢复原始 ZDOTDIR 并 source 用户的 .zshenv
-        let zshenv = "ZDOTDIR=\"${_ONETCLI_ORIG_ZDOTDIR:-$HOME}\"\n\
-                       [[ -f \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n";
+        let zshenv = format!(
+            "_ONETCLI_ZDOTDIR={onetcli_zdotdir}\n\
+             _ONETCLI_USER_ZDOTDIR=\"${{_ONETCLI_ORIG_ZDOTDIR:-$HOME}}\"\n\
+             ZDOTDIR=\"$_ONETCLI_USER_ZDOTDIR\"\n\
+             [[ -f \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
+             _ONETCLI_USER_ZDOTDIR=\"${{ZDOTDIR:-$_ONETCLI_USER_ZDOTDIR}}\"\n\
+             export _ONETCLI_USER_ZDOTDIR\n\
+             export ZDOTDIR=\"$_ONETCLI_ZDOTDIR\"\n"
+        );
         let _ = fs::write(zsh_dir.join(".zshenv"), zshenv);
 
         // .zshrc — 恢复 ZDOTDIR，source 用户 .zshrc，再 source 集成脚本
         let zshrc = format!(
-            "ZDOTDIR=\"${{_ONETCLI_ORIG_ZDOTDIR:-$HOME}}\"\n\
+            "ZDOTDIR=\"${{_ONETCLI_USER_ZDOTDIR:-${{_ONETCLI_ORIG_ZDOTDIR:-$HOME}}}}\"\n\
              [[ -f \"$ZDOTDIR/.zshrc\" ]] && source \"$ZDOTDIR/.zshrc\"\n\
-             source \"{script}\"\n"
+             source {script}\n"
         );
         let _ = fs::write(zsh_dir.join(".zshrc"), zshrc);
 
@@ -592,6 +664,47 @@ fn load_local_history(preferred_shell: Option<&str>) -> Vec<String> {
         .filter_map(|(path, format)| fs::read_to_string(path).ok().map(|text| (text, format)))
         .flat_map(|(text, format)| parse_shell_history(&text, format))
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn with_local_terminal_default_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    const GUI_FALLBACK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    const MACOS_CLI_PATHS: &[&str] = &[
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ];
+
+    let path = env
+        .iter()
+        .find_map(|(key, value)| (key == "PATH").then_some(value.clone()))
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_else(|| GUI_FALLBACK_PATH.to_string());
+    let mut path_parts: Vec<String> = path
+        .split(':')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    for cli_path in MACOS_CLI_PATHS.iter().rev() {
+        if !path_parts.iter().any(|part| part == cli_path) {
+            path_parts.insert(0, (*cli_path).to_string());
+        }
+    }
+
+    let merged_path = path_parts.join(":");
+    if let Some((_, value)) = env.iter_mut().find(|(key, _)| key == "PATH") {
+        *value = merged_path;
+    } else {
+        env.push(("PATH".to_string(), merged_path));
+    }
+    env
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_local_terminal_default_env(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    env
 }
 
 fn build_remote_history_load_command() -> String {
@@ -695,6 +808,12 @@ pub struct Terminal {
     session_history: VecDeque<HistoryEntry>,
     /// 从 shell 历史文件加载的持久化历史
     persisted_history: Vec<String>,
+    /// 成功命令历史数据库仓库
+    history_repository: Option<Arc<TerminalCommandHistoryRepository>>,
+    /// 当前终端对应的历史 scope
+    history_scope: Option<TerminalHistoryScope>,
+    /// OSC 命令记录 gate：只有 exit_code=0 的命令会被接收
+    command_record_gate: CommandRecordGate,
     /// 当前连接尝试代次，用于忽略过期的异步回调
     connection_generation: u64,
 
@@ -764,6 +883,65 @@ impl TerminalScrollProxy {
     }
 }
 
+fn visible_text_from_term(term: &Arc<FairMutex<Term<GpuiEventProxy>>>) -> String {
+    let term = term.lock();
+    let grid = term.grid();
+    let display_offset = grid.display_offset();
+    let mut lines = Vec::with_capacity(term.screen_lines());
+
+    for screen_line in 0..term.screen_lines() {
+        let grid_line = screen_line as i32 - display_offset as i32;
+        if grid_line < -(term.history_size() as i32) || grid_line >= term.screen_lines() as i32 {
+            lines.push(String::new());
+            continue;
+        }
+
+        let line = &grid[Line(grid_line)];
+        let text: String = line[..].iter().map(|cell| cell.c).collect();
+        lines.push(
+            text.trim_end_matches(|ch: char| ch == ' ' || ch == '\0')
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
+}
+
+fn merge_history_matches(primary: Vec<String>, fallback: Vec<String>, limit: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for command in primary.into_iter().chain(fallback) {
+        if seen.insert(command.clone()) {
+            merged.push(command);
+        }
+        if merged.len() >= limit {
+            break;
+        }
+    }
+    merged
+}
+
+fn normalize_history_matches(
+    commands: Vec<String>,
+    history_user: Option<&str>,
+    limit: usize,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut normalized = Vec::new();
+    for command in commands {
+        let Some(command) = normalize_recorded_command(&command, history_user) else {
+            continue;
+        };
+        if seen.insert(command.clone()) {
+            normalized.push(command);
+        }
+        if normalized.len() >= limit {
+            break;
+        }
+    }
+    normalized
+}
+
 impl Terminal {
     fn new_local_disconnected(error: String, cx: &mut Context<Self>) -> Self {
         let (event_tx, event_rx) = unbounded_channel::<TerminalEvent>();
@@ -794,6 +972,9 @@ impl Terminal {
             init_commands: None,
             session_history: VecDeque::new(),
             persisted_history: Vec::new(),
+            history_repository: Self::history_repository(cx),
+            history_scope: Some(TerminalHistoryScope::local()),
+            command_record_gate: CommandRecordGate::default(),
             connection_generation: 0,
             connection_kind: TerminalConnectionKind::Local,
         }
@@ -834,7 +1015,7 @@ impl Terminal {
         // 合并用户环境变量与 Shell Integration 环境变量
         let mut env_pairs = env;
         env_pairs.extend(integration_env);
-        ensure_utf8_locale_env(&mut env_pairs);
+        env_pairs = with_local_terminal_default_env(env_pairs);
 
         let pty_options = PtyOptions {
             shell: build_local_shell(shell, shell_args),
@@ -848,6 +1029,7 @@ impl Terminal {
 
         Self::spawn_event_loop(event_rx, event_proxy.wakeup_pending_handle(), cx);
         Self::spawn_local_history_loader(history_shell.as_deref(), cx);
+        let history_repository = Self::history_repository(cx);
 
         Ok(Self {
             term,
@@ -871,6 +1053,9 @@ impl Terminal {
             init_commands: None,
             session_history: VecDeque::new(),
             persisted_history: Vec::new(),
+            history_repository,
+            history_scope: Some(TerminalHistoryScope::local()),
+            command_record_gate: CommandRecordGate::default(),
             connection_generation: 0,
             connection_kind: TerminalConnectionKind::Local,
         })
@@ -1012,6 +1197,8 @@ impl Terminal {
             cx,
         );
         Self::spawn_ssh_history_loader(ssh_session_manager.clone(), cx);
+        let history_repository = Self::history_repository(cx);
+        let history_scope = conn.id.map(TerminalHistoryScope::ssh);
 
         Self {
             term,
@@ -1035,6 +1222,9 @@ impl Terminal {
             init_commands,
             session_history: VecDeque::new(),
             persisted_history: Vec::new(),
+            history_repository,
+            history_scope,
+            command_record_gate: CommandRecordGate::default(),
             connection_generation,
             connection_kind: TerminalConnectionKind::Ssh,
         }
@@ -1085,9 +1275,17 @@ impl Terminal {
             init_commands: None,
             session_history: VecDeque::new(),
             persisted_history: Vec::new(),
+            history_repository: None,
+            history_scope: None,
+            command_record_gate: CommandRecordGate::default(),
             connection_generation,
             connection_kind: TerminalConnectionKind::Serial,
         }
+    }
+
+    fn history_repository(cx: &mut Context<Self>) -> Option<Arc<TerminalCommandHistoryRepository>> {
+        cx.try_global::<GlobalStorageState>()
+            .and_then(|state| state.storage.get::<TerminalCommandHistoryRepository>())
     }
 
     fn next_connection_generation(&mut self) -> u64 {
@@ -1423,11 +1621,54 @@ impl Terminal {
         }
     }
 
-    fn record_history_entry(&mut self, command: &str, cx: &mut Context<Self>) {
-        let entry =
-            HistoryEntry::new(command.to_string()).with_cwd(self.current_working_dir.clone());
-        if push_rich_history_entry(&mut self.session_history, entry, SESSION_HISTORY_LIMIT) {
+    fn record_successful_history_entry(
+        &mut self,
+        command: &str,
+        exit_code: i32,
+        cx: &mut Context<Self>,
+    ) {
+        let history_user = self.history_record_user();
+        let Some(command) = normalize_recorded_command(command, history_user.as_deref()) else {
+            return;
+        };
+        let cwd = self.current_working_dir.clone();
+        let entry = HistoryEntry::new(command.clone())
+            .with_cwd(cwd.clone())
+            .with_exit_code(Some(exit_code));
+        let changed =
+            push_rich_history_entry(&mut self.session_history, entry, SESSION_HISTORY_LIMIT);
+        let mut command_history_changed = false;
+        if let (Some(repo), Some(scope)) = (&self.history_repository, &self.history_scope) {
+            match repo.record_success(scope, &command, cwd.as_deref(), Some(exit_code)) {
+                Ok(Some(_)) => command_history_changed = true,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to record terminal command history");
+                }
+            }
+        }
+        if command_history_changed {
+            cx.emit(TerminalModelEvent::CommandHistoryChanged);
+        }
+        if changed {
             cx.emit(TerminalModelEvent::Wakeup);
+        }
+    }
+
+    fn history_record_user(&self) -> Option<String> {
+        match self.connection_kind {
+            TerminalConnectionKind::Ssh => self
+                .ssh_config
+                .as_ref()
+                .map(|config| config.ssh_config.username.clone()),
+            TerminalConnectionKind::Local => std::env::var("USER").ok(),
+            TerminalConnectionKind::Serial => None,
+        }
+    }
+
+    fn accept_recorded_command(&mut self, accepted: Option<(String, i32)>, cx: &mut Context<Self>) {
+        if let Some((command, exit_code)) = accepted {
+            self.record_successful_history_entry(&command, exit_code, cx);
         }
     }
 
@@ -1468,6 +1709,7 @@ impl Terminal {
                 cx.emit(TerminalModelEvent::InputStart);
             }
             TerminalEvent::CommandStart => {
+                self.command_record_gate.command_started();
                 cx.emit(TerminalModelEvent::CommandStart);
             }
             TerminalEvent::TitleChanged(title) => {
@@ -1492,15 +1734,13 @@ impl Terminal {
                 cx.emit(TerminalModelEvent::WorkingDirChanged(path));
             }
             TerminalEvent::CommandFinished { exit_code } => {
-                // 命令执行完毕（OSC 133;D）— 将退出码记录到最后一条历史条目
                 tracing::debug!("命令执行完毕，退出码: {}", exit_code);
-                if let Some(last) = self.session_history.back_mut() {
-                    last.exit_code = Some(exit_code);
-                }
-                cx.emit(TerminalModelEvent::CommandFinished(exit_code));
+                let accepted = self.command_record_gate.command_finished(exit_code);
+                self.accept_recorded_command(accepted, cx);
             }
             TerminalEvent::CommandRecorded(command) => {
-                self.record_history_entry(&command, cx);
+                let accepted = self.command_record_gate.command_recorded(command);
+                self.accept_recorded_command(accepted, cx);
             }
         }
     }
@@ -1571,46 +1811,59 @@ impl Terminal {
 
     /// 获取当前可见屏幕文本，供外部只读集成使用。
     pub fn visible_text(&self) -> String {
-        let term = self.term.lock();
-        let grid = term.grid();
-        let display_offset = grid.display_offset();
-        let mut lines = Vec::with_capacity(term.screen_lines());
-
-        for screen_line in 0..term.screen_lines() {
-            let grid_line = screen_line as i32 - display_offset as i32;
-            if grid_line < -(term.history_size() as i32) || grid_line >= term.screen_lines() as i32
-            {
-                lines.push(String::new());
-                continue;
-            }
-
-            let line = &grid[Line(grid_line)];
-            let text: String = line[..].iter().map(|cell| cell.c).collect();
-            lines.push(
-                text.trim_end_matches(|c: char| c == ' ' || c == '\0')
-                    .to_string(),
-            );
-        }
-
-        lines.join("\n")
+        visible_text_from_term(&self.term)
     }
 
     pub fn history_suggestions(&self, prefix: &str, limit: usize) -> Vec<String> {
-        collect_history_suggestions_with_cwd(
+        let history_user = self.history_record_user();
+        let db_matches = self
+            .history_repository
+            .as_ref()
+            .zip(self.history_scope.as_ref())
+            .and_then(|(repo, scope)| repo.suggestions(scope, prefix, limit).ok())
+            .unwrap_or_default();
+        let db_matches = normalize_history_matches(db_matches, history_user.as_deref(), limit);
+        let fallback = collect_history_suggestions_with_cwd(
             &self.session_history,
             &self.persisted_history,
             prefix,
             limit,
             self.current_working_dir.as_deref(),
-        )
+        );
+        merge_history_matches(db_matches, fallback, limit)
     }
 
     pub fn history_search_results(&self, query: &str, limit: usize) -> Vec<String> {
-        collect_history_search_results(&self.session_history, &self.persisted_history, query, limit)
+        let history_user = self.history_record_user();
+        let db_matches = self
+            .history_repository
+            .as_ref()
+            .zip(self.history_scope.as_ref())
+            .and_then(|(repo, scope)| {
+                repo.list(
+                    scope,
+                    TerminalCommandHistorySort::Latest,
+                    (!query.trim().is_empty()).then_some(query),
+                    limit,
+                )
+                .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.command)
+            .collect();
+        let db_matches = normalize_history_matches(db_matches, history_user.as_deref(), limit);
+        let fallback = collect_history_search_results(
+            &self.session_history,
+            &self.persisted_history,
+            query,
+            limit,
+        );
+        merge_history_matches(db_matches, fallback, limit)
     }
 
     pub fn record_command(&mut self, command: &str, cx: &mut Context<Self>) {
-        self.record_history_entry(command, cx);
+        self.record_successful_history_entry(command, 0, cx);
     }
 
     /// 获取 SSH 连接配置（仅 SSH 终端）
@@ -1654,6 +1907,18 @@ impl Terminal {
     /// 写入来自外部集成的输入，例如 Public MCP。
     pub fn write_external_input(&self, data: &[u8]) {
         self.write(data);
+    }
+
+    pub fn external_input_handle(&self) -> Option<TerminalInputHandle> {
+        self.backend
+            .as_ref()
+            .and_then(|backend| backend.input_handle())
+    }
+
+    pub fn external_exec_handle(&self) -> Option<TerminalExecHandle> {
+        self.backend
+            .as_ref()
+            .and_then(|backend| backend.exec_handle())
     }
 
     /// 调整终端大小
@@ -1774,6 +2039,7 @@ impl Terminal {
                         generation,
                         cx,
                     );
+                    Self::spawn_ssh_history_loader(session_manager.clone(), cx);
                 });
             })
             .detach();
@@ -1943,11 +2209,12 @@ impl EventEmitter<TerminalModelEvent> for Terminal {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionState, Terminal, TerminalConnectionKind, TerminalMfaPrompt, TerminalMfaRequest,
-        TerminalMfaResponder, build_cd_command, build_ssh_base_init_commands,
+        CommandRecordGate, ConnectionState, Terminal, TerminalConnectionKind, TerminalMfaPrompt,
+        TerminalMfaRequest, TerminalMfaResponder, build_cd_command, build_ssh_base_init_commands,
         build_ssh_init_commands, clear_screen_remote_redraw_bytes, compose_ssh_init_commands,
-        format_connection_error, keyboard_interactive_answers_for_terminal,
-        resolve_default_windows_shell_from_env, resolve_local_working_dir, shell_escape_arg,
+        format_connection_error, keyboard_interactive_answers_for_terminal, merge_history_matches,
+        normalize_history_matches, resolve_default_windows_shell_from_env,
+        resolve_local_working_dir, shell_escape_arg, with_local_terminal_default_env,
     };
     use crate::TerminalEvent;
     use crate::history::{
@@ -1961,6 +2228,7 @@ mod tests {
     use ssh::{KeyboardInteractiveRequest, KeyboardInteractiveResponder};
     use std::collections::VecDeque;
     use std::fs;
+    use std::process::Command;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
@@ -1998,6 +2266,101 @@ mod tests {
     }
 
     #[test]
+    fn command_record_gate_accepts_success_when_finish_precedes_record() {
+        let mut gate = CommandRecordGate::default();
+
+        gate.command_started();
+        assert_eq!(None, gate.command_finished(0));
+
+        assert_eq!(
+            Some(("git status".to_string(), 0)),
+            gate.command_recorded("git status".to_string())
+        );
+    }
+
+    #[test]
+    fn command_record_gate_accepts_success_when_record_precedes_finish() {
+        let mut gate = CommandRecordGate::default();
+
+        gate.command_started();
+        assert_eq!(None, gate.command_recorded("cargo test".to_string()));
+
+        assert_eq!(
+            Some(("cargo test".to_string(), 0)),
+            gate.command_finished(0)
+        );
+    }
+
+    #[test]
+    fn command_record_gate_discards_failed_commands() {
+        let mut gate = CommandRecordGate::default();
+
+        gate.command_started();
+        gate.command_finished(127);
+
+        assert_eq!(None, gate.command_recorded("missing-command".to_string()));
+    }
+
+    #[test]
+    fn command_record_gate_discards_record_without_command_start() {
+        let mut gate = CommandRecordGate::default();
+
+        assert_eq!(None, gate.command_recorded("git status".to_string()));
+        assert_eq!(None, gate.command_finished(0));
+    }
+
+    #[test]
+    fn merge_history_matches_prefers_database_and_deduplicates_fallback() {
+        let merged = merge_history_matches(
+            vec!["git status".to_string(), "cargo test".to_string()],
+            vec![
+                "git status".to_string(),
+                "git stash".to_string(),
+                "cargo test".to_string(),
+            ],
+            4,
+        );
+
+        assert_eq!(
+            vec![
+                "git status".to_string(),
+                "cargo test".to_string(),
+                "git stash".to_string(),
+            ],
+            merged
+        );
+    }
+
+    #[test]
+    fn merge_history_matches_respects_limit() {
+        let merged = merge_history_matches(
+            vec!["first".to_string(), "second".to_string()],
+            vec!["third".to_string()],
+            2,
+        );
+
+        assert_eq!(vec!["first".to_string(), "second".to_string()], merged);
+    }
+
+    #[test]
+    fn normalize_history_matches_strips_recorded_prefix_and_deduplicates() {
+        let matches = normalize_history_matches(
+            vec![
+                "2026-07-05 08:07:16 root cd /data/app".to_string(),
+                "cd /data/app".to_string(),
+                "git status".to_string(),
+            ],
+            Some("root"),
+            10,
+        );
+
+        assert_eq!(
+            vec!["cd /data/app".to_string(), "git status".to_string()],
+            matches
+        );
+    }
+
+    #[test]
     fn resolve_local_working_dir_uses_home_when_unspecified() {
         assert_eq!(dirs::home_dir(), resolve_local_working_dir(None));
     }
@@ -2016,6 +2379,24 @@ mod tests {
             dirs::home_dir(),
             resolve_local_working_dir(Some("  ".to_string()))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_local_terminal_default_env_adds_homebrew_paths_to_existing_path() {
+        let env = with_local_terminal_default_env(vec![(
+            "PATH".to_string(),
+            "/usr/bin:/bin".to_string(),
+        )]);
+        let path = env
+            .iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value.as_str()))
+            .expect("local terminal env should include PATH");
+
+        assert!(path.contains("/opt/homebrew/bin"));
+        assert!(path.contains("/opt/homebrew/sbin"));
+        assert!(path.contains("/usr/local/bin"));
+        assert!(path.ends_with("/usr/bin:/bin"));
     }
 
     #[test]
@@ -2111,6 +2492,51 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&session_dir);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn zsh_shell_integration_sources_generated_zshrc() {
+        let zsh = std::path::Path::new("/bin/zsh");
+        if !zsh.exists() {
+            return;
+        }
+
+        let session_dir = std::env::temp_dir().join(format!("onetcli-{}", std::process::id()));
+        let home_dir =
+            std::env::temp_dir().join(format!("onetcli-zsh-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&session_dir);
+        let _ = fs::remove_dir_all(&home_dir);
+        fs::create_dir_all(&home_dir).expect("应创建临时 HOME");
+
+        let (env_pairs, args) = super::prepare_shell_integration(Some("/bin/zsh"));
+        assert!(args.is_empty(), "zsh 注入不应依赖额外启动参数");
+
+        let mut command = Command::new(zsh);
+        command
+            .arg("-i")
+            .arg("-c")
+            .arg("print -r -- ${_ONETCLI_SHELL_INTEGRATED:-missing}")
+            .env("HOME", &home_dir);
+        for (key, value) in env_pairs {
+            command.env(key, value);
+        }
+        command.env("_ONETCLI_ORIG_ZDOTDIR", &home_dir);
+
+        let output = command.output().expect("应能启动 zsh");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.lines().any(|line| line == "1"),
+            "zsh 应加载生成的 .zshrc 并 source shell integration，stdout: {stdout:?}"
+        );
+        assert!(
+            !stderr.contains("recursion limit") && !stderr.contains("job table full"),
+            "zsh integration 不应递归 source 临时 .zshrc，stderr: {stderr:?}"
+        );
+
+        let _ = fs::remove_dir_all(&session_dir);
+        let _ = fs::remove_dir_all(&home_dir);
     }
 
     #[test]
@@ -2352,6 +2778,9 @@ mod tests {
             init_commands: None,
             session_history: VecDeque::new(),
             persisted_history: Vec::new(),
+            history_repository: None,
+            history_scope: None,
+            command_record_gate: CommandRecordGate::default(),
             connection_generation: 1,
             connection_kind: TerminalConnectionKind::Ssh,
         };

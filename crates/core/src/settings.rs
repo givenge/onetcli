@@ -2,7 +2,7 @@ use crate::cloud_sync::{GlobalCloudUser, UserInfo};
 use crate::storage::get_config_dir;
 use crate::utils::auto_save_config::AutoSaveConfig;
 use gpui::http_client::Url;
-use gpui::{App, Global};
+use gpui::{App, Font, FontFallbacks, Global, font};
 use gpui_component::{Theme, ThemeMode};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -74,6 +74,30 @@ pub enum LargeTextCellEditorOpenMode {
     #[default]
     SidebarPreview,
     Dialog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupDefaultPage {
+    #[default]
+    Home,
+    AiWorkbench,
+}
+
+impl StartupDefaultPage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StartupDefaultPage::Home => "home",
+            StartupDefaultPage::AiWorkbench => "ai_workbench",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "home" => StartupDefaultPage::Home,
+            _ => StartupDefaultPage::AiWorkbench,
+        }
+    }
 }
 
 impl LargeTextCellEditorOpenMode {
@@ -259,12 +283,24 @@ impl McpPermissionMode {
             _ => McpPermissionMode::Deny,
         }
     }
+
+    pub fn profile_id(&self) -> &'static str {
+        match self {
+            McpPermissionMode::Deny => "safe",
+            McpPermissionMode::Ask => "confirm",
+            McpPermissionMode::Allow => "auto",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpToolsetSettings {
+pub struct ToolExposureToolsetSettings {
     #[serde(default = "default_true")]
     pub terminal: bool,
+    #[serde(default = "default_true")]
+    pub terminal_ssh_exec: bool,
+    #[serde(default = "default_true")]
+    pub terminal_exec: bool,
     #[serde(default = "default_true")]
     pub connections: bool,
     #[serde(default)]
@@ -277,15 +313,55 @@ pub struct McpToolsetSettings {
     pub internal_functions: bool,
 }
 
-impl Default for McpToolsetSettings {
-    fn default() -> Self {
+impl ToolExposureToolsetSettings {
+    pub fn public_mcp_default() -> Self {
         Self {
             terminal: true,
+            terminal_ssh_exec: true,
+            terminal_exec: true,
             connections: true,
             sftp: false,
             database: false,
             redis: false,
             internal_functions: false,
+        }
+    }
+
+    pub fn agent_default() -> Self {
+        Self {
+            terminal: true,
+            terminal_ssh_exec: true,
+            terminal_exec: true,
+            connections: true,
+            sftp: true,
+            database: true,
+            redis: true,
+            internal_functions: true,
+        }
+    }
+}
+
+impl Default for ToolExposureToolsetSettings {
+    fn default() -> Self {
+        Self::public_mcp_default()
+    }
+}
+
+pub type McpToolsetSettings = ToolExposureToolsetSettings;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExposureSettings {
+    #[serde(default = "ToolExposureToolsetSettings::public_mcp_default")]
+    pub mcp: ToolExposureToolsetSettings,
+    #[serde(default = "ToolExposureToolsetSettings::agent_default")]
+    pub agent: ToolExposureToolsetSettings,
+}
+
+impl Default for ToolExposureSettings {
+    fn default() -> Self {
+        Self {
+            mcp: ToolExposureToolsetSettings::public_mcp_default(),
+            agent: ToolExposureToolsetSettings::agent_default(),
         }
     }
 }
@@ -298,8 +374,8 @@ pub struct McpSettings {
     pub server_mode: McpServerMode,
     #[serde(default)]
     pub permission_mode: McpPermissionMode,
-    #[serde(default)]
-    pub toolsets: McpToolsetSettings,
+    #[serde(default, rename = "toolsets", skip_serializing)]
+    pub legacy_toolsets: Option<ToolExposureToolsetSettings>,
 }
 
 impl Default for McpSettings {
@@ -308,10 +384,13 @@ impl Default for McpSettings {
             server_enabled: false,
             server_mode: McpServerMode::Temporary,
             permission_mode: McpPermissionMode::Deny,
-            toolsets: McpToolsetSettings::default(),
+            legacy_toolsets: None,
         }
     }
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiChatSettings {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomFont {
@@ -347,61 +426,90 @@ where
         .collect())
 }
 
-const DEFAULT_WEBDAV_BACKUP_REMOTE_DIR: &str = "onetcli-backup";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalSyncBackendKind {
+    #[default]
+    Folder,
+    Git,
+}
+
+impl PersonalSyncBackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Folder => "folder",
+            Self::Git => "git",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "git" => Self::Git,
+            _ => Self::Folder,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncProvider {
+    #[default]
+    OnetCloud,
+    Personal,
+}
+
+impl SyncProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OnetCloud => "onet_cloud",
+            Self::Personal => "personal",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "personal" => Self::Personal,
+            _ => Self::OnetCloud,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WebDavBackupSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default = "default_webdav_backup_remote_dir")]
-    pub remote_dir: String,
+pub struct PersonalGitSyncSettings {
+    #[serde(default = "default_true")]
+    pub auto_push: bool,
 }
 
-fn default_webdav_backup_remote_dir() -> String {
-    DEFAULT_WEBDAV_BACKUP_REMOTE_DIR.to_string()
-}
-
-impl Default for WebDavBackupSettings {
+impl Default for PersonalGitSyncSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            endpoint: String::new(),
-            username: String::new(),
-            password: String::new(),
-            remote_dir: default_webdav_backup_remote_dir(),
+            auto_push: default_true(),
         }
     }
 }
 
-impl WebDavBackupSettings {
-    pub fn validate_for_backup(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Err("请先在设置中启用 WebDAV 备份".to_string());
-        }
-        self.validate_endpoint()
-    }
-
-    pub fn validate_endpoint(&self) -> Result<(), String> {
-        let endpoint = self.endpoint.trim();
-        if endpoint.is_empty() {
-            return Err("WebDAV 地址不能为空".to_string());
-        }
-        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-            return Err("WebDAV 地址必须以 http:// 或 https:// 开头".to_string());
-        }
-        if self.username.trim().is_empty() && !self.password.is_empty() {
-            return Err("填写 WebDAV 密码时必须同时填写用户名".to_string());
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalSyncSettings {
+    #[serde(default)]
+    pub backend: PersonalSyncBackendKind,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_true")]
+    pub auto_sync: bool,
+    #[serde(default)]
+    pub git: PersonalGitSyncSettings,
 }
 
+impl Default for PersonalSyncSettings {
+    fn default() -> Self {
+        Self {
+            backend: PersonalSyncBackendKind::Folder,
+            path: String::new(),
+            auto_sync: default_true(),
+            git: PersonalGitSyncSettings::default(),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_locale")]
@@ -434,7 +542,7 @@ pub struct AppSettings {
     pub terminal_enable_autocomplete: bool,
     #[serde(default = "default_true")]
     pub terminal_middle_click_paste: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub terminal_sync_path_with_terminal: bool,
     #[serde(default = "default_terminal_theme")]
     pub terminal_theme: String,
@@ -449,15 +557,23 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub auto_update: bool,
     #[serde(default)]
+    pub sync_provider: SyncProvider,
+    #[serde(default)]
     pub global_proxy: GlobalProxySettings,
     #[serde(default)]
     pub mcp: McpSettings,
     #[serde(default)]
-    pub webdav_backup: WebDavBackupSettings,
+    pub tool_exposure: ToolExposureSettings,
+    #[serde(default)]
+    pub ai_chat: AiChatSettings,
+    #[serde(default)]
+    pub personal_sync: PersonalSyncSettings,
     #[serde(default)]
     pub database_open_mode: DatabaseOpenMode,
     #[serde(default)]
     pub large_text_cell_editor_open_mode: LargeTextCellEditorOpenMode,
+    #[serde(default)]
+    pub startup_default_page: StartupDefaultPage,
     /// 是否启用SQL查询的自动保存功能
     #[serde(default = "default_true")]
     pub enable_sql_auto_save: bool,
@@ -495,6 +611,10 @@ fn default_font_size() -> f64 {
 }
 
 fn default_monospace_font_family() -> String {
+    default_grid_monospace_font_family().to_string()
+}
+
+pub fn default_grid_monospace_font_family() -> &'static str {
     if cfg!(target_os = "macos") {
         "Menlo"
     } else if cfg!(target_os = "windows") {
@@ -502,7 +622,170 @@ fn default_monospace_font_family() -> String {
     } else {
         "DejaVu Sans Mono"
     }
-    .to_string()
+}
+
+fn grid_monospace_resolution_candidates() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "Menlo",
+            "Monaco",
+            "SF Mono",
+            "Courier New",
+            "Fira Code",
+            "JetBrains Mono",
+            "Source Code Pro",
+            "Cascadia Code",
+            "Hack",
+            "IBM Plex Mono",
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            "Consolas",
+            "Cascadia Mono",
+            "Cascadia Code",
+            "Courier New",
+            "Lucida Console",
+            "Fira Code",
+            "JetBrains Mono",
+            "Source Code Pro",
+            "Hack",
+            "IBM Plex Mono",
+        ]
+    } else {
+        &[
+            "DejaVu Sans Mono",
+            "Ubuntu Mono",
+            "Liberation Mono",
+            "Courier New",
+            "Fira Code",
+            "JetBrains Mono",
+            "Source Code Pro",
+            "Cascadia Code",
+            "Hack",
+            "IBM Plex Mono",
+        ]
+    }
+}
+
+fn is_fallback_only_grid_font(font: &str) -> bool {
+    [
+        "Apple Color Emoji",
+        "Apple Symbols",
+        "Heiti SC",
+        "Hiragino Sans GB",
+        "Kaiti SC",
+        "Microsoft YaHei",
+        "Noto Color Emoji",
+        "Noto Sans CJK SC",
+        "Noto Sans Mono CJK SC",
+        "Noto Sans SC",
+        "Noto Serif CJK SC",
+        "PingFang SC",
+        "PingFang TC",
+        "Segoe UI Emoji",
+        "SimSun",
+        "Songti SC",
+        "Source Han Mono SC",
+        "Source Han Sans SC",
+        "WenQuanYi Micro Hei",
+    ]
+    .iter()
+    .any(|fallback| fallback.eq_ignore_ascii_case(font.trim()))
+}
+
+pub fn is_supported_grid_monospace_font(font: &str) -> bool {
+    let font = font.trim();
+    !font.is_empty() && !is_fallback_only_grid_font(font)
+}
+
+pub fn normalize_grid_monospace_font_family(font: &str) -> String {
+    let font = font.trim();
+    if is_supported_grid_monospace_font(font) {
+        return font.to_string();
+    }
+    default_grid_monospace_font_family().to_string()
+}
+
+pub fn is_installed_font_family(font: &str, installed_font_names: &[String]) -> bool {
+    let font = font.trim();
+    !font.is_empty()
+        && installed_font_names
+            .iter()
+            .any(|installed| installed.trim().eq_ignore_ascii_case(font))
+}
+
+pub fn resolve_installed_grid_monospace_font_family(
+    font_family: &str,
+    installed_font_names: &[String],
+) -> String {
+    let normalized = normalize_grid_monospace_font_family(font_family);
+    if is_installed_font_family(&normalized, installed_font_names) {
+        return normalized;
+    }
+
+    grid_monospace_resolution_candidates()
+        .iter()
+        .copied()
+        .find(|candidate| is_installed_font_family(candidate, installed_font_names))
+        .unwrap_or(default_grid_monospace_font_family())
+        .to_string()
+}
+
+pub fn default_grid_font_fallback_families() -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        vec![
+            "PingFang SC",
+            "PingFang TC",
+            "Hiragino Sans GB",
+            "Noto Sans CJK SC",
+            "Noto Sans Mono CJK SC",
+            "Source Han Sans SC",
+            "Source Han Mono SC",
+            "Apple Color Emoji",
+            "Apple Symbols",
+        ]
+    } else if cfg!(target_os = "windows") {
+        vec![
+            "Microsoft YaHei",
+            "SimSun",
+            "Noto Sans CJK SC",
+            "Noto Sans Mono CJK SC",
+            "Source Han Sans SC",
+            "Source Han Mono SC",
+            "Segoe UI Emoji",
+        ]
+    } else {
+        vec![
+            "Noto Sans CJK SC",
+            "Noto Sans Mono CJK SC",
+            "Source Han Sans SC",
+            "Source Han Mono SC",
+            "WenQuanYi Micro Hei",
+            "Noto Color Emoji",
+        ]
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn grid_monospace_font(font_family: &str) -> Font {
+    let mut font = font(normalize_grid_monospace_font_family(font_family));
+    font.fallbacks = Some(FontFallbacks::from_fonts(
+        default_grid_font_fallback_families(),
+    ));
+    font
+}
+
+pub fn installed_grid_monospace_font(font_family: &str, installed_font_names: &[String]) -> Font {
+    let mut font = font(resolve_installed_grid_monospace_font_family(
+        font_family,
+        installed_font_names,
+    ));
+    font.fallbacks = Some(FontFallbacks::from_fonts(
+        default_grid_font_fallback_families(),
+    ));
+    font
 }
 
 fn default_terminal_font_size() -> f64 {
@@ -553,18 +836,22 @@ impl Default for AppSettings {
             terminal_auto_copy: default_true(),
             terminal_enable_autocomplete: default_true(),
             terminal_middle_click_paste: default_true(),
-            terminal_sync_path_with_terminal: false,
+            terminal_sync_path_with_terminal: true,
             terminal_theme: default_terminal_theme(),
             terminal_cursor_blink: false,
             terminal_confirm_multiline_paste: default_true(),
             terminal_confirm_high_risk_command: default_true(),
             log_file_path: String::new(),
             auto_update: true,
+            sync_provider: SyncProvider::OnetCloud,
             global_proxy: GlobalProxySettings::default(),
             mcp: McpSettings::default(),
-            webdav_backup: WebDavBackupSettings::default(),
+            tool_exposure: ToolExposureSettings::default(),
+            ai_chat: AiChatSettings::default(),
+            personal_sync: PersonalSyncSettings::default(),
             database_open_mode: DatabaseOpenMode::default(),
             large_text_cell_editor_open_mode: LargeTextCellEditorOpenMode::default(),
+            startup_default_page: StartupDefaultPage::default(),
             enable_sql_auto_save: true,
             sql_auto_save_interval: default_auto_save_interval(),
             system_hotkey_macos: default_system_hotkey_macos(),
@@ -579,6 +866,24 @@ impl Default for AppSettings {
 impl Global for AppSettings {}
 
 impl AppSettings {
+    fn migrate_legacy_mcp_toolsets(&mut self) {
+        let Some(toolsets) = self.mcp.legacy_toolsets.take() else {
+            return;
+        };
+        if self.tool_exposure.mcp == ToolExposureToolsetSettings::public_mcp_default() {
+            self.tool_exposure.mcp = toolsets;
+        }
+    }
+
+    pub fn normalize_font_settings(&mut self) {
+        self.sql_editor_font_family =
+            normalize_grid_monospace_font_family(&self.sql_editor_font_family);
+        self.table_preview_font_family =
+            normalize_grid_monospace_font_family(&self.table_preview_font_family);
+        self.terminal_font_family =
+            normalize_grid_monospace_font_family(&self.terminal_font_family);
+    }
+
     pub fn current(cx: &App) -> Self {
         cx.try_global::<AppSettings>().cloned().unwrap_or_default()
     }
@@ -594,12 +899,14 @@ impl AppSettings {
     pub fn update(cx: &mut App, update: impl FnOnce(&mut AppSettings)) {
         let mut settings = Self::current(cx);
         update(&mut settings);
+        settings.normalize_font_settings();
         cx.set_global(settings);
     }
 
     pub fn update_and_save(cx: &mut App, update: impl FnOnce(&mut AppSettings)) {
         let mut settings = Self::current(cx);
         update(&mut settings);
+        settings.normalize_font_settings();
         settings.save();
         cx.set_global(settings);
     }
@@ -630,9 +937,11 @@ impl AppSettings {
         }
 
         match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(settings) => {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(mut settings) => {
                     info!("Settings loaded from {:?}", path);
+                    settings.migrate_legacy_mcp_toolsets();
+                    settings.normalize_font_settings();
                     settings
                 }
                 Err(e) => {
@@ -707,7 +1016,10 @@ impl AppSettings {
 mod tests {
     use super::{
         AppSettings, CustomFont, LOCALE_SYSTEM, LargeTextCellEditorOpenMode, McpPermissionMode,
-        McpServerMode,
+        McpServerMode, PersonalSyncBackendKind, StartupDefaultPage, SyncProvider,
+        default_grid_font_fallback_families, default_grid_monospace_font_family,
+        grid_monospace_font, installed_grid_monospace_font, is_installed_font_family,
+        resolve_installed_grid_monospace_font_family,
     };
 
     #[test]
@@ -733,11 +1045,27 @@ mod tests {
         assert!(!settings.mcp.server_enabled);
         assert_eq!(settings.mcp.server_mode, McpServerMode::Temporary);
         assert_eq!(settings.mcp.permission_mode, McpPermissionMode::Deny);
-        assert!(settings.mcp.toolsets.terminal);
-        assert!(settings.mcp.toolsets.connections);
-        assert!(!settings.mcp.toolsets.database);
-        assert!(!settings.mcp.toolsets.redis);
-        assert!(!settings.mcp.toolsets.sftp);
+        assert!(settings.tool_exposure.mcp.terminal);
+        assert!(settings.tool_exposure.mcp.terminal_ssh_exec);
+        assert!(settings.tool_exposure.mcp.terminal_exec);
+        assert!(settings.tool_exposure.mcp.connections);
+        assert!(!settings.tool_exposure.mcp.database);
+        assert!(!settings.tool_exposure.mcp.redis);
+        assert!(!settings.tool_exposure.mcp.sftp);
+        assert!(settings.tool_exposure.agent.terminal);
+        assert!(settings.tool_exposure.agent.terminal_ssh_exec);
+        assert!(settings.tool_exposure.agent.terminal_exec);
+        assert!(settings.tool_exposure.agent.connections);
+        assert!(settings.tool_exposure.agent.database);
+        assert!(settings.tool_exposure.agent.redis);
+        assert!(settings.tool_exposure.agent.sftp);
+    }
+
+    #[test]
+    fn mcp_permission_modes_expose_unified_profile_ids() {
+        assert_eq!("safe", McpPermissionMode::Deny.profile_id());
+        assert_eq!("confirm", McpPermissionMode::Ask.profile_id());
+        assert_eq!("auto", McpPermissionMode::Allow.profile_id());
     }
 
     #[test]
@@ -745,6 +1073,58 @@ mod tests {
         let settings = AppSettings::default();
 
         assert_eq!(1000, settings.sql_query_max_rows);
+    }
+
+    #[test]
+    fn app_settings_default_enables_terminal_file_manager_path_sync() {
+        let settings = AppSettings::default();
+
+        assert!(settings.terminal_sync_path_with_terminal);
+    }
+
+    #[test]
+    fn app_settings_deserializes_terminal_file_manager_path_sync_enabled_by_default() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert!(settings.terminal_sync_path_with_terminal);
+    }
+
+    #[test]
+    fn app_settings_default_opens_ai_workbench_on_startup() {
+        let settings = AppSettings::default();
+
+        assert_eq!(
+            StartupDefaultPage::AiWorkbench,
+            settings.startup_default_page
+        );
+    }
+
+    #[test]
+    fn app_settings_deserializes_startup_default_page_from_legacy_json() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert_eq!(
+            StartupDefaultPage::AiWorkbench,
+            settings.startup_default_page
+        );
+    }
+
+    #[test]
+    fn app_settings_deserializes_home_startup_default_page() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "startup_default_page": "home"
+        }))
+        .expect("startup_default_page 应能读取");
+
+        assert_eq!(StartupDefaultPage::Home, settings.startup_default_page);
     }
 
     #[test]
@@ -776,6 +1156,60 @@ mod tests {
     }
 
     #[test]
+    fn app_settings_default_disables_personal_sync() {
+        let settings = AppSettings::default();
+
+        assert_eq!(
+            PersonalSyncBackendKind::Folder,
+            settings.personal_sync.backend
+        );
+        assert!(settings.personal_sync.path.is_empty());
+        assert!(settings.personal_sync.auto_sync);
+        assert!(settings.personal_sync.git.auto_push);
+    }
+
+    #[test]
+    fn app_settings_deserializes_personal_sync_defaults_from_legacy_json() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert!(settings.personal_sync.auto_sync);
+    }
+
+    #[test]
+    fn app_settings_default_uses_onet_cloud_sync_provider() {
+        let settings = AppSettings::default();
+
+        assert_eq!(SyncProvider::OnetCloud, settings.sync_provider);
+    }
+
+    #[test]
+    fn app_settings_deserializes_personal_sync_provider() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "sync_provider": "personal"
+        }))
+        .expect("应能读取个人同步模式");
+
+        assert_eq!(SyncProvider::Personal, settings.sync_provider);
+    }
+
+    #[test]
+    fn app_settings_round_trip_preserves_personal_sync() {
+        let mut settings = AppSettings::default();
+        settings.personal_sync.backend = PersonalSyncBackendKind::Git;
+        settings.personal_sync.path = "/tmp/repo".to_string();
+        settings.personal_sync.git.auto_push = false;
+
+        let json = serde_json::to_string(&settings).expect("应序列化 AppSettings");
+        let loaded: AppSettings = serde_json::from_str(&json).expect("应反序列化 AppSettings");
+
+        assert_eq!(settings.personal_sync, loaded.personal_sync);
+    }
+
+    #[test]
     fn app_settings_deserializes_mcp_defaults_from_legacy_json() {
         let settings: AppSettings = serde_json::from_value(serde_json::json!({
             "locale": "en",
@@ -786,8 +1220,35 @@ mod tests {
         assert_eq!("en", settings.locale);
         assert!(!settings.mcp.server_enabled);
         assert_eq!(settings.mcp.permission_mode, McpPermissionMode::Deny);
-        assert!(settings.mcp.toolsets.terminal);
-        assert!(settings.mcp.toolsets.connections);
+        assert!(settings.tool_exposure.mcp.terminal);
+        assert!(settings.tool_exposure.mcp.terminal_ssh_exec);
+        assert!(settings.tool_exposure.mcp.terminal_exec);
+        assert!(settings.tool_exposure.mcp.connections);
+        assert!(settings.tool_exposure.agent.database);
+    }
+
+    #[test]
+    fn app_settings_migrates_legacy_mcp_toolsets_to_tool_exposure() {
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "mcp": {
+                "toolsets": {
+                    "terminal": false,
+                    "connections": false,
+                    "database": true,
+                    "redis": true
+                }
+            }
+        }))
+        .expect("旧版 mcp.toolsets 应能读取");
+
+        assert!(settings.mcp.legacy_toolsets.is_some());
+        settings.migrate_legacy_mcp_toolsets();
+
+        assert!(settings.mcp.legacy_toolsets.is_none());
+        assert!(!settings.tool_exposure.mcp.terminal);
+        assert!(!settings.tool_exposure.mcp.connections);
+        assert!(settings.tool_exposure.mcp.database);
+        assert!(settings.tool_exposure.mcp.redis);
     }
 
     #[test]
@@ -815,6 +1276,109 @@ mod tests {
             settings.terminal_font_family
         );
         assert!(settings.custom_fonts.is_empty());
+    }
+
+    #[test]
+    fn app_settings_normalizes_grid_font_settings() {
+        let mut settings = AppSettings {
+            sql_editor_font_family: "Noto Sans Mono CJK SC".to_string(),
+            table_preview_font_family: "PingFang SC".to_string(),
+            terminal_font_family: "Microsoft YaHei".to_string(),
+            ..AppSettings::default()
+        };
+
+        settings.normalize_font_settings();
+
+        let default = default_grid_monospace_font_family();
+        assert_eq!(default, settings.sql_editor_font_family);
+        assert_eq!(default, settings.table_preview_font_family);
+        assert_eq!(default, settings.terminal_font_family);
+    }
+
+    #[test]
+    fn app_settings_keeps_grid_safe_custom_monospace_fonts() {
+        let mut settings = AppSettings {
+            sql_editor_font_family: "JetBrains Mono".to_string(),
+            table_preview_font_family: "Table Safe Mono".to_string(),
+            terminal_font_family: "Custom Mono".to_string(),
+            ..AppSettings::default()
+        };
+
+        settings.normalize_font_settings();
+
+        assert_eq!("JetBrains Mono", settings.sql_editor_font_family);
+        assert_eq!("Table Safe Mono", settings.table_preview_font_family);
+        assert_eq!("Custom Mono", settings.terminal_font_family);
+    }
+
+    #[test]
+    fn default_grid_font_fallbacks_include_cjk_before_symbol_fonts() {
+        let fallbacks = default_grid_font_fallback_families();
+        let cjk_index = fallbacks
+            .iter()
+            .position(|font| font == "Noto Sans CJK SC" || font == "Microsoft YaHei")
+            .expect("grid font fallback should include a CJK font");
+
+        for symbol_font in ["Apple Color Emoji", "Apple Symbols", "Noto Color Emoji"] {
+            if let Some(symbol_index) = fallbacks.iter().position(|font| font == symbol_font) {
+                assert!(cjk_index < symbol_index);
+            }
+        }
+    }
+
+    #[test]
+    fn grid_monospace_font_normalizes_family_and_sets_fallbacks() {
+        let font = grid_monospace_font("PingFang SC");
+
+        assert_eq!(default_grid_monospace_font_family(), font.family.as_ref());
+        assert!(font.fallbacks.as_ref().is_some_and(|fallbacks| {
+            fallbacks.fallback_list().iter().any(|family| {
+                family == "Noto Sans CJK SC"
+                    || family == "Microsoft YaHei"
+                    || family == "PingFang SC"
+            })
+        }));
+    }
+
+    #[test]
+    fn installed_font_family_matches_case_insensitively() {
+        let installed = vec!["Menlo".to_string(), "JetBrains Mono".to_string()];
+
+        assert!(is_installed_font_family(" jetbrains mono ", &installed));
+        assert!(!is_installed_font_family("Fira Code", &installed));
+    }
+
+    #[test]
+    fn resolve_installed_grid_font_rejects_missing_requested_family() {
+        let installed = vec!["Menlo".to_string(), "PingFang SC".to_string()];
+
+        assert_eq!(
+            "Menlo",
+            resolve_installed_grid_monospace_font_family("Fira Code", &installed)
+        );
+        assert_eq!(
+            "Menlo",
+            resolve_installed_grid_monospace_font_family("PingFang SC", &installed)
+        );
+    }
+
+    #[test]
+    fn resolve_installed_grid_font_keeps_installed_requested_family() {
+        let installed = vec!["Menlo".to_string(), "JetBrains Mono".to_string()];
+
+        assert_eq!(
+            "JetBrains Mono",
+            resolve_installed_grid_monospace_font_family("JetBrains Mono", &installed)
+        );
+    }
+
+    #[test]
+    fn installed_grid_monospace_font_uses_effective_installed_family() {
+        let installed = vec!["Menlo".to_string()];
+        let font = installed_grid_monospace_font("Fira Code", &installed);
+
+        assert_eq!("Menlo", font.family.as_ref());
+        assert!(font.fallbacks.is_some());
     }
 
     #[test]
@@ -862,9 +1426,10 @@ mod tests {
         settings.mcp.server_enabled = true;
         settings.mcp.server_mode = McpServerMode::Persistent;
         settings.mcp.permission_mode = McpPermissionMode::Ask;
-        settings.mcp.toolsets.connections = false;
-        settings.mcp.toolsets.database = true;
-        settings.mcp.toolsets.redis = true;
+        settings.tool_exposure.mcp.connections = false;
+        settings.tool_exposure.mcp.database = true;
+        settings.tool_exposure.mcp.redis = true;
+        settings.tool_exposure.agent.terminal_exec = false;
 
         let json = serde_json::to_string(&settings).expect("应序列化 AppSettings");
         let loaded: AppSettings = serde_json::from_str(&json).expect("应反序列化 AppSettings");
@@ -872,9 +1437,12 @@ mod tests {
         assert!(loaded.mcp.server_enabled);
         assert_eq!(loaded.mcp.server_mode, McpServerMode::Persistent);
         assert_eq!(loaded.mcp.permission_mode, McpPermissionMode::Ask);
-        assert!(loaded.mcp.toolsets.terminal);
-        assert!(!loaded.mcp.toolsets.connections);
-        assert!(loaded.mcp.toolsets.database);
-        assert!(loaded.mcp.toolsets.redis);
+        assert!(loaded.tool_exposure.mcp.terminal);
+        assert!(loaded.tool_exposure.mcp.terminal_ssh_exec);
+        assert!(loaded.tool_exposure.mcp.terminal_exec);
+        assert!(!loaded.tool_exposure.mcp.connections);
+        assert!(loaded.tool_exposure.mcp.database);
+        assert!(loaded.tool_exposure.mcp.redis);
+        assert!(!loaded.tool_exposure.agent.terminal_exec);
     }
 }

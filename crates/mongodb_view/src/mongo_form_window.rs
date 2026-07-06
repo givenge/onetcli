@@ -6,7 +6,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Sizable, Size, TitleBar,
+    ActiveTheme, Disableable, IconName, Sizable, Size,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -16,7 +16,10 @@ use gpui_component::{
     tab::{Tab, TabBar},
     v_flex,
 };
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption, get_cached_team_options};
+use one_core::cloud_sync::{
+    GlobalCloudUser, TeamKeyStatus, TeamOption, ensure_team_key_ready_for_save,
+    get_cached_team_options,
+};
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event, get_notifier};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::traits::Repository;
@@ -29,8 +32,25 @@ use crate::MongoManager;
 /// MongoDB 表单窗口配置
 pub struct MongoFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
+    pub initial_connection: Option<StoredConnection>,
+    pub on_saved: Option<MongoFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
+}
+
+pub type MongoFormSavedCallback =
+    std::sync::Arc<dyn Fn(StoredConnection, &mut App) + Send + Sync + 'static>;
+
+impl MongoFormWindowConfig {
+    fn is_editing(&self) -> bool {
+        self.editing_connection.is_some()
+    }
+
+    fn connection_to_load(&self) -> Option<&StoredConnection> {
+        self.editing_connection
+            .as_ref()
+            .or(self.initial_connection.as_ref())
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -84,7 +104,18 @@ impl TeamSelectItem {
     fn from_team(team: &TeamOption) -> Self {
         Self {
             id: Some(team.id.clone()),
-            name: team.name.clone(),
+            name: team_select_name(team),
+        }
+    }
+}
+
+fn team_select_name(team: &TeamOption) -> String {
+    match team.key_status {
+        TeamKeyStatus::Missing | TeamKeyStatus::VersionMismatch => {
+            format!("{} ({})", team.name, t!("TeamSync.key_missing_short"))
+        }
+        TeamKeyStatus::Cached | TeamKeyStatus::Unlocked => {
+            format!("{} ({})", team.name, t!("TeamSync.key_cached_short"))
         }
     }
 }
@@ -104,7 +135,6 @@ impl SelectItem for TeamSelectItem {
 /// MongoDB 连接表单窗口
 pub struct MongoFormWindow {
     focus_handle: FocusHandle,
-    title: SharedString,
     is_editing: bool,
     editing_id: Option<i64>,
     editing_cloud_id: Option<String>,
@@ -136,11 +166,13 @@ pub struct MongoFormWindow {
 
     is_testing: bool,
     test_result: Option<Result<(), String>>,
+    on_saved: Option<MongoFormSavedCallback>,
 }
 
 impl MongoFormWindow {
     pub fn new(config: MongoFormWindowConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let is_editing = config.editing_connection.is_some();
+        let is_editing = config.is_editing();
+        let connection_to_load = config.connection_to_load().cloned();
         let editing_id = config.editing_connection.as_ref().and_then(|c| c.id);
         let editing_cloud_id = config
             .editing_connection
@@ -155,22 +187,14 @@ impl MongoFormWindow {
             .as_ref()
             .and_then(|c| c.owner_id.clone());
 
-        let title: SharedString = if is_editing {
-            t!("MongoForm.edit_connection_title").to_string()
-        } else {
-            t!("MongoForm.new_connection_title").to_string()
-        }
-        .into();
-
-        let existing_parameters = config
-            .editing_connection
+        let existing_parameters = connection_to_load
             .as_ref()
             .and_then(|connection| connection.to_mongodb_params().ok());
 
         let name_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx)
                 .placeholder(t!("MongoForm.name_placeholder").to_string());
-            if let Some(connection) = &config.editing_connection {
+            if let Some(connection) = &connection_to_load {
                 state.set_value(connection.name.clone(), window, cx);
             }
             state
@@ -308,7 +332,7 @@ impl MongoFormWindow {
         let remark_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx)
                 .placeholder(t!("MongoForm.remark_placeholder").to_string());
-            if let Some(connection) = &config.editing_connection {
+            if let Some(connection) = &connection_to_load {
                 if let Some(remark) = &connection.remark {
                     state.set_value(remark.clone(), window, cx);
                 }
@@ -329,8 +353,7 @@ impl MongoFormWindow {
 
         let workspace_select = cx.new(|cx| {
             let mut state = SelectState::new(workspace_items, None, window, cx);
-            if let Some(selected) = config
-                .editing_connection
+            if let Some(selected) = connection_to_load
                 .as_ref()
                 .and_then(|connection| connection.workspace_id)
             {
@@ -347,18 +370,13 @@ impl MongoFormWindow {
 
         let team_select = cx.new(|cx| {
             let mut state = SelectState::new(team_items, None, window, cx);
-            if let Some(team_id) = config
-                .editing_connection
-                .as_ref()
-                .and_then(|c| c.team_id.clone())
-            {
+            if let Some(team_id) = connection_to_load.as_ref().and_then(|c| c.team_id.clone()) {
                 state.set_selected_value(&Some(team_id), window, cx);
             }
             state
         });
 
-        let sync_enabled = config
-            .editing_connection
+        let sync_enabled = connection_to_load
             .as_ref()
             .map(|connection| connection.sync_enabled)
             .unwrap_or(true);
@@ -378,7 +396,6 @@ impl MongoFormWindow {
 
         Self {
             focus_handle: cx.focus_handle(),
-            title,
             is_editing,
             editing_id,
             editing_cloud_id,
@@ -405,6 +422,7 @@ impl MongoFormWindow {
             sync_enabled,
             is_testing: false,
             test_result: None,
+            on_saved: config.on_saved,
         }
     }
 
@@ -614,6 +632,11 @@ impl MongoFormWindow {
 
         let workspace_id = self.get_workspace_id(cx);
         let team_id = self.get_team_id(cx);
+        if let Err(error) = ensure_team_key_ready_for_save(team_id.as_deref(), cx) {
+            self.test_result = Some(Err(error.to_string()));
+            cx.notify();
+            return;
+        }
         let owner_id = if self.is_editing {
             self.editing_owner_id.clone()
         } else {
@@ -628,6 +651,7 @@ impl MongoFormWindow {
         let editing_id = self.editing_id;
         let editing_cloud_id = self.editing_cloud_id.clone();
         let editing_last_synced_at = self.editing_last_synced_at;
+        let on_saved = self.on_saved.clone();
 
         let storage = cx
             .global::<one_core::storage::GlobalStorageState>()
@@ -664,16 +688,19 @@ impl MongoFormWindow {
                         if let Some(notifier) = get_notifier(cx) {
                             let event = if is_editing {
                                 ConnectionDataEvent::ConnectionUpdated {
-                                    connection: saved_conn,
+                                    connection: saved_conn.clone(),
                                 }
                             } else {
                                 ConnectionDataEvent::ConnectionCreated {
-                                    connection: saved_conn,
+                                    connection: saved_conn.clone(),
                                 }
                             };
                             notifier.update(cx, |_, cx| {
                                 cx.emit(event);
                             });
+                        }
+                        if let Some(on_saved) = &on_saved {
+                            on_saved(saved_conn, cx);
                         }
                     });
                 }
@@ -852,6 +879,72 @@ impl Focusable for MongoFormWindow {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mongo_connection(name: &str) -> StoredConnection {
+        StoredConnection::new_mongodb(
+            name.to_string(),
+            MongoDBParams {
+                connection_string: String::new(),
+                host: "127.0.0.1".to_string(),
+                port: Some(27017),
+                database: Some("app".to_string()),
+                username: None,
+                password: None,
+                auth_source: None,
+                replica_set: None,
+                read_preference: None,
+                use_srv_record: false,
+                direct_connection: false,
+                use_tls: false,
+                connect_timeout_seconds: None,
+                application_name: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn initial_connection_prefills_without_edit_mode() {
+        let config = MongoFormWindowConfig {
+            editing_connection: None,
+            initial_connection: Some(mongo_connection("imported mongo")),
+            on_saved: None,
+            workspaces: Vec::new(),
+            teams: Vec::new(),
+        };
+
+        assert!(!config.is_editing());
+        assert_eq!(
+            Some("imported mongo"),
+            config
+                .connection_to_load()
+                .map(|connection| connection.name.as_str())
+        );
+    }
+
+    #[test]
+    fn editing_connection_takes_precedence_over_initial_connection() {
+        let config = MongoFormWindowConfig {
+            editing_connection: Some(mongo_connection("existing mongo")),
+            initial_connection: Some(mongo_connection("imported mongo")),
+            on_saved: None,
+            workspaces: Vec::new(),
+            teams: Vec::new(),
+        };
+
+        assert!(config.is_editing());
+        assert_eq!(
+            Some("existing mongo"),
+            config
+                .connection_to_load()
+                .map(|connection| connection.name.as_str())
+        );
+    }
+}
+
 impl Render for MongoFormWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_testing = self.is_testing;
@@ -885,19 +978,6 @@ impl Render for MongoFormWindow {
         v_flex()
             .justify_center()
             .size_full()
-            .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(self.title.clone()),
-                ),
-            )
             .child(
                 div().flex().justify_center().px_3().pt_2().child(
                     TabBar::new("mongodb-form-tabs")

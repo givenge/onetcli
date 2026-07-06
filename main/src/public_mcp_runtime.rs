@@ -2,9 +2,13 @@ mod config;
 mod connection_sessions;
 mod internal_functions;
 mod redis;
+mod resource_pool;
 mod session;
 mod status;
 mod tool_registry;
+
+#[cfg(test)]
+mod agent_db_registry_tests;
 
 pub use config::{PublicMcpEnvOverride, PublicMcpStartConfig};
 pub use session::{mcp_server_enabled, set_mcp_server_enabled, set_mcp_server_mode};
@@ -60,6 +64,7 @@ impl Drop for GlobalPublicMcpRuntime {
 pub fn init(cx: &mut App) {
     let discovery_path = public_mcp_discovery_path();
     let _ = remove_discovery(&discovery_path);
+    ai_chat_view::set_plan_tool_registry_provider(cx, agent_runtime_tool_registry);
     internal_functions::ensure_registry(cx);
     for definition in internal_functions::builtin_definitions() {
         register_internal_function(cx, definition);
@@ -91,6 +96,85 @@ pub fn runtime_status(cx: &App) -> PublicMcpRuntimeStatus {
 
 pub fn register_internal_function(cx: &mut App, definition: InternalFunctionDefinition) {
     internal_functions::register_internal_function(cx, definition);
+}
+
+pub fn agent_runtime_tool_registry(cx: &mut App) -> anyhow::Result<agent_runtime::ToolRegistry> {
+    let settings = AppSettings::current(cx);
+    let session_enabled = session::runtime_session_enabled(cx);
+    let config = PublicMcpStartConfig::from_settings_session_and_env(
+        &settings,
+        session_enabled,
+        PublicMcpEnvOverride::from_env(),
+    );
+    let mut agent_toolsets = settings.tool_exposure.agent.clone();
+    let agent_database_enabled = agent_toolsets.database;
+    let agent_redis_enabled = agent_toolsets.redis;
+    let agent_sftp_enabled = agent_toolsets.sftp;
+    agent_toolsets.database = false;
+    agent_toolsets.redis = false;
+    agent_toolsets.sftp = false;
+    let registry = build_tool_registry(cx, &agent_toolsets)?;
+    let mut agent_registry = public_mcp::tools::agent_runtime_tool_registry(
+        registry,
+        config.permission_mode,
+        build_approval_manager(cx),
+    );
+    if agent_database_enabled {
+        if let Some(repo) = connection_repository(cx) {
+            let runtime_db_registry = onetcli_runtime::database_tools::database_tool_registry(repo);
+            let runtime_agent_db_registry = agent_runtime::tools::tool_runtime_agent_tool_registry(
+                runtime_db_registry,
+                tool_runtime::ToolAdapter::FunctionCalling,
+            );
+            agent_registry.extend(runtime_agent_db_registry);
+        } else {
+            tracing::warn!("Agent database tools enabled without ConnectionRepository");
+        }
+    }
+    if agent_redis_enabled {
+        register_runtime_redis_tools(cx, &mut agent_registry);
+    }
+    if agent_sftp_enabled {
+        if let Some(repo) = connection_repository(cx) {
+            register_runtime_sftp_tools(repo, &mut agent_registry);
+        } else {
+            tracing::warn!("Agent SSH/SFTP tools enabled without ConnectionRepository");
+        }
+    }
+    Ok(agent_registry)
+}
+
+fn register_runtime_redis_tools(cx: &App, agent_registry: &mut agent_runtime::ToolRegistry) {
+    let Some(repo) = connection_repository(cx) else {
+        tracing::warn!("Agent Redis runtime tools enabled without ConnectionRepository");
+        return;
+    };
+    let runtime_redis_registry = onetcli_runtime::redis_tools::redis_tool_registry(repo);
+    let runtime_agent_redis_registry = agent_runtime::tools::tool_runtime_agent_tool_registry(
+        runtime_redis_registry,
+        tool_runtime::ToolAdapter::FunctionCalling,
+    );
+    agent_registry.extend(runtime_agent_redis_registry);
+}
+
+fn register_runtime_sftp_tools(
+    repo: std::sync::Arc<one_core::storage::ConnectionRepository>,
+    agent_registry: &mut agent_runtime::ToolRegistry,
+) {
+    let runtime_sftp_registry = onetcli_runtime::sftp_tools::sftp_tool_registry(repo);
+    let runtime_agent_sftp_registry = agent_runtime::tools::tool_runtime_agent_tool_registry(
+        runtime_sftp_registry,
+        tool_runtime::ToolAdapter::FunctionCalling,
+    );
+    agent_registry.extend(runtime_agent_sftp_registry);
+}
+
+fn connection_repository(
+    cx: &App,
+) -> Option<std::sync::Arc<one_core::storage::ConnectionRepository>> {
+    cx.try_global::<one_core::storage::GlobalStorageState>()?
+        .storage
+        .get::<one_core::storage::ConnectionRepository>()
 }
 
 fn reconcile_runtime(cx: &mut App) {

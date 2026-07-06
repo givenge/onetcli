@@ -4,9 +4,9 @@ use super::copy_format::{CopyFormat, CopyFormatter, TableMetadata};
 use super::data_grid::DataGrid;
 use db::{ColumnInfo, FieldType};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Font, InteractiveElement, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity,
+    Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::calendar::Date;
 use gpui_component::date_picker::{DatePickerEvent, DatePickerState};
@@ -16,7 +16,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::time_picker::{TimePickerEvent, TimePickerState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, WindowExt, h_flex};
-use one_core::settings::AppSettings;
+use one_core::settings::{AppSettings, installed_grid_monospace_font};
 use one_core::storage::DatabaseType;
 use one_ui::edit_table::{
     CellEditor, Column, ColumnSort, EditTableDelegate, EditTableEvent, EditTableState,
@@ -119,6 +119,13 @@ pub struct EditorTableDelegate {
     primary_key_indices: Vec<usize>,
     /// Data grid handle for context menu actions
     data_grid: Option<WeakEntity<DataGrid>>,
+    preview_font_cache: Option<PreviewFontCache>,
+}
+
+#[derive(Clone)]
+struct PreviewFontCache {
+    requested_family: String,
+    font: Font,
 }
 
 fn parse_primary_order_by_clause(order_by_clause: &str) -> Option<(String, ColumnSort)> {
@@ -204,6 +211,7 @@ impl Clone for EditorTableDelegate {
             table_name: self.table_name.clone(),
             primary_key_indices: self.primary_key_indices.clone(),
             data_grid: self.data_grid.clone(),
+            preview_font_cache: self.preview_font_cache.clone(),
         }
     }
 }
@@ -243,7 +251,25 @@ impl EditorTableDelegate {
             table_name: SharedString::default(),
             primary_key_indices: Vec::new(),
             data_grid: None,
+            preview_font_cache: None,
         }
+    }
+
+    fn preview_font(&mut self, cx: &mut Context<EditTableState<Self>>) -> Font {
+        let font_family = AppSettings::global(cx).table_preview_font_family.clone();
+        if let Some(cache) = &self.preview_font_cache
+            && cache.requested_family == font_family
+        {
+            return cache.font.clone();
+        }
+
+        let installed_font_names = cx.text_system().all_font_names();
+        let font = installed_grid_monospace_font(&font_family, &installed_font_names);
+        self.preview_font_cache = Some(PreviewFontCache {
+            requested_family: font_family,
+            font: font.clone(),
+        });
+        font
     }
 
     pub fn set_data_grid(&mut self, data_grid: WeakEntity<DataGrid>) {
@@ -876,9 +902,11 @@ impl EditTableDelegate for EditorTableDelegate {
             })
             .unwrap_or_default();
 
+        let font = self.preview_font(cx);
+
         h_flex()
             .id(SharedString::from(format!("col-{}", col_ix)))
-            .font_family(AppSettings::global(cx).table_preview_font_family.clone())
+            .font(font)
             .size_full()
             .items_center()
             .justify_between()
@@ -1355,17 +1383,16 @@ impl EditTableDelegate for EditorTableDelegate {
             .cloned()
             .unwrap_or(None);
 
-        let font_family =
-            SharedString::from(AppSettings::global(cx).table_preview_font_family.clone());
+        let font = self.preview_font(cx);
 
         match value {
             None => div()
-                .font_family(font_family.clone())
+                .font(font.clone())
                 .text_color(cx.theme().muted_foreground.opacity(0.5))
                 .italic()
                 .child("NULL"),
             Some(s) => div()
-                .font_family(font_family)
+                .font(font)
                 .w_full()
                 .overflow_hidden()
                 .whitespace_nowrap()
@@ -2324,6 +2351,7 @@ mod tests {
             table_name: SharedString::default(),
             primary_key_indices: Vec::new(),
             data_grid: None,
+            preview_font_cache: None,
         }
     }
 
@@ -2404,5 +2432,35 @@ mod tests {
         assert_eq!(1, delegate.filtered_row_count());
         assert_eq!(Some(0), delegate.resolve_display_row(0));
         assert_eq!(None, delegate.resolve_display_row(1));
+    }
+
+    #[test]
+    fn table_render_uses_cached_preview_font() {
+        let source = include_str!("results_delegate.rs");
+        let preview_font = source
+            .split("fn preview_font(")
+            .nth(1)
+            .expect("preview_font helper exists")
+            .split("pub fn set_data_grid")
+            .next()
+            .expect("preview_font helper has an end marker");
+        let render_th = source
+            .split("fn render_th(")
+            .nth(1)
+            .expect("render_th exists")
+            .split("fn context_menu(")
+            .next()
+            .expect("render_th has an end marker");
+        let render_td = source
+            .split("fn render_td(")
+            .nth(1)
+            .expect("render_td exists")
+            .split("fn loading(")
+            .next()
+            .expect("render_td has an end marker");
+
+        assert!(preview_font.contains("cx.text_system().all_font_names()"));
+        assert!(!render_th.contains("cx.text_system().all_font_names()"));
+        assert!(!render_td.contains("cx.text_system().all_font_names()"));
     }
 }

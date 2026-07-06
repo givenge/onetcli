@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::types::ObjectViewColumn as Column;
 use anyhow::Result;
-use gpui_component::table::Column;
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 use regex::Regex;
 use tracing::info;
@@ -14,16 +14,18 @@ use crate::import_export::{
     ImportResult,
 };
 use crate::manifest_helpers::{
-    DatabaseActionDescriptorExt, action, action_with_scope, field, option, ssh_auth_rules,
-    ssh_enabled_rules, ssh_field, ssh_number_field, ssh_password_field, tab, yes_no_options,
+    DatabaseActionDescriptorExt, action, action_with_scope, field, option,
+    schema_preference_fields, ssh_auth_rules, ssh_enabled_rules, ssh_field, ssh_number_field,
+    ssh_password_field, tab, yes_no_options,
 };
 use crate::mssql::connection::MssqlDbConnection;
-use crate::plugin::{DatabasePlugin, SqlCompletionInfo};
+use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
     DatabaseUiCapabilities, DatabaseUiManifest, FormSelectOption, ReferenceDataKind,
 };
+use crate::schema_preferences::{SchemaFilterProfile, filter_schemas};
 use crate::types::*;
 
 /// MSSQL data types (name, description)
@@ -81,9 +83,22 @@ impl MsSqlPlugin {
 }
 
 fn build_mssql_ui_manifest() -> DatabaseUiManifest {
+    let mut forms = vec![
+        mssql_connection_form(),
+        mssql_database_form(false),
+        mssql_database_form(true),
+        mssql_schema_form(),
+    ];
+    forms.extend(mssql_user_forms());
+
     DatabaseUiManifest {
         capabilities: DatabaseUiCapabilities {
             supports_schema: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_sequences: true,
             supports_functions: true,
             supports_procedures: true,
@@ -91,14 +106,86 @@ fn build_mssql_ui_manifest() -> DatabaseUiManifest {
             supports_table_collation: true,
             ..DatabaseUiCapabilities::default()
         },
-        forms: vec![
-            mssql_connection_form(),
-            mssql_database_form(false),
-            mssql_database_form(true),
-            mssql_schema_form(),
-        ],
+        forms,
         actions: mssql_action_manifest(),
         ..DatabaseUiManifest::default()
+    }
+}
+
+fn mssql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn mssql_user_password(request: &DatabaseUserOperationRequest) -> &str {
+    request
+        .field_values
+        .get("password")
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .unwrap_or("change_me")
+}
+
+fn mssql_user_role(request: &DatabaseUserOperationRequest) -> &str {
+    match request.field_values.get("role").map(String::as_str) {
+        Some("db_datareader") => "db_datareader",
+        Some("db_datawriter") => "db_datawriter",
+        Some("db_owner") => "db_owner",
+        _ => "db_datareader",
+    }
+}
+
+fn mssql_user_forms() -> Vec<DatabaseFormManifest> {
+    vec![
+        mssql_user_form(DatabaseFormKind::CreateUser, true, false),
+        mssql_user_form(DatabaseFormKind::EditUser, true, false),
+        mssql_user_form(DatabaseFormKind::DeleteUser, false, false),
+        mssql_user_form(DatabaseFormKind::UserPrivileges, false, true),
+    ]
+}
+
+fn mssql_user_form(
+    kind: DatabaseFormKind,
+    include_password: bool,
+    include_role: bool,
+) -> DatabaseFormManifest {
+    let mut fields = vec![field(
+        "name",
+        "DatabaseUser.name",
+        DatabaseFormFieldType::Text,
+    )];
+    if include_password {
+        fields.push(field(
+            "password",
+            "DatabaseUser.password",
+            DatabaseFormFieldType::Password,
+        ));
+    }
+    if include_role {
+        fields.push(
+            field("role", "DatabaseUser.role", DatabaseFormFieldType::Select)
+                .with_default("db_datareader")
+                .with_options(vec![
+                    option("db_datareader", "DatabaseUser.role_datareader"),
+                    option("db_datawriter", "DatabaseUser.role_datawriter"),
+                    option("db_owner", "DatabaseUser.role_owner"),
+                ]),
+        );
+    }
+    DatabaseFormManifest {
+        kind,
+        title_i18n_key: user_form_title_key(kind).into(),
+        submit_i18n_key: "Common.save".into(),
+        tabs: vec![tab("user", "DatabaseUser.user_tab", fields)],
+    }
+}
+
+fn user_form_title_key(kind: DatabaseFormKind) -> &'static str {
+    match kind {
+        DatabaseFormKind::CreateUser => "DatabaseUser.create_title",
+        DatabaseFormKind::EditUser => "DatabaseUser.edit_title",
+        DatabaseFormKind::DeleteUser => "DatabaseUser.delete_title",
+        DatabaseFormKind::UserPrivileges => "DatabaseUser.privileges_title",
+        _ => "DatabaseUser.user_title",
     }
 }
 
@@ -147,10 +234,8 @@ fn mssql_connection_form() -> DatabaseFormManifest {
                     .with_placeholder("database name (optional)"),
                 ],
             ),
-            tab(
-                "advanced",
-                "ConnectionForm.advanced",
-                vec![
+            {
+                let mut fields = vec![
                     field(
                         "connect_timeout",
                         "ConnectionForm.connect_timeout",
@@ -166,8 +251,10 @@ fn mssql_connection_form() -> DatabaseFormManifest {
                     )
                     .optional()
                     .with_placeholder("Application Name"),
-                ],
-            ),
+                ];
+                fields.extend(schema_preference_fields());
+                tab("advanced", "ConnectionForm.advanced", fields)
+            },
             tab(
                 "ssl",
                 "ConnectionForm.ssl",
@@ -595,6 +682,11 @@ impl DatabasePlugin for MsSqlPlugin {
             supports_functions: true,
             supports_procedures: true,
             supports_triggers: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_table_collation: true,
             ..DatabaseUiCapabilities::default()
         }
@@ -792,8 +884,6 @@ impl DatabasePlugin for MsSqlPlugin {
     }
 
     async fn list_databases_view(&self, connection: &dyn DbConnection) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = r#"
             SELECT
                 d.name,
@@ -838,11 +928,11 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("owner", "Owner").width(px(120.0)),
-            Column::new("created", "Created").width(px(180.0)),
-            Column::new("compat_level", "Compat Level").width(px(100.0)),
-            Column::new("collation", "Collation").width(px(200.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("owner", "Owner").width(120.0),
+            Column::new("created", "Created").width(180.0),
+            Column::new("compat_level", "Compat Level").width(100.0),
+            Column::new("collation", "Collation").width(200.0),
         ];
 
         Ok(ObjectView {
@@ -915,12 +1005,6 @@ impl DatabasePlugin for MsSqlPlugin {
             r#"
             SELECT s.name
             FROM [{database}].sys.schemas s
-            WHERE s.name NOT IN (
-                'INFORMATION_SCHEMA', 'sys',
-                'db_owner', 'db_accessadmin', 'db_securityadmin', 'db_ddladmin',
-                'db_backupoperator', 'db_datareader', 'db_datawriter',
-                'db_denydatareader', 'db_denydatawriter'
-            )
             ORDER BY s.name
             "#,
             database = database.replace("]", "]]")
@@ -932,11 +1016,16 @@ impl DatabasePlugin for MsSqlPlugin {
             .map_err(|e| anyhow::anyhow!("Failed to list schemas: {}", e))?;
 
         if let SqlResult::Query(query_result) = result {
-            Ok(query_result
+            let schemas = query_result
                 .rows
                 .iter()
                 .filter_map(|row| row.first().and_then(|v| v.clone()))
-                .collect())
+                .collect();
+            Ok(filter_schemas(
+                connection.config(),
+                SchemaFilterProfile::MsSql,
+                schemas,
+            ))
         } else {
             Err(anyhow::anyhow!("Unexpected result type"))
         }
@@ -949,8 +1038,6 @@ impl DatabasePlugin for MsSqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -977,9 +1064,9 @@ impl DatabasePlugin for MsSqlPlugin {
 
         if let SqlResult::Query(query_result) = result {
             let columns = vec![
-                Column::new("name", "Name").width(px(180.0)),
-                Column::new("owner", "Owner").width(px(120.0)),
-                Column::new("tables", "Tables").width(px(80.0)).text_right(),
+                Column::new("name", "Name").width(180.0),
+                Column::new("owner", "Owner").width(120.0),
+                Column::new("tables", "Tables").width(80.0).text_right(),
             ];
 
             let rows: Vec<Vec<String>> = query_result
@@ -1068,8 +1155,6 @@ impl DatabasePlugin for MsSqlPlugin {
         database: &str,
         schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let schema_filter = match &schema {
             Some(s) => format!("AND s.name = '{}'", s.replace("'", "''")),
             None => String::new(),
@@ -1123,10 +1208,10 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("schema", "Schema").width(px(100.0)),
-            Column::new("comment", "Comment").width(px(250.0)),
-            Column::new("created", "Created").width(px(150.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("schema", "Schema").width(100.0),
+            Column::new("comment", "Comment").width(250.0),
+            Column::new("created", "Created").width(150.0),
         ];
 
         Ok(ObjectView {
@@ -1226,8 +1311,6 @@ impl DatabasePlugin for MsSqlPlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns_data = self
             .list_columns(connection, database, schema, table)
             .await?;
@@ -1246,11 +1329,11 @@ impl DatabasePlugin for MsSqlPlugin {
             .collect();
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("type", "Type").width(px(120.0)),
-            Column::new("nullable", "Null").width(px(60.0)),
-            Column::new("default", "Default").width(px(120.0)),
-            Column::new("comment", "Comment").width(px(250.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("type", "Type").width(120.0),
+            Column::new("nullable", "Null").width(60.0),
+            Column::new("default", "Default").width(120.0),
+            Column::new("comment", "Comment").width(250.0),
         ];
 
         Ok(ObjectView {
@@ -1333,8 +1416,6 @@ impl DatabasePlugin for MsSqlPlugin {
         schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self
             .list_indexes(connection, database, schema.map(|s| s.to_string()), table)
             .await?;
@@ -1352,10 +1433,10 @@ impl DatabasePlugin for MsSqlPlugin {
             .collect();
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("columns", "Columns").width(px(250.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("unique", "Unique").width(px(80.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("columns", "Columns").width(250.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("unique", "Unique").width(80.0),
         ];
 
         Ok(ObjectView {
@@ -1421,8 +1502,6 @@ impl DatabasePlugin for MsSqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1470,10 +1549,10 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("schema", "Schema").width(px(100.0)),
-            Column::new("comment", "Comment").width(px(250.0)),
-            Column::new("created", "Created").width(px(150.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("schema", "Schema").width(100.0),
+            Column::new("comment", "Comment").width(250.0),
+            Column::new("created", "Created").width(150.0),
         ];
 
         Ok(ObjectView {
@@ -1542,8 +1621,6 @@ impl DatabasePlugin for MsSqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1595,10 +1672,10 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("schema", "Schema").width(px(100.0)),
-            Column::new("type", "Type").width(px(120.0)),
-            Column::new("created", "Created").width(px(150.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("schema", "Schema").width(100.0),
+            Column::new("type", "Type").width(120.0),
+            Column::new("created", "Created").width(150.0),
         ];
 
         Ok(ObjectView {
@@ -1660,8 +1737,6 @@ impl DatabasePlugin for MsSqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1705,10 +1780,10 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("schema", "Schema").width(px(100.0)),
-            Column::new("created", "Created").width(px(150.0)),
-            Column::new("modified", "Modified").width(px(150.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("schema", "Schema").width(100.0),
+            Column::new("created", "Created").width(150.0),
+            Column::new("modified", "Modified").width(150.0),
         ];
 
         Ok(ObjectView {
@@ -1764,8 +1839,6 @@ impl DatabasePlugin for MsSqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1806,9 +1879,9 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(250.0)),
-            Column::new("table", "Table").width(px(200.0)),
-            Column::new("status", "Status").width(px(100.0)),
+            Column::new("name", "Name").width(250.0),
+            Column::new("table", "Table").width(200.0),
+            Column::new("status", "Status").width(100.0),
         ];
 
         Ok(ObjectView {
@@ -1872,8 +1945,6 @@ impl DatabasePlugin for MsSqlPlugin {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1920,11 +1991,11 @@ impl DatabasePlugin for MsSqlPlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("type", "Type").width(px(100.0)),
-            Column::new("start", "Start").width(px(100.0)),
-            Column::new("increment", "Increment").width(px(100.0)),
-            Column::new("current", "Current").width(px(100.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("type", "Type").width(100.0),
+            Column::new("start", "Start").width(100.0),
+            Column::new("increment", "Increment").width(100.0),
+            Column::new("current", "Current").width(100.0),
         ];
 
         Ok(ObjectView {
@@ -2171,6 +2242,71 @@ impl DatabasePlugin for MsSqlPlugin {
         def
     }
 
+    fn build_list_users_sql(&self, _database: Option<&str>) -> Option<String> {
+        Some(
+            r#"SELECT
+  name,
+  type_desc,
+  authentication_type_desc,
+  default_schema_name,
+  create_date,
+  modify_date
+FROM sys.database_principals
+WHERE type IN ('S', 'U', 'G', 'R')
+  AND name NOT LIKE '##%'
+ORDER BY name;"#
+                .to_string(),
+        )
+    }
+
+    fn user_list_columns(&self) -> Vec<Column> {
+        vec![
+            Column::localized("name", "DatabaseUser.columns.name").width(180.0),
+            Column::localized("type_desc", "DatabaseUser.columns.principal_type").width(180.0),
+            Column::localized(
+                "authentication_type_desc",
+                "DatabaseUser.columns.authentication_type",
+            )
+            .width(200.0),
+            Column::localized("default_schema_name", "DatabaseUser.columns.default_schema")
+                .width(160.0),
+            Column::localized("create_date", "DatabaseUser.columns.created_at").width(180.0),
+            Column::localized("modify_date", "DatabaseUser.columns.updated_at").width(180.0),
+        ]
+    }
+
+    fn build_create_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        let user = self.quote_identifier(&request.user_name);
+        Some(format!(
+            "CREATE LOGIN {} WITH PASSWORD = {};\nCREATE USER {} FOR LOGIN {};",
+            user,
+            mssql_string_literal(mssql_user_password(request)),
+            user,
+            user
+        ))
+    }
+
+    fn build_modify_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "ALTER LOGIN {} WITH PASSWORD = {};",
+            self.quote_identifier(&request.user_name),
+            mssql_string_literal(mssql_user_password(request))
+        ))
+    }
+
+    fn build_drop_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        let user = self.quote_identifier(&request.user_name);
+        Some(format!("DROP USER {};\nDROP LOGIN {};", user, user))
+    }
+
+    fn build_user_privileges_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "ALTER ROLE {} ADD MEMBER {};",
+            self.quote_identifier(mssql_user_role(request)),
+            self.quote_identifier(&request.user_name)
+        ))
+    }
+
     fn build_create_database_sql(
         &self,
         request: &crate::plugin::DatabaseOperationRequest,
@@ -2358,6 +2494,10 @@ impl DatabasePlugin for MsSqlPlugin {
             definitions.push(format!("  PRIMARY KEY ({})", pk_cols.join(", ")));
         }
 
+        for foreign_key in &design.foreign_keys {
+            definitions.push(format!("  {}", self.build_foreign_key_def(foreign_key)));
+        }
+
         sql.push_str(&definitions.join(",\n"));
         sql.push_str("\n);");
 
@@ -2412,6 +2552,24 @@ impl DatabasePlugin for MsSqlPlugin {
             .collect();
         let new_cols: HashMap<&str, &ColumnDefinition> =
             new.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+        let original_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = original
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+        let new_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+
+        for (name, original_foreign_key) in &original_foreign_keys {
+            match new_foreign_keys.get(name) {
+                Some(new_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements.push(self.build_drop_foreign_key_sql(&new.table_name, name)),
+            }
+        }
 
         for name in original_cols.keys() {
             if !new_cols.contains_key(name) {
@@ -2494,6 +2652,15 @@ impl DatabasePlugin for MsSqlPlugin {
             }
         }
 
+        for (name, new_foreign_key) in &new_foreign_keys {
+            match original_foreign_keys.get(name) {
+                Some(original_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements
+                    .push(self.build_add_foreign_key_sql(&new.table_name, new_foreign_key)),
+            }
+        }
+
         if statements.is_empty() {
             "-- No changes detected".to_string()
         } else {
@@ -2536,11 +2703,29 @@ mod tests {
     use super::*;
     use crate::plugin::DatabasePlugin;
     use crate::plugin_manifest::{DatabaseActionId, DatabaseFormKind};
-    use crate::types::{ColumnDefinition, IndexDefinition, TableDesign, TableOptions};
+    use crate::types::{
+        ColumnDefinition, ForeignKeyDefinition, IndexDefinition, TableDesign, TableOptions,
+    };
     use std::collections::HashMap;
 
     fn create_plugin() -> MsSqlPlugin {
         MsSqlPlugin::new()
+    }
+
+    fn user_request(
+        user_name: &str,
+        database: Option<&str>,
+        values: &[(&str, &str)],
+    ) -> crate::plugin::DatabaseUserOperationRequest {
+        crate::plugin::DatabaseUserOperationRequest {
+            user_name: user_name.to_string(),
+            host: None,
+            database: database.map(str::to_string),
+            field_values: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
     }
 
     // ==================== Basic Plugin Info Tests ====================
@@ -2572,6 +2757,17 @@ mod tests {
     }
 
     #[test]
+    fn test_capabilities_support_users() {
+        let capabilities = create_plugin().capabilities();
+
+        assert!(capabilities.supports_users);
+        assert!(capabilities.supports_user_create);
+        assert!(capabilities.supports_user_edit);
+        assert!(capabilities.supports_user_delete);
+        assert!(capabilities.supports_user_privileges);
+    }
+
+    #[test]
     fn test_ui_manifest_smoke() {
         let manifest = create_plugin().ui_manifest();
         let form_kinds: Vec<_> = manifest.forms.iter().map(|form| form.kind).collect();
@@ -2584,6 +2780,10 @@ mod tests {
                 DatabaseFormKind::CreateDatabase,
                 DatabaseFormKind::EditDatabase,
                 DatabaseFormKind::CreateSchema,
+                DatabaseFormKind::CreateUser,
+                DatabaseFormKind::EditUser,
+                DatabaseFormKind::DeleteUser,
+                DatabaseFormKind::UserPrivileges,
             ]
         );
         assert!(
@@ -2666,6 +2866,48 @@ mod tests {
         let sql = plugin.drop_view("test_db", "my_view");
         assert!(sql.contains("DROP VIEW"));
         assert!(sql.contains("[my_view]"));
+    }
+
+    #[test]
+    fn test_build_list_users_sql() {
+        let plugin = create_plugin();
+        let sql = plugin
+            .build_list_users_sql(Some("appdb"))
+            .expect("MSSQL supports user listing");
+
+        assert!(sql.contains("FROM sys.database_principals"));
+        assert!(sql.contains("authentication_type_desc"));
+        assert!(sql.contains("default_schema_name"));
+    }
+
+    #[test]
+    fn test_build_mssql_user_operation_sql() {
+        let plugin = create_plugin();
+        let request = user_request(
+            "app]user",
+            Some("appdb"),
+            &[("password", "pa'ss"), ("role", "db_datareader")],
+        );
+
+        assert_eq!(
+            Some(
+                "CREATE LOGIN [app]]user] WITH PASSWORD = 'pa''ss';\nCREATE USER [app]]user] FOR LOGIN [app]]user];"
+                    .to_string()
+            ),
+            plugin.build_create_user_sql(&request)
+        );
+        assert_eq!(
+            Some("ALTER LOGIN [app]]user] WITH PASSWORD = 'pa''ss';".to_string()),
+            plugin.build_modify_user_sql(&request)
+        );
+        assert_eq!(
+            Some("DROP USER [app]]user];\nDROP LOGIN [app]]user];".to_string()),
+            plugin.build_drop_user_sql(&request)
+        );
+        assert_eq!(
+            Some("ALTER ROLE [db_datareader] ADD MEMBER [app]]user];".to_string()),
+            plugin.build_user_privileges_sql(&request)
+        );
     }
 
     // ==================== Database Operations Tests ====================
@@ -2856,6 +3098,37 @@ mod tests {
         assert!(sql.contains("UNIQUE INDEX [idx_email]"));
     }
 
+    #[test]
+    fn test_build_create_table_sql_with_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT").nullable(false),
+                ColumnDefinition::new("order_id")
+                    .data_type("INT")
+                    .nullable(false),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "NO ACTION".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT [fk_order_items_order] FOREIGN KEY ([order_id]) REFERENCES [orders] ([id]) ON DELETE CASCADE ON UPDATE NO ACTION"
+        ));
+    }
+
     // ==================== ALTER TABLE Tests ====================
 
     #[test]
@@ -2999,6 +3272,60 @@ mod tests {
         assert!(sql.contains("CREATE UNIQUE INDEX"));
         assert!(sql.contains("[idx_name]"));
         assert!(sql.contains("[name]"));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_add_and_drop_foreign_keys() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("order_id").data_type("INT"),
+                ColumnDefinition::new("legacy_order_id").data_type("INT"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_legacy".to_string(),
+                columns: vec!["legacy_order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: String::new(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            database_name: "test_db".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("INT"),
+                ColumnDefinition::new("order_id").data_type("INT"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: "NO ACTION".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert!(sql.contains("ALTER TABLE [order_items] DROP CONSTRAINT [fk_order_items_legacy];"));
+        assert!(
+            sql.find("DROP CONSTRAINT [fk_order_items_legacy]").unwrap()
+                < sql.find("DROP COLUMN [legacy_order_id]").unwrap()
+        );
+        assert!(sql.contains(
+            "ALTER TABLE [order_items] ADD CONSTRAINT [fk_order_items_order] FOREIGN KEY ([order_id]) REFERENCES [orders] ([id]) ON DELETE CASCADE ON UPDATE NO ACTION;"
+        ));
     }
 
     // ==================== Completion Info Tests ====================

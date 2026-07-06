@@ -331,9 +331,11 @@ fn empty_state(message: String, cx: &Context<ExtensionManagerView>) -> gpui::Any
 fn kind_label(kind: ExtensionKind) -> String {
     match kind {
         ExtensionKind::Language => t!("Extension.kind_language").to_string(),
+        ExtensionKind::LanguageBundle => "Language Bundle".to_string(),
         ExtensionKind::DatabaseDriver => t!("Extension.kind_database_driver").to_string(),
         ExtensionKind::RemoteDesktopProvider => "Remote Desktop".to_string(),
         ExtensionKind::McpHelper => "MCP Helper".to_string(),
+        ExtensionKind::AcpAgent => "ACP Agent".to_string(),
         ExtensionKind::Composite => t!("Extension.kind_composite").to_string(),
     }
 }

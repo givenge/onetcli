@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use db::ipc::IpcDriverRegistry;
 use db_view::connection_form_window::{ConnectionFormWindow, ConnectionFormWindowConfig};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -9,7 +10,6 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions,
     div, px,
 };
-use gpui_component::button::ButtonVariant;
 use gpui_component::{
     ActiveTheme, Icon, IconName, Sizable, Size, WindowExt,
     button::{Button, ButtonVariants as _},
@@ -23,12 +23,14 @@ use one_core::cloud_sync::{
     CloudApiClient, CloudSyncService, ConflictResolution, SyncConflict, SyncEngine, UserInfo,
     get_cached_team_options,
 };
+use one_core::config::{public_base_url, team_management_url_template};
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event, get_notifier};
 use one_core::crypto;
 use one_core::key_storage;
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
 use one_core::license::Feature;
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
+use one_core::settings::{AppSettings, SyncProvider};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
     ActiveConnections, ConnectionRepository, ConnectionType, DatabaseType, GlobalStorageState,
@@ -47,20 +49,26 @@ use rust_i18n::t;
 use terminal_view::{SerialFormWindow, SerialFormWindowConfig};
 use terminal_view::{SshFormWindow, SshFormWindowConfig};
 
-use crate::auth::{AuthService, show_auth_dialog};
-use crate::home::connection_display::generate_duplicate_name;
+use crate::auth::{AuthService, load_auth_data, show_auth_dialog};
+use crate::external_driver_display::external_driver_icon_for_config_with_registry;
+use crate::home::connection_import_window::show_connection_import_window;
 use crate::home::home_connection_quick_open::ConnectionQuickOpenDelegate;
 use crate::home::home_strategy::build_connection_open_strategy;
 use crate::home::home_workspace_filter::WorkspaceFilterDelegate;
 use crate::license::{get_license_service, is_feature_enabled};
 use crate::new_connection::NewConnectionWindow;
-use crate::setting_tab::{AppSettings, GlobalCurrentUser};
-use crate::webdav_backup;
+use crate::setting_tab::GlobalCurrentUser;
+use crate::team_management::{build_team_management_url, resolve_team_management_url};
+use crate::user_avatar::render_user_avatar;
 use remote_desktop_view::remote_desktop_form::{
     RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
 };
 
 actions!(home_tab, [OpenConnectionQuickOpen, NewConnectionShortcut]);
+
+const HOME_SIDEBAR_EXPANDED_WIDTH: gpui::Pixels = px(220.0);
+const HOME_SIDEBAR_COLLAPSED_WIDTH: gpui::Pixels = px(68.0);
+const HOME_CONNECTION_LIST_ACTIONS_WIDTH: gpui::Pixels = px(136.0);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys(init_keybindings(cx));
@@ -126,7 +134,143 @@ fn home_default_shortcut(macos: &'static str, other: &'static str) -> &'static s
     }
 }
 
+fn refreshed_pending_conflicts(
+    previous: Vec<SyncConflict>,
+    current: Vec<SyncConflict>,
+    errors: &[String],
+) -> Vec<SyncConflict> {
+    if errors.is_empty() || !current.is_empty() {
+        current
+    } else {
+        previous
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeSyncRoute {
+    OnetCloud,
+    Personal,
+}
+
+fn sync_route_for_provider(provider: SyncProvider) -> HomeSyncRoute {
+    match provider {
+        SyncProvider::OnetCloud => HomeSyncRoute::OnetCloud,
+        SyncProvider::Personal => HomeSyncRoute::Personal,
+    }
+}
+
+fn sync_route(cx: &App) -> HomeSyncRoute {
+    sync_route_for_provider(AppSettings::global(cx).sync_provider)
+}
+
+fn should_auto_onet_cloud_sync(cx: &App, current_user_present: bool) -> bool {
+    sync_route(cx) == HomeSyncRoute::OnetCloud && current_user_present && crypto::has_master_key()
+}
+
+fn should_show_team_key_button(route: HomeSyncRoute, cached_team_count: usize) -> bool {
+    route == HomeSyncRoute::OnetCloud && cached_team_count > 0
+}
+
+fn should_show_team_management_entry(team_management_enabled: bool) -> bool {
+    team_management_enabled
+}
+
 // HomePage Entity - 管理 home 页面的所有状态
+
+/// 连接列表布局模式
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLayout {
+    /// 卡片网格视图
+    Card,
+    /// 长条列表视图
+    List,
+}
+
+impl ConnectionLayout {
+    fn toggle(self) -> Self {
+        match self {
+            ConnectionLayout::Card => ConnectionLayout::List,
+            ConnectionLayout::List => ConnectionLayout::Card,
+        }
+    }
+}
+
+/// 拖拽排序的荷载，在渲染连接列表时由 on_drag 创建，
+/// 拖入另一个连接条目时由 on_drop handler 读取。
+#[derive(Clone)]
+#[allow(dead_code)]
+struct DragConnection {
+    source_index: usize,
+    source_id: Option<i64>,
+    name: String,
+    info: String,
+    connection_type: ConnectionType,
+}
+
+impl Render for DragConnection {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("drag-connection")
+            .cursor_grabbing()
+            .w(px(300.0))
+            .h(px(58.0))
+            .px_3()
+            .overflow_hidden()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(8.0))
+            .bg(cx.theme().popover)
+            .opacity(0.95)
+            .shadow_md()
+            .items_center()
+            .gap_3()
+            .child(Self::preview_icon(self.connection_type, cx))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(self.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(self.info.clone()),
+                    ),
+            )
+    }
+}
+
+impl DragConnection {
+    fn preview_icon(connection_type: ConnectionType, cx: &mut Context<Self>) -> AnyElement {
+        let icon = match connection_type {
+            ConnectionType::Database => IconName::Database.color(),
+            ConnectionType::SshSftp => IconName::TerminalColor.color(),
+            ConnectionType::Redis => IconName::Redis.color(),
+            ConnectionType::MongoDB => IconName::MongoDB.color(),
+            ConnectionType::Serial => IconName::SerialPort.color(),
+            ConnectionType::PortForwarding => IconName::PortForwardingColor.color(),
+            ConnectionType::Rdp => IconName::Rdp.color(),
+            ConnectionType::Vnc => IconName::Vnc.color(),
+            _ => IconName::Server.color(),
+        };
+        icon.with_size(px(22.0))
+            .text_color(cx.theme().foreground)
+            .flex_shrink_0()
+            .into_any_element()
+    }
+}
 
 pub struct HomePage {
     focus_handle: FocusHandle,
@@ -164,11 +308,9 @@ pub struct HomePage {
     master_key_unlock_prompt_pending: bool,
     /// 防止主密钥对话框被启动提示和用户点击重复打开。
     master_key_dialog_open: bool,
+    sidebar_collapsed: bool,
     port_forwarding_runtime: Arc<tokio::sync::Mutex<PortForwardingRuntime>>,
-    /// WebDAV 备份错误信息
-    pub(crate) backup_error: Option<String>,
-    /// 是否正在执行 WebDAV 备份
-    pub(crate) backing_up: bool,
+    pub(crate) external_driver_registry: IpcDriverRegistry,
 }
 
 fn external_driver_id_for_connection_form(
@@ -190,9 +332,15 @@ fn external_driver_id_for_connection_form(
         })
 }
 
+fn non_empty_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    if name.is_empty() { None } else { Some(name) }
+}
+
 #[cfg(test)]
 mod external_driver_form_tests {
     use super::*;
+    use one_core::cloud_sync::{CloudSyncData, ConflictType};
     use one_core::storage::DbConnectionConfig;
 
     fn stored_external_connection(driver_id: &str) -> StoredConnection {
@@ -227,6 +375,94 @@ mod external_driver_form_tests {
     }
 
     #[test]
+    fn connection_title_prefers_external_driver_name() {
+        assert_eq!(
+            HomePage::connection_title_for_locale(
+                "zh-CN",
+                false,
+                &DatabaseType::MySQL,
+                None,
+                Some("DM"),
+            ),
+            "新建 DM 连接"
+        );
+        assert_eq!(
+            HomePage::connection_title_for_locale(
+                "zh-CN",
+                true,
+                &DatabaseType::MySQL,
+                None,
+                Some("DM"),
+            ),
+            "编辑 DM 连接"
+        );
+    }
+
+    #[test]
+    fn connection_title_prefers_connection_name_when_editing() {
+        assert_eq!(
+            HomePage::connection_title_for_locale(
+                "zh-CN",
+                true,
+                &DatabaseType::MySQL,
+                Some("生产库"),
+                Some("DM"),
+            ),
+            "编辑 生产库 连接"
+        );
+        assert_eq!(
+            HomePage::connection_title_for_locale(
+                "zh-CN",
+                false,
+                &DatabaseType::MySQL,
+                Some("生产库"),
+                Some("DM"),
+            ),
+            "新建 DM 连接"
+        );
+    }
+
+    #[test]
+    fn editing_title_or_default_prefers_connection_name() {
+        let mut connection = stored_external_connection("dm");
+        connection.name = "生产库".to_string();
+
+        assert_eq!(
+            HomePage::editing_title_or_default(
+                "zh-CN",
+                Some(&connection),
+                "编辑 SSH 连接".to_string(),
+            ),
+            "编辑 生产库 连接"
+        );
+
+        connection.name = "  ".to_string();
+        assert_eq!(
+            HomePage::editing_title_or_default(
+                "zh-CN",
+                Some(&connection),
+                "编辑 SSH 连接".to_string(),
+            ),
+            "编辑 SSH 连接"
+        );
+    }
+
+    #[test]
+    fn typed_connection_title_uses_connection_name_only_when_editing() {
+        let mut connection = stored_external_connection("dm");
+        connection.name = "缓存集群".to_string();
+
+        assert_eq!(
+            HomePage::typed_connection_title_for_locale("zh-CN", true, "Redis", Some(&connection),),
+            "编辑 缓存集群 连接"
+        );
+        assert_eq!(
+            HomePage::typed_connection_title_for_locale("zh-CN", false, "Redis", Some(&connection),),
+            "新建 Redis 连接"
+        );
+    }
+
+    #[test]
     fn remote_desktop_connection_info_uses_remote_desktop_params() {
         let params = RemoteDesktopParams {
             protocol: StoredRemoteDesktopProtocol::Rdp,
@@ -257,6 +493,114 @@ mod external_driver_form_tests {
         };
 
         assert_eq!("10.0.0.9:5900", remote_desktop_connection_info(&params));
+    }
+
+    #[test]
+    fn refreshed_pending_conflicts_clears_stale_conflicts_after_clean_sync() {
+        let previous = vec![sync_conflict("cloud-1")];
+
+        let refreshed = refreshed_pending_conflicts(previous, Vec::new(), &[]);
+
+        assert!(refreshed.is_empty());
+    }
+
+    #[test]
+    fn refreshed_pending_conflicts_keeps_previous_when_sync_errors_without_fresh_conflicts() {
+        let previous = vec![sync_conflict("cloud-1")];
+        let errors = vec!["network failed".to_string()];
+
+        let refreshed = refreshed_pending_conflicts(previous.clone(), Vec::new(), &errors);
+
+        assert_eq!(1, refreshed.len());
+        assert_eq!(previous[0].cloud.id, refreshed[0].cloud.id);
+    }
+
+    #[test]
+    fn sync_route_uses_selected_provider() {
+        assert_eq!(
+            HomeSyncRoute::OnetCloud,
+            sync_route_for_provider(SyncProvider::OnetCloud)
+        );
+        assert_eq!(
+            HomeSyncRoute::Personal,
+            sync_route_for_provider(SyncProvider::Personal)
+        );
+    }
+
+    #[test]
+    fn team_key_button_is_visible_only_for_onetcloud_with_cached_teams() {
+        assert!(should_show_team_key_button(HomeSyncRoute::OnetCloud, 1));
+        assert!(should_show_team_key_button(HomeSyncRoute::OnetCloud, 3));
+        assert!(!should_show_team_key_button(HomeSyncRoute::OnetCloud, 0));
+        assert!(!should_show_team_key_button(HomeSyncRoute::Personal, 1));
+    }
+
+    #[test]
+    fn team_management_entry_follows_feature_gate() {
+        assert!(should_show_team_management_entry(true));
+        assert!(!should_show_team_management_entry(false));
+    }
+
+    #[test]
+    fn home_render_uses_cached_external_driver_registry() {
+        let source = include_str!("home_tab.rs");
+        let list_item = source
+            .rsplit("fn render_connection_list_item(")
+            .next()
+            .expect("render_connection_list_item exists")
+            .split("\n    fn render_connection_card(")
+            .next()
+            .expect("list item render has an end marker");
+        let card = source
+            .rsplit("fn render_connection_card(")
+            .next()
+            .expect("render_connection_card exists")
+            .split("impl Focusable for HomePage")
+            .next()
+            .expect("card render has an end marker");
+
+        assert!(source.contains("external_driver_registry: IpcDriverRegistry"));
+        assert!(list_item.contains("external_driver_icon_for_config_with_registry"));
+        assert!(card.contains("external_driver_icon_for_config_with_registry"));
+        assert!(!list_item.contains("IpcDriverRegistry::load_default()"));
+        assert!(!card.contains("IpcDriverRegistry::load_default()"));
+    }
+
+    fn sync_conflict(cloud_id: &str) -> SyncConflict {
+        SyncConflict {
+            local: StoredConnection::new_database(
+                "demo".to_string(),
+                DbConnectionConfig {
+                    id: String::new(),
+                    database_type: DatabaseType::MySQL,
+                    name: "demo".to_string(),
+                    host: "localhost".to_string(),
+                    port: 3306,
+                    username: String::new(),
+                    password: String::new(),
+                    database: None,
+                    service_name: None,
+                    sid: None,
+                    workspace_id: None,
+                    extra_params: std::collections::HashMap::new(),
+                },
+                None,
+            ),
+            cloud: CloudSyncData {
+                id: cloud_id.to_string(),
+                owner_id: "owner".to_string(),
+                team_id: None,
+                data_type: one_core::cloud_sync::data_type::CONNECTION.to_string(),
+                encrypted_data: String::new(),
+                key_version: 1,
+                checksum: String::new(),
+                version: 1,
+                updated_at: 1,
+                deleted_at: None,
+            },
+            cloud_name: "demo".to_string(),
+            conflict_type: ConflictType::LocalModifiedCloudDeleted,
+        }
     }
 }
 
@@ -315,11 +659,11 @@ impl HomePage {
             auth_error: None,
             master_key_unlock_prompt_pending: false,
             master_key_dialog_open: false,
+            sidebar_collapsed: false,
             port_forwarding_runtime: Arc::new(
                 tokio::sync::Mutex::new(PortForwardingRuntime::new()),
             ),
-            backup_error: None,
-            backing_up: false,
+            external_driver_registry: IpcDriverRegistry::empty(),
         };
 
         // 异步加载工作区
@@ -355,7 +699,7 @@ impl HomePage {
                         // 然后异步重新加载以确保数据一致性
                         this.load_connections(cx);
                         // 如果已登录且密钥已解锁，自动触发同步
-                        if this.current_user.is_some() && crypto::has_master_key() {
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("连接数据变化，自动触发云同步");
                             this.trigger_sync(cx);
                         }
@@ -374,19 +718,19 @@ impl HomePage {
                         // 然后异步重新加载以确保数据一致性
                         this.load_connections(cx);
                         // 如果已登录且密钥已解锁，自动触发同步
-                        if this.current_user.is_some() && crypto::has_master_key() {
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("连接数据变化，自动触发云同步");
                             this.trigger_sync(cx);
                         }
                     }
-                    ConnectionDataEvent::ConnectionDeleted { connection_id } => {
+                    ConnectionDataEvent::ConnectionDeleted { connection_id, .. } => {
                         // 立即从列表中移除连接
                         this.connections.retain(|c| c.id != Some(*connection_id));
                         cx.notify();
                         // 然后异步重新加载以确保数据一致性
                         this.load_connections(cx);
                         // 如果已登录且密钥已解锁，自动触发同步
-                        if this.current_user.is_some() && crypto::has_master_key() {
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("连接数据变化，自动触发云同步");
                             this.trigger_sync(cx);
                         }
@@ -396,7 +740,7 @@ impl HomePage {
                     | ConnectionDataEvent::WorkspaceDeleted { .. } => {
                         this.load_workspaces(cx);
                         // 如果已登录且密钥已解锁，自动触发同步
-                        if this.current_user.is_some() && crypto::has_master_key() {
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("工作区数据变化，自动触发云同步");
                             this.trigger_sync(cx);
                         }
@@ -449,18 +793,22 @@ impl HomePage {
         }
 
         let storage = cx.global::<GlobalStorageState>().storage.clone();
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let result = (|| {
+        let load_task = cx.background_spawn(async move {
+            (|| {
                 let repo = storage
                     .get::<ConnectionRepository>()
                     .ok_or_else(|| anyhow::anyhow!("ConnectionRepository not found"))?;
-                repo.list()
-            })();
+                Ok::<_, anyhow::Error>((repo.list()?, IpcDriverRegistry::load_default()))
+            })()
+        });
 
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = load_task.await;
             match result {
-                Ok(connections) => {
+                Ok((connections, external_driver_registry)) => {
                     _ = this.update(cx, |this, cx| {
                         this.connections = connections;
+                        this.external_driver_registry = external_driver_registry;
                         cx.notify();
                     });
                 }
@@ -472,11 +820,34 @@ impl HomePage {
         .detach();
     }
 
-    pub(crate) fn cards_reorder_enabled(&self, cx: &App) -> bool {
-        self.selected_filter == ConnectionType::All && self.search_query.read(cx).is_empty()
+    /// 拖拽排序：将 `from` 位置的连接移动到 `to` 位置，并异步持久化 sort_order。
+    #[allow(dead_code)]
+    fn reorder_connections(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.connections.len() || to >= self.connections.len() || from == to {
+            return;
+        }
+        let conn = self.connections.remove(from);
+        self.connections.insert(to, conn);
+
+        let orders: Vec<(i64, i32)> = self
+            .connections
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.id.map(|id| (id, i as i32)))
+            .collect();
+
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        cx.spawn(async move |_, _| {
+            if let Some(repo) = storage.get::<ConnectionRepository>() {
+                let _ = repo.update_sort_orders(&orders);
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
-    pub(crate) fn move_connection_card(
+    #[allow(dead_code)]
+    fn reorder_connection_by_id(
         &mut self,
         from_id: i64,
         workspace_id: Option<i64>,
@@ -548,7 +919,79 @@ impl HomePage {
         .detach();
     }
 
-    pub(crate) fn refresh_local_home_data(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reorder_workspace_by_id(
+        &mut self,
+        source_id: i64,
+        target_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if source_id == target_id {
+            return;
+        }
+        let from = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == Some(source_id));
+        let to = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == Some(target_id));
+        if let (Some(from), Some(to)) = (from, to) {
+            self.reorder_workspaces(from, to, cx);
+        }
+    }
+
+    fn reorder_workspaces(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.workspaces.len() || to >= self.workspaces.len() || from == to {
+            return;
+        }
+        let moved_workspace_id = self.workspaces[from].id;
+        let workspace = self.workspaces.remove(from);
+        self.workspaces.insert(to, workspace);
+
+        let orders: Vec<(i64, i32)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| workspace.id.map(|id| (id, index as i32)))
+            .collect();
+        for (index, workspace) in self.workspaces.iter_mut().enumerate() {
+            workspace.sort_order = Some(index as i32);
+        }
+
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        cx.spawn(async move |this, cx| {
+            let result = storage
+                .get::<WorkspaceRepository>()
+                .ok_or_else(|| anyhow::anyhow!("WorkspaceRepository not found"))
+                .and_then(|repo| repo.update_sort_orders(&orders));
+
+            _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Some(workspace_id) = moved_workspace_id {
+                            emit_connection_event(
+                                ConnectionDataEvent::WorkspaceUpdated { workspace_id },
+                                cx,
+                            );
+                        }
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
+                            tracing::info!("工作区排序变化，自动触发云同步");
+                            this.trigger_sync(cx);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!("更新工作区排序失败: {error}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn refresh_local_home_data(&mut self, cx: &mut Context<Self>) {
         self.load_workspaces(cx);
         self.load_connections(cx);
     }
@@ -605,7 +1048,12 @@ impl HomePage {
     /// 2. 计算同步计划（上传、下载、冲突检测）
     /// 3. 执行同步操作
     /// 4. 更新本地状态
-    pub(crate) fn trigger_sync(&mut self, cx: &mut Context<Self>) {
+    fn trigger_sync(&mut self, cx: &mut Context<Self>) {
+        if sync_route(cx) == HomeSyncRoute::Personal {
+            crate::personal_sync_runtime::sync_now(cx);
+            return;
+        }
+
         // 检查 License
         if !is_feature_enabled(Feature::CloudSync, cx) {
             tracing::debug!("云同步功能需要 Pro 订阅");
@@ -614,18 +1062,6 @@ impl HomePage {
 
         if self.current_user.is_none() {
             self.cloud_error = Some(t!("Home.cloud_need_login").to_string());
-            cx.notify();
-            return;
-        }
-
-        if !self.pending_conflicts.is_empty() {
-            self.cloud_error = Some(
-                t!(
-                    "Home.conflict_tooltip",
-                    count = self.pending_conflicts.len()
-                )
-                .to_string(),
-            );
             cx.notify();
             return;
         }
@@ -673,11 +1109,14 @@ impl HomePage {
                         );
                         this.cloud_error = None;
 
-                        // 如果有冲突，保存并显示冲突解决对话框
                         if !stats.conflicts.is_empty() {
                             tracing::warn!("同步存在 {} 个冲突需要处理", stats.conflicts.len());
-                            this.pending_conflicts = stats.conflicts;
                         }
+                        this.pending_conflicts = refreshed_pending_conflicts(
+                            std::mem::take(&mut this.pending_conflicts),
+                            stats.conflicts,
+                            &stats.errors,
+                        );
 
                         // 如果有错误，显示第一个错误
                         if !stats.errors.is_empty() {
@@ -744,186 +1183,62 @@ impl HomePage {
 
         let conflicts = self.pending_conflicts.clone();
         let view = cx.entity().clone();
-
-        // 为每个冲突创建默认策略（使用建议的策略）
-        let mut default_strategies = std::collections::HashMap::new();
-        for conflict in &conflicts {
-            let suggested = match conflict.conflict_type {
-                one_core::cloud_sync::ConflictType::BothModified => ConflictResolution::KeepBoth,
-                one_core::cloud_sync::ConflictType::LocalDeletedCloudModified => {
-                    ConflictResolution::UseCloud
+        let conflict_count = conflicts.len();
+        let options = vec![
+            crate::sync_conflict_dialog::SyncConflictResolutionOption {
+                strategy: ConflictResolution::UseCloud,
+                label: SharedString::from(t!("Home.sync_conflict_use_cloud").to_string()),
+            },
+            crate::sync_conflict_dialog::SyncConflictResolutionOption {
+                strategy: ConflictResolution::UseLocal,
+                label: SharedString::from(t!("Home.sync_conflict_use_local").to_string()),
+            },
+            crate::sync_conflict_dialog::SyncConflictResolutionOption {
+                strategy: ConflictResolution::KeepBoth,
+                label: SharedString::from(t!("Home.sync_conflict_keep_both").to_string()),
+            },
+        ];
+        let items = conflicts
+            .iter()
+            .map(|conflict| {
+                let suggested = match conflict.conflict_type {
+                    one_core::cloud_sync::ConflictType::BothModified => {
+                        ConflictResolution::KeepBoth
+                    }
+                    one_core::cloud_sync::ConflictType::LocalDeletedCloudModified => {
+                        ConflictResolution::UseCloud
+                    }
+                    one_core::cloud_sync::ConflictType::LocalModifiedCloudDeleted => {
+                        ConflictResolution::UseLocal
+                    }
+                };
+                crate::sync_conflict_dialog::SyncConflictDialogItem {
+                    id: conflict.cloud.id.clone(),
+                    title: conflict.local.name.clone(),
+                    detail: t!(
+                        "Home.sync_conflict_type",
+                        conflict_type = format!("{}", conflict.conflict_type)
+                    )
+                    .to_string(),
+                    default_strategy: suggested,
+                    options: options.clone(),
                 }
-                one_core::cloud_sync::ConflictType::LocalModifiedCloudDeleted => {
-                    ConflictResolution::UseLocal
-                }
-            };
-            default_strategies.insert(conflict.cloud.id.clone(), suggested);
-        }
+            })
+            .collect();
 
-        // 创建策略选择状态
-        let strategies = cx.new(|_| default_strategies);
-
-        window.open_dialog(cx, move |dialog, _window, cx| {
-            let conflicts_count = conflicts.len();
-            let conflict_items: Vec<AnyElement> = conflicts
-                .iter()
-                .map(|conflict| {
-                    let local_name = conflict.local.name.clone();
-                    let conflict_type = format!("{}", conflict.conflict_type);
-                    let cloud_id = conflict.cloud.id.clone();
-                    let strategies_clone = strategies.clone();
-
-                    // 获取当前选择的策略
-                    let current_strategy = strategies
-                        .read(cx)
-                        .get(&cloud_id)
-                        .copied()
-                        .unwrap_or(ConflictResolution::UseCloud);
-
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p_3()
-                        .bg(gpui::hsla(0.0, 0.0, 0.5, 0.1))
-                        .rounded_md()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!("📄 {}", local_name)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(gpui::hsla(0.0, 0.0, 0.5, 1.0))
-                                .child(
-                                    t!("Home.sync_conflict_type", conflict_type = conflict_type)
-                                        .to_string(),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .mt_2()
-                                .child(
-                                    Button::new(ElementId::Name(
-                                        format!("use_cloud_{}", cloud_id).into(),
-                                    ))
-                                    .label(t!("Home.sync_conflict_use_cloud"))
-                                    .with_variant(
-                                        if current_strategy == ConflictResolution::UseCloud {
-                                            ButtonVariant::Primary
-                                        } else {
-                                            ButtonVariant::Ghost
-                                        },
-                                    )
-                                    .xsmall()
-                                    .on_click({
-                                        let cloud_id = cloud_id.clone();
-                                        let strategies = strategies_clone.clone();
-                                        move |_, _, cx| {
-                                            strategies.update(cx, |s, cx| {
-                                                s.insert(
-                                                    cloud_id.clone(),
-                                                    ConflictResolution::UseCloud,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                                )
-                                .child(
-                                    Button::new(ElementId::Name(
-                                        format!("use_local_{}", cloud_id).into(),
-                                    ))
-                                    .label(t!("Home.sync_conflict_use_local"))
-                                    .with_variant(
-                                        if current_strategy == ConflictResolution::UseLocal {
-                                            ButtonVariant::Primary
-                                        } else {
-                                            ButtonVariant::Ghost
-                                        },
-                                    )
-                                    .xsmall()
-                                    .on_click({
-                                        let cloud_id = cloud_id.clone();
-                                        let strategies = strategies_clone.clone();
-                                        move |_, _, cx| {
-                                            strategies.update(cx, |s, cx| {
-                                                s.insert(
-                                                    cloud_id.clone(),
-                                                    ConflictResolution::UseLocal,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                                )
-                                .child(
-                                    Button::new(ElementId::Name(
-                                        format!("keep_both_{}", cloud_id).into(),
-                                    ))
-                                    .label(t!("Home.sync_conflict_keep_both"))
-                                    .with_variant(
-                                        if current_strategy == ConflictResolution::KeepBoth {
-                                            ButtonVariant::Primary
-                                        } else {
-                                            ButtonVariant::Ghost
-                                        },
-                                    )
-                                    .xsmall()
-                                    .on_click({
-                                        let strategies = strategies_clone.clone();
-                                        move |_, _, cx| {
-                                            strategies.update(cx, |s, cx| {
-                                                s.insert(
-                                                    cloud_id.clone(),
-                                                    ConflictResolution::KeepBoth,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                                ),
-                        )
-                        .into_any_element()
-                })
-                .collect();
-
-            let view_clone = view.clone();
-            let strategies_for_ok = strategies.clone();
-
-            dialog
-                .title(
-                    t!("Home.sync_conflict_dialog_title", count = conflicts_count)
-                        .to_string()
-                        .into_any_element(),
-                )
-                .child(
-                    div()
-                        .id("conflict_items")
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .max_h(px(400.0))
-                        .overflow_y_scroll()
-                        .children(conflict_items)
-                        .into_any_element(),
-                )
-                .confirm()
-                .button_props(
-                    gpui_component::dialog::DialogButtonProps::default()
-                        .ok_text(t!("Home.sync_conflict_apply")),
-                )
-                .on_ok(move |_event, _window, cx| {
-                    let selected_strategies = strategies_for_ok.read(cx).clone();
-                    view_clone.update(cx, |this, cx| {
-                        this.resolve_conflicts_individually(selected_strategies, cx);
-                    });
-                    true
-                })
-        });
+        crate::sync_conflict_dialog::show_sync_conflict_dialog(
+            window,
+            cx,
+            t!("Home.sync_conflict_dialog_title", count = conflict_count).to_string(),
+            t!("Home.sync_conflict_apply").to_string(),
+            items,
+            move |selected, _window, cx| {
+                let selected_strategies = selected.into_iter().collect();
+                view.update(cx, |this, cx| {
+                    this.resolve_conflicts_individually(selected_strategies, cx);
+                });
+            },
+        );
     }
 
     /// 使用单独的策略解决每个冲突
@@ -1031,7 +1346,7 @@ impl HomePage {
                     cx.notify();
 
                     // 如果密钥已解锁，自动触发同步
-                    if crypto::has_master_key() {
+                    if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                         tracing::info!("会话已恢复且密钥已解锁，自动触发云同步");
                         this.trigger_sync(cx);
                     }
@@ -1077,7 +1392,7 @@ impl HomePage {
 
                         this.auth_error = None;
                         // 登录成功后，如果密钥已解锁，自动触发同步
-                        if crypto::has_master_key() {
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("登录成功且密钥已解锁，自动触发云同步");
                             this.trigger_sync(cx);
                         }
@@ -1298,6 +1613,7 @@ impl HomePage {
                         emit_connection_event(
                             ConnectionDataEvent::ConnectionDeleted {
                                 connection_id: conn_id,
+                                cloud_id: cloud_id.clone(),
                             },
                             cx,
                         );
@@ -1365,10 +1681,19 @@ impl HomePage {
         self.editing_connection_id = None;
         let parent = cx.entity();
         let parent_window = window.window_handle();
+        let external_driver_registry = self.external_driver_registry.clone();
         open_popup_window(
             PopupWindowOptions::new(t!("Home.new_connection").to_string()).size(1100.0, 700.0),
             move |window, cx| {
-                cx.new(|cx| NewConnectionWindow::new(parent, parent_window, window, cx))
+                cx.new(|cx| {
+                    NewConnectionWindow::new(
+                        parent,
+                        parent_window,
+                        external_driver_registry.clone(),
+                        window,
+                        cx,
+                    )
+                })
             },
             cx,
         );
@@ -1415,6 +1740,7 @@ impl HomePage {
         &mut self,
         workspace_id: Option<i64>,
         name: String,
+        sort_order: Option<i32>,
         cx: &mut Context<Self>,
     ) {
         let storage = cx.global::<GlobalStorageState>().storage.clone();
@@ -1429,10 +1755,13 @@ impl HomePage {
                 .cloned()
                 .unwrap_or_else(|| Workspace::new(name.clone()));
             ws.name = name;
+            ws.sort_order = sort_order.or(ws.sort_order);
             ws
         } else {
             // 新建模式
-            Workspace::new(name)
+            let mut workspace = Workspace::new(name);
+            workspace.sort_order = sort_order;
+            workspace
         };
 
         let result: anyhow::Result<Workspace> = (|| {
@@ -1473,7 +1802,7 @@ impl HomePage {
                         );
                     }
                     // 兜底触发一次自动同步，避免当前页对自身工作区事件未回流时漏同步。
-                    if this.current_user.is_some() && crypto::has_master_key() {
+                    if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                         tracing::info!("本地工作区保存成功，自动触发云同步");
                         this.trigger_sync(cx);
                     }
@@ -1583,11 +1912,14 @@ impl HomePage {
                         this.workspaces.retain(|w| w.id != Some(workspace_id));
                         this.filtered_workspace_ids.remove(&workspace_id);
                         emit_connection_event(
-                            ConnectionDataEvent::WorkspaceDeleted { workspace_id },
+                            ConnectionDataEvent::WorkspaceDeleted {
+                                workspace_id,
+                                cloud_id: cloud_id.clone(),
+                            },
                             cx,
                         );
                         // 兜底触发一次自动同步，避免当前页对自身工作区事件未回流时漏同步。
-                        if this.current_user.is_some() && crypto::has_master_key() {
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("本地工作区删除成功，自动触发云同步");
                             this.trigger_sync(cx);
                         }
@@ -1602,6 +1934,51 @@ impl HomePage {
         .detach();
     }
 
+    fn external_driver_name_for_title(
+        driver_id: Option<&str>,
+        registry: &IpcDriverRegistry,
+    ) -> Option<String> {
+        driver_id.and_then(|driver_id| registry.find(driver_id).map(|driver| driver.name))
+    }
+
+    fn connection_title_for_locale(
+        locale: &str,
+        is_editing: bool,
+        db_type: &DatabaseType,
+        connection_name: Option<&str>,
+        external_driver_name: Option<&str>,
+    ) -> String {
+        let db_type_label = connection_name
+            .filter(|name| is_editing && !name.trim().is_empty())
+            .or_else(|| external_driver_name.filter(|name| !name.trim().is_empty()))
+            .unwrap_or_else(|| db_type.as_str());
+
+        db::translate_connection_title_for_locale(locale, is_editing, db_type_label)
+    }
+
+    fn editing_title_or_default(
+        locale: &str,
+        editing_connection: Option<&StoredConnection>,
+        default_title: String,
+    ) -> String {
+        editing_connection
+            .and_then(|connection| non_empty_name(&connection.name))
+            .map(|name| db::translate_connection_title_for_locale(locale, true, name))
+            .unwrap_or(default_title)
+    }
+
+    fn typed_connection_title_for_locale(
+        locale: &str,
+        is_editing: bool,
+        type_label: &str,
+        editing_connection: Option<&StoredConnection>,
+    ) -> String {
+        let label = editing_connection
+            .filter(|_| is_editing)
+            .and_then(|connection| non_empty_name(&connection.name))
+            .unwrap_or(type_label);
+        db::translate_connection_title_for_locale(locale, is_editing, label)
+    }
     pub(crate) fn show_connection_form(
         &mut self,
         db_type: DatabaseType,
@@ -1620,10 +1997,7 @@ impl HomePage {
         if let Some(driver_id) =
             external_driver_id_for_connection_form(&db_type, editing_conn.as_ref())
         {
-            if db::ipc::IpcDriverRegistry::load_default()
-                .find(&driver_id)
-                .is_none()
-            {
+            if self.external_driver_registry.find(&driver_id).is_none() {
                 let connection_name = editing_conn
                     .as_ref()
                     .map(|connection| connection.name.clone())
@@ -1647,21 +2021,36 @@ impl HomePage {
         let config = ConnectionFormWindowConfig {
             db_type: db_type.clone(),
             external_driver_id: None,
+            external_driver_registry: self.external_driver_registry.clone(),
             editing_connection: editing_conn,
+            initial_connection: None,
+            on_saved: None,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
             ssh_connections,
         };
 
         self.editing_connection_id = None;
-
+        let external_driver_id = external_driver_id_for_connection_form(
+            &config.db_type,
+            config.editing_connection.as_ref(),
+        );
+        let external_driver_name = Self::external_driver_name_for_title(
+            external_driver_id.as_deref(),
+            &config.external_driver_registry,
+        );
+        let title = Self::connection_title_for_locale(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.is_some(),
+            &config.db_type,
+            config
+                .editing_connection
+                .as_ref()
+                .map(|connection| connection.name.as_str()),
+            external_driver_name.as_deref(),
+        );
         open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
-                t!("Connection.edit", db_type = db_type.as_str()).to_string()
-            } else {
-                t!("Connection.new", db_type = db_type.as_str()).to_string()
-            })
-            .size(700.0, 650.0),
+            PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| ConnectionFormWindow::new(config, window, cx)),
             cx,
         );
@@ -1683,19 +2072,25 @@ impl HomePage {
 
         let config = SshFormWindowConfig {
             editing_connection: editing_conn,
+            initial_connection: None,
+            on_saved: None,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
         };
 
         self.editing_connection_id = None;
 
-        open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
+        let title = Self::editing_title_or_default(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.as_ref(),
+            if config.editing_connection.is_some() {
                 t!("SSH.edit").to_string()
             } else {
                 t!("SSH.new").to_string()
-            })
-            .size(700.0, 650.0),
+            },
+        );
+        open_popup_window(
+            PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| SshFormWindow::new(config, window, cx)),
             cx,
         );
@@ -1717,6 +2112,8 @@ impl HomePage {
 
         let config = RedisFormWindowConfig {
             editing_connection: editing_conn,
+            initial_connection: None,
+            on_saved: None,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
             ssh_connections: self
@@ -1729,13 +2126,14 @@ impl HomePage {
 
         self.editing_connection_id = None;
 
+        let title = Self::typed_connection_title_for_locale(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.is_some(),
+            "Redis",
+            config.editing_connection.as_ref(),
+        );
         open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
-                t!("Connection.edit", db_type = "Redis").to_string()
-            } else {
-                t!("Connection.new", db_type = "Redis").to_string()
-            })
-            .size(700.0, 650.0),
+            PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| RedisFormWindow::new(config, window, cx)),
             cx,
         );
@@ -1757,19 +2155,22 @@ impl HomePage {
 
         let config = MongoFormWindowConfig {
             editing_connection: editing_conn,
+            initial_connection: None,
+            on_saved: None,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
         };
 
         self.editing_connection_id = None;
 
+        let title = Self::typed_connection_title_for_locale(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.is_some(),
+            "MongoDB",
+            config.editing_connection.as_ref(),
+        );
         open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
-                t!("Connection.edit", db_type = "MongoDB").to_string()
-            } else {
-                t!("Connection.new", db_type = "MongoDB").to_string()
-            })
-            .size(700.0, 520.0),
+            PopupWindowOptions::new(title).size(700.0, 650.0),
             move |window, cx| cx.new(|cx| MongoFormWindow::new(config, window, cx)),
             cx,
         );
@@ -1797,13 +2198,17 @@ impl HomePage {
 
         self.editing_connection_id = None;
 
-        open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
+        let title = Self::editing_title_or_default(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.as_ref(),
+            if config.editing_connection.is_some() {
                 t!("Serial.edit").to_string()
             } else {
                 t!("Serial.new").to_string()
-            })
-            .size(700.0, 600.0),
+            },
+        );
+        open_popup_window(
+            PopupWindowOptions::new(title).size(700.0, 600.0),
             move |window, cx| cx.new(|cx| SerialFormWindow::new(config, window, cx)),
             cx,
         );
@@ -1840,13 +2245,17 @@ impl HomePage {
 
         self.editing_connection_id = None;
 
-        open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
+        let title = Self::editing_title_or_default(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.as_ref(),
+            if config.editing_connection.is_some() {
                 t!("PortForwarding.edit").to_string()
             } else {
                 t!("PortForwarding.new").to_string()
-            })
-            .size(700.0, 520.0),
+            },
+        );
+        open_popup_window(
+            PopupWindowOptions::new(title).size(700.0, 520.0),
             move |window, cx| cx.new(|cx| PortForwardingFormWindow::new(config, window, cx)),
             cx,
         );
@@ -1991,13 +2400,17 @@ impl HomePage {
 
         self.editing_connection_id = None;
 
-        open_popup_window(
-            PopupWindowOptions::new(if config.editing_connection.is_some() {
+        let title = Self::editing_title_or_default(
+            rust_i18n::locale().as_ref(),
+            config.editing_connection.as_ref(),
+            if config.editing_connection.is_some() {
                 t!("RemoteDesktopForm.title_edit", protocol = protocol.label()).to_string()
             } else {
                 t!("RemoteDesktopForm.title_new", protocol = protocol.label()).to_string()
-            })
-            .size(700.0, 560.0),
+            },
+        );
+        open_popup_window(
+            PopupWindowOptions::new(title).size(700.0, 560.0),
             move |window, cx| cx.new(|cx| RemoteDesktopFormWindow::new(config, window, cx)),
             cx,
         );
@@ -2174,7 +2587,7 @@ impl HomePage {
                             if crypto::has_master_key() {
                                 // 密钥已就绪后刷新连接列表，修复启动时序导致的空密码回显
                                 this.load_connections(cx);
-                                if this.current_user.is_some() {
+                                if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                                     tracing::info!("密钥设置/解锁成功，自动触发云同步");
                                     this.trigger_sync(cx);
                                 }
@@ -2221,6 +2634,409 @@ impl HomePage {
         });
     }
 
+    fn team_management_url(&self) -> Result<String, String> {
+        let Some((access_token, refresh_token, _, _)) = load_auth_data() else {
+            return Err(t!("Home.cloud_need_login").to_string());
+        };
+
+        let template = team_management_url_template();
+        let template = template.trim();
+        let url = build_team_management_url(template, &access_token, &refresh_token);
+        Ok(resolve_team_management_url(
+            &url,
+            public_base_url().as_deref(),
+        ))
+    }
+
+    fn open_team_management(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.team_management_url() {
+            Ok(url) => cx.open_url(&url),
+            Err(message) => window.push_notification(message, cx),
+        }
+    }
+
+    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+
+        let workspace_filter_open = self.workspace_filter_open;
+        let workspace_filter =
+            self.render_workspace_filter_popover(workspace_filter_open, window, cx);
+
+        let is_syncing = self.syncing;
+        let is_logged_in = self.current_user.is_some();
+        let has_sync_license = is_feature_enabled(Feature::CloudSync, cx);
+        let route = sync_route(cx);
+        let personal_syncing = matches!(
+            crate::personal_sync_runtime::runtime_status(cx),
+            crate::personal_sync_status::PersonalSyncRuntimeStatus::Syncing
+        );
+        let personal_sync_ready = crate::personal_sync_runtime::actions_enabled(cx);
+        let sync_disabled = match route {
+            HomeSyncRoute::OnetCloud => (!is_logged_in && has_sync_license) || is_syncing,
+            HomeSyncRoute::Personal => !personal_sync_ready || personal_syncing,
+        };
+        let has_master_key = crypto::has_master_key();
+        let show_team_key_button =
+            should_show_team_key_button(route, get_cached_team_options(cx).len());
+        let personal_conflict_count = if route == HomeSyncRoute::Personal {
+            crate::personal_sync_conflicts::current_personal_conflict_count(cx)
+        } else {
+            0
+        };
+        let conflict_count = match route {
+            HomeSyncRoute::OnetCloud => self.pending_conflicts.len(),
+            HomeSyncRoute::Personal => personal_conflict_count,
+        };
+        let has_conflicts = conflict_count > 0;
+
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .items_center()
+            .justify_between()
+            // ===== 左侧功能区 =====
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    // 新建连接按钮（主要操作）
+                    .child(
+                        Button::new("new-connect-button")
+                            .icon(IconName::Plus)
+                            .primary()
+                            .label(t!("Home.new_connection"))
+                            .tooltip(t!("Home.new_connection"))
+                            .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                                this.show_new_connection_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("import-connection-button")
+                            .icon(IconName::Upload)
+                            .label(t!("Home.other_app_import"))
+                            .tooltip(t!("Home.other_app_import"))
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    show_connection_import_window(
+                                        view.clone(),
+                                        window.window_handle(),
+                                        cx,
+                                    );
+                                }
+                            }),
+                    )
+                    // 分隔线
+                    .child(div().h(px(20.0)).w(px(1.0)).bg(cx.theme().border).mx_1())
+                    // 同步按钮
+                    .child(
+                        Button::new("sync-button")
+                            .icon(if has_sync_license {
+                                IconName::Refresh
+                            } else {
+                                IconName::Key
+                            })
+                            .label(if is_syncing || personal_syncing {
+                                t!("Home.syncing").to_string()
+                            } else if route == HomeSyncRoute::OnetCloud && !has_sync_license {
+                                t!("License.upgrade_to_pro").to_string()
+                            } else {
+                                t!("Home.sync").to_string()
+                            })
+                            .ghost()
+                            .disabled(sync_disabled)
+                            .tooltip(
+                                if route == HomeSyncRoute::Personal && !personal_sync_ready {
+                                    t!("Settings.Sync.Status.not_configured")
+                                } else if route == HomeSyncRoute::OnetCloud
+                                    && !is_logged_in
+                                    && has_sync_license
+                                {
+                                    t!("Home.cloud_need_login")
+                                } else if route == HomeSyncRoute::OnetCloud && !has_sync_license {
+                                    t!("License.pro_required")
+                                } else {
+                                    t!("Home.sync_tooltip")
+                                },
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if sync_route(cx) == HomeSyncRoute::OnetCloud && !has_sync_license {
+                                    show_upgrade_dialog(window, cx);
+                                } else {
+                                    this.trigger_sync(cx);
+                                }
+                            })),
+                    )
+                    // 冲突指示器
+                    .when(has_conflicts, |this| {
+                        this.child(
+                            Button::new("conflict-button")
+                                .icon(IconName::TriangleAlert)
+                                .label(format!("{}", conflict_count))
+                                .ghost()
+                                .text_color(cx.theme().warning)
+                                .tooltip(if route == HomeSyncRoute::Personal {
+                                    t!(
+                                        "Home.personal_sync_conflict_tooltip",
+                                        count = conflict_count
+                                    )
+                                    .to_string()
+                                } else {
+                                    t!("Home.conflict_tooltip", count = conflict_count).to_string()
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if sync_route(cx) == HomeSyncRoute::Personal {
+                                        crate::personal_sync_conflicts::show_personal_conflict_dialog(
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        this.show_conflict_dialog(window, cx);
+                                    }
+                                })),
+                        )
+                    })
+                    // 主密钥按钮
+                    .child(
+                        Button::new("encryption-key-button")
+                            .icon(IconName::Key)
+                            .label(if has_master_key {
+                                t!("Encryption.key_unlocked").to_string()
+                            } else {
+                                t!("Encryption.edit_repo_password").to_string()
+                            })
+                            .ghost()
+                            .when(has_master_key, |btn| btn.text_color(cx.theme().success))
+                            .when(!has_master_key, |btn| {
+                                btn.text_color(cx.theme().muted_foreground)
+                            })
+                            .tooltip(if has_master_key {
+                                t!("Encryption.key_unlocked_tooltip")
+                            } else {
+                                t!("Encryption.key_locked_tooltip")
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_encryption_key_dialog(window, cx);
+                            })),
+                    )
+                    .when(show_team_key_button, |this| {
+                        this.child(
+                            Button::new("team-key-button")
+                                .icon(IconName::Key)
+                                .label(t!("TeamSync.manage_keys").to_string())
+                                .ghost()
+                                .tooltip(t!("TeamSync.key_help").to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_team_key_settings_tab(window, cx);
+                                })),
+                        )
+                    }),
+            )
+            // ===== 右侧操作区 =====
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_1()
+                    .items_center()
+                    // 搜索框
+                    .child(
+                        Input::new(&self.search_input)
+                            .cleanable(true)
+                            .w(px(240.0))
+                            .bg(cx.theme().muted),
+                    )
+                    // 布局切换按钮
+                    .child({
+                        let is_card = self.connection_layout == ConnectionLayout::Card;
+                        let tooltip = if is_card {
+                            t!("Home.list_view").to_string()
+                        } else {
+                            t!("Home.card_view").to_string()
+                        };
+                        Button::new("layout-toggle")
+                            .icon(if is_card {
+                                IconName::LayoutDashboard
+                            } else {
+                                IconName::Menu
+                            })
+                            .ghost()
+                            .tooltip(tooltip)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.connection_layout = this.connection_layout.toggle();
+                                cx.notify();
+                            }))
+                    })
+                    // 刷新按钮
+                    .child(
+                        Button::new("refresh-button")
+                            .icon(IconName::Refresh)
+                            .ghost()
+                            .tooltip(t!("Home.refresh"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_local_home_data(cx);
+                            })),
+                    )
+                    // 工作区筛选
+                    .child(workspace_filter),
+            )
+    }
+
+    fn render_workspace_filter_popover(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.entity();
+        let view_for_select = view.clone();
+        let view_for_clear = view.clone();
+        let view_for_new = view.clone();
+
+        let list = self.ensure_workspace_filter_list(window, cx);
+
+        let workspaces = &self.workspaces;
+        let connections = &self.connections;
+        let filtered_ids = &self.filtered_workspace_ids;
+        list.update(cx, |state, _cx| {
+            state
+                .delegate_mut()
+                .update_items_with_data(workspaces, connections, filtered_ids);
+        });
+
+        let is_all_selected = self.filtered_workspace_ids.is_empty()
+            || self.filtered_workspace_ids.len()
+                == self.workspaces.iter().filter(|w| w.id.is_some()).count();
+
+        Popover::new("workspace-filter-popover")
+            .trigger(
+                Button::new("workspace-filter")
+                    .icon(IconName::Filter)
+                    .tooltip(t!("Workspace.filter")),
+            )
+            .open(open)
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                this.workspace_filter_open = *open;
+                cx.notify();
+            }))
+            .content(move |_, _, cx| {
+                v_flex()
+                    .w(px(280.0))
+                    .max_h(px(400.0))
+                    .gap_2()
+                    .p_2()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .px_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child({
+                                        let view_select = view_for_select.clone();
+                                        Checkbox::new("select-all-ws")
+                                            .checked(is_all_selected)
+                                            .on_click(move |_, _, cx| {
+                                                view_select.update(cx, |this, cx| {
+                                                    if this.filtered_workspace_ids.is_empty()
+                                                        || this.filtered_workspace_ids.len()
+                                                            == this
+                                                                .workspaces
+                                                                .iter()
+                                                                .filter(|w| w.id.is_some())
+                                                                .count()
+                                                    {
+                                                        this.clear_workspace_filter(cx);
+                                                    } else {
+                                                        this.select_all_workspaces(cx);
+                                                    }
+                                                });
+                                            })
+                                    })
+                                    .child(div().text_sm().child(
+                                        t!("Workspace.select_all").to_string().into_any_element(),
+                                    )),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child({
+                                        let view_new = view_for_new.clone();
+                                        Button::new("new-workspace-from-filter")
+                                            .primary()
+                                            .small()
+                                            .label(t!("Common.new"))
+                                            .on_click(move |_, window, cx| {
+                                                let sort_order =
+                                                    view_new.read(cx).workspaces.len() as i32;
+                                                show_workspace_dialog(
+                                                    view_new.clone(),
+                                                    None,
+                                                    String::new(),
+                                                    Some(sort_order),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                    })
+                                    .child({
+                                        let view_clear = view_for_clear.clone();
+                                        Button::new("clear-ws-filter")
+                                            .ghost()
+                                            .small()
+                                            .label(t!("Workspace.clear_filter"))
+                                            .on_click(move |_, _, cx| {
+                                                view_clear.update(cx, |this, cx| {
+                                                    this.clear_workspace_filter(cx);
+                                                });
+                                            })
+                                    }),
+                            ),
+                    )
+                    .child(div().border_t_1().border_color(cx.theme().border))
+                    .child(
+                        List::new(&list)
+                            .w_full()
+                            .max_h(px(320.0))
+                            .p(px(8.))
+                            .flex_1()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius),
+                    )
+            })
+            .into_any_element()
+    }
+
+    fn ensure_workspace_filter_list(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ListState<WorkspaceFilterDelegate>> {
+        if let Some(ref list) = self.workspace_filter_list {
+            return list.clone();
+        }
+
+        let parent = cx.entity();
+        let list = cx.new(|cx| {
+            ListState::new(WorkspaceFilterDelegate::new(parent), window, cx).searchable(true)
+        });
+        self.workspace_filter_list = Some(list.clone());
+        list
+    }
+
     pub(crate) fn toggle_workspace_filter(&mut self, workspace_id: i64, cx: &mut Context<Self>) {
         if self.filtered_workspace_ids.is_empty() {
             for ws in &self.workspaces {
@@ -2253,7 +3069,231 @@ impl HomePage {
         cx.notify();
     }
 
-    pub(crate) fn match_connection_type(&self, conn: &StoredConnection) -> bool {
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    fn render_sidebar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 同步全局用户状态：如果设置页面执行了登出，同步清空本地状态
+        let global_user = GlobalCurrentUser::get_user(cx);
+        if global_user.is_none() && self.current_user.is_some() {
+            self.current_user = None;
+        }
+
+        let filter_types = ConnectionType::all();
+        let collapsed = self.sidebar_collapsed;
+        let show_team_management_entry =
+            should_show_team_management_entry(is_feature_enabled(Feature::TeamManagement, cx));
+        let sidebar_width = if collapsed {
+            HOME_SIDEBAR_COLLAPSED_WIDTH
+        } else {
+            HOME_SIDEBAR_EXPANDED_WIDTH
+        };
+
+        v_flex()
+            .relative()
+            .w(sidebar_width)
+            .h_full()
+            .flex_shrink_0()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                // 侧边栏过滤选项
+                v_flex()
+                    .flex_1()
+                    .w_full()
+                    .p_2()
+                    .gap_2()
+                    .when(collapsed, |this| this.items_center())
+                    .children(filter_types.into_iter().map(|filter_type| {
+                        let is_selected = self.selected_filter == filter_type;
+                        let filter_type_clone = filter_type;
+
+                        div()
+                            .id(filter_type.label())
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .w_full()
+                            .when(collapsed, |this| this.justify_center().px_0())
+                            .when(!collapsed, |this| this.px_3())
+                            .py_2()
+                            .cursor_pointer()
+                            .rounded_lg()
+                            .overflow_hidden()
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().list_active)
+                                    .border_l_3()
+                                    .border_color(cx.theme().list_active_border)
+                            })
+                            .when(!is_selected, |this| {
+                                this.bg(cx.theme().sidebar)
+                                    .hover(|style| style.bg(cx.theme().sidebar_accent))
+                            })
+                            .on_click(cx.listener(move |this: &mut HomePage, _, _window, cx| {
+                                this.selected_filter = filter_type_clone;
+                                cx.notify();
+                            }))
+                            .child(Icon::new(filter_type.icon()).color().with_size(Size::Large))
+                            .when(!collapsed, |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().foreground)
+                                        .when(is_selected, |this| {
+                                            this.font_weight(FontWeight::MEDIUM)
+                                        })
+                                        .child(filter_type.label()),
+                                )
+                            })
+                    })),
+            )
+            .child(
+                // 底部区域：主题切换、设置和用户头像
+                v_flex()
+                    .w_full()
+                    .when(collapsed, |this| this.items_center().p_2())
+                    .when(!collapsed, |this| this.p_4())
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .when(show_team_management_entry, |this| {
+                        this.child(
+                            Button::new("open_team_management")
+                                .icon(IconName::TeamColor.color())
+                                .tooltip(t!("TeamManagement.title").to_string())
+                                .when(collapsed, |button| button.ghost().small())
+                                .when(!collapsed, |button| {
+                                    button
+                                        .label(t!("TeamManagement.title").to_string())
+                                        .w_full()
+                                        .justify_start()
+                                })
+                                .on_click(cx.listener(|this: &mut HomePage, _, window, cx| {
+                                    this.open_team_management(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("open_extensions")
+                            .icon(IconName::ExtensionsColor.color())
+                            .tooltip(t!("Home.extensions").to_string())
+                            .when(collapsed, |button| button.ghost().small())
+                            .when(!collapsed, |button| {
+                                button
+                                    .label(t!("Home.extensions").to_string())
+                                    .w_full()
+                                    .justify_start()
+                            })
+                            .on_click(cx.listener(|this: &mut HomePage, _, window, cx| {
+                                this.add_extensions_tab(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("open_settings")
+                            .icon(IconName::SettingColor.color())
+                            .tooltip(t!("Common.settings").to_string())
+                            .when(collapsed, |button| button.ghost().small())
+                            .when(!collapsed, |button| {
+                                button.label(t!("Common.settings")).w_full().justify_start()
+                            })
+                            .on_click(cx.listener(|this: &mut HomePage, _, window, cx| {
+                                this.add_settings_tab(window, cx);
+                            })),
+                    )
+                    // 用户头像区域
+                    .child({
+                        let user = self.current_user.as_ref();
+                        let view = cx.entity();
+                        v_flex()
+                            .relative()
+                            .w_full()
+                            .mt_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .when(collapsed, |this| {
+                                this.items_center().child(
+                                    Button::new("home-sidebar-user-collapsed")
+                                        .icon(IconName::User)
+                                        .ghost()
+                                        .small()
+                                        .tooltip(if user.is_some() {
+                                            "账号".to_string()
+                                        } else {
+                                            t!("Auth.login").to_string()
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if this.current_user.is_none() {
+                                                this.show_login_dialog(window, cx);
+                                            }
+                                        })),
+                                )
+                            })
+                            .when(!collapsed, |this| {
+                                this.child(render_user_avatar(
+                                    user,
+                                    view.clone(),
+                                    |this: &mut HomePage, window, cx| {
+                                        if this.current_user.is_none() {
+                                            this.show_login_dialog(window, cx);
+                                        }
+                                    },
+                                    cx,
+                                ))
+                            })
+                    }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.toggle_sidebar(cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("home-sidebar-toggle")
+                            .w(px(18.0))
+                            .h(px(52.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(9.0))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background)
+                            .shadow_sm()
+                            .hover(|this| this.bg(cx.theme().muted))
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronLeft
+                                })
+                                .with_size(Size::Small)
+                                .text_color(cx.theme().muted_foreground),
+                            ),
+                    ),
+            )
+    }
+
+    fn match_connection_type(&self, conn: &StoredConnection) -> bool {
         match self.selected_filter {
             ConnectionType::All => true,
             filter_type => conn.connection_type == filter_type,
@@ -2389,6 +3429,1263 @@ impl HomePage {
 
         false
     }
+
+    fn render_content_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let search_query = self.search_query.read(cx).to_lowercase();
+        let selected_id = self.selected_connection_id;
+        let layout = self.connection_layout;
+        self.render_workspace_view(&search_query, selected_id, layout, cx)
+            .into_any_element()
+    }
+
+    fn render_workspace_view(
+        &self,
+        search_query: &str,
+        selected_id: Option<i64>,
+        layout: ConnectionLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workspaces_with_connections: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter(|ws| {
+                if self.filtered_workspace_ids.is_empty() {
+                    return true;
+                }
+                match ws.id {
+                    Some(id) => self.filtered_workspace_ids.contains(&id),
+                    None => true,
+                }
+            })
+            .map(|ws| {
+                let conn_list: Vec<_> = self
+                    .connections
+                    .iter()
+                    .filter(|conn| conn.workspace_id == ws.id)
+                    .filter(|conn| self.match_connection(conn, search_query))
+                    .filter(|conn| self.match_connection_type(conn))
+                    .cloned()
+                    .collect();
+                (ws.clone(), conn_list)
+            })
+            .collect();
+
+        let unassigned_connections: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|conn| conn.workspace_id.is_none())
+            .filter(|conn| self.match_connection(conn, search_query))
+            .filter(|conn| self.match_connection_type(conn))
+            .cloned()
+            .collect();
+        let has_workspaces = self.workspaces.iter().any(|ws| ws.id.is_some());
+
+        if layout == ConnectionLayout::List && !has_workspaces {
+            return div()
+                .id("home-content")
+                .size_full()
+                .min_w_0()
+                .p_6()
+                .child(self.render_connection_uniform_list(unassigned_connections, selected_id, cx))
+                .into_any_element();
+        }
+
+        div()
+            .id("home-content")
+            .size_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .p_6()
+            .child({
+                let mut container = v_flex().gap_8().w_full().min_w_0();
+
+                // 过滤掉空的工作区
+                for (workspace, connections) in workspaces_with_connections {
+                    if connections.is_empty() {
+                        continue;
+                    }
+                    container = container.child(self.render_workspace_section(
+                        workspace,
+                        connections,
+                        selected_id,
+                        layout,
+                        cx,
+                    ));
+                }
+
+                // 如果用户没有设置工作区，直接显示连接列表；否则显示未分配工作区
+                if !unassigned_connections.is_empty() {
+                    if has_workspaces {
+                        container = container.child(self.render_unassigned_section(
+                            unassigned_connections,
+                            selected_id,
+                            layout,
+                            cx,
+                        ));
+                    } else {
+                        // 没有工作区时，直接显示连接卡片
+                        container = container.child(self.render_connections_grid(
+                            unassigned_connections,
+                            selected_id,
+                            layout,
+                            cx,
+                        ));
+                    }
+                }
+
+                container
+            })
+            .into_any_element()
+    }
+
+    fn render_workspace_section(
+        &self,
+        workspace: Workspace,
+        connections: Vec<StoredConnection>,
+        selected_id: Option<i64>,
+        layout: ConnectionLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let workspace_id = workspace.id;
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        Icon::new(IconName::AppsColor)
+                            .color()
+                            .with_size(Size::Medium),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(SharedString::from(format!(
+                                "workspace-name-{}",
+                                workspace_id.unwrap_or(0)
+                            ))))
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child(workspace.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                t!("Home.connection_count", count = connections.len()).to_string(),
+                            ),
+                    )
+                    .child(div().flex_1()),
+            )
+            .when(!connections.is_empty(), |this| {
+                let mut container = match layout {
+                    ConnectionLayout::List => v_flex().w_full().min_w_0().gap_1(),
+                    ConnectionLayout::Card => div().flex().flex_wrap().w_full().min_w_0().gap_3(),
+                };
+
+                for (idx, conn) in connections.iter().enumerate() {
+                    container = match layout {
+                        ConnectionLayout::List => container.child(
+                            self.render_connection_list_item(conn.clone(), selected_id, idx, cx),
+                        ),
+                        ConnectionLayout::Card => {
+                            container.child(div().w(px(320.0)).flex_shrink_0().child(
+                                self.render_connection_card(conn.clone(), selected_id, idx, cx),
+                            ))
+                        }
+                    };
+                }
+
+                this.child(container)
+            })
+    }
+
+    fn render_connections_grid(
+        &self,
+        connections: Vec<StoredConnection>,
+        selected_id: Option<i64>,
+        layout: ConnectionLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if layout == ConnectionLayout::List {
+            return self.render_connection_uniform_list(connections, selected_id, cx);
+        }
+
+        let mut container = div().flex().flex_wrap().w_full().min_w_0().gap_3();
+        for (idx, conn) in connections.into_iter().enumerate() {
+            container = container.child(
+                div()
+                    .w(px(320.0))
+                    .flex_shrink_0()
+                    .child(self.render_connection_card(conn, selected_id, idx, cx)),
+            );
+        }
+        container.into_any_element()
+    }
+
+    fn render_connection_uniform_list(
+        &self,
+        connections: Vec<StoredConnection>,
+        selected_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let item_count = connections.len();
+        uniform_list("home-connection-list", item_count, {
+            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+                range
+                    .filter_map(|idx| {
+                        let conn = connections.get(idx).cloned()?;
+                        Some(this.render_connection_list_item(conn, selected_id, idx, cx))
+                    })
+                    .collect()
+            })
+        })
+        .size_full()
+        .track_scroll(&self.connection_scroll_handle)
+        .with_sizing_behavior(ListSizingBehavior::Auto)
+        .into_any_element()
+    }
+
+    fn render_unassigned_section(
+        &self,
+        connections: Vec<StoredConnection>,
+        selected_id: Option<i64>,
+        layout: ConnectionLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child(
+                                t!("Home.unassigned_workspace")
+                                    .to_string()
+                                    .into_any_element(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                t!("Home.connection_count", count = connections.len()).to_string(),
+                            ),
+                    ),
+            )
+            .child({
+                let mut container = match layout {
+                    ConnectionLayout::List => v_flex().w_full().min_w_0().gap_1(),
+                    ConnectionLayout::Card => div().flex().flex_wrap().w_full().min_w_0().gap_3(),
+                };
+
+                for (idx, conn) in connections.into_iter().enumerate() {
+                    container = match layout {
+                        ConnectionLayout::List => container
+                            .child(self.render_connection_list_item(conn, selected_id, idx, cx)),
+                        ConnectionLayout::Card => container.child(
+                            div()
+                                .w(px(320.0))
+                                .flex_shrink_0()
+                                .child(self.render_connection_card(conn, selected_id, idx, cx)),
+                        ),
+                    };
+                }
+                container
+            })
+    }
+
+    fn render_connection_list_item(
+        &self,
+        conn: StoredConnection,
+        selected_id: Option<i64>,
+        _index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let conn_id = conn.id;
+        let clone_conn = conn.clone();
+        let sftp_hover_conn = conn.clone();
+        let edit_conn = conn.clone();
+        let edit_conn_type = conn.connection_type;
+        let edit_conn_name = conn.name.clone();
+        let duplicate_conn = conn.clone();
+        let delete_conn_id = conn.id;
+        let delete_conn_name = conn.name.clone();
+        let is_selected = selected_id == conn.id;
+        let is_active = conn
+            .id
+            .map_or(false, |id| cx.global::<ActiveConnections>().is_active(id));
+        let can_edit = can_edit_connection(&conn, cx);
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "conn-list-item-{}",
+                conn.id.unwrap_or(0)
+            )))
+            .w_full()
+            .h(px(64.0))
+            .rounded(px(6.0))
+            .bg(cx.theme().background)
+            .px_3()
+            .border_1()
+            .items_center()
+            .gap_3()
+            .relative()
+            .group("")
+            .when(is_selected, |this| {
+                this.border_color(cx.theme().list_active_border)
+                    .border_l_3()
+            })
+            .when(!is_selected, |this| this.border_color(cx.theme().border))
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().muted))
+            .on_double_click(cx.listener(move |this, _, w, cx| {
+                this.open_connection_from_quick(&clone_conn, w, cx);
+                cx.notify()
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_connection_id = conn_id;
+                cx.notify();
+            }))
+            // 激活指示灯
+            .when(is_active, |this| {
+                // list_item version
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(cx.theme().success),
+                )
+            })
+            // 类型图标
+            .child(match conn.connection_type {
+                ConnectionType::Database => {
+                    let icon = conn
+                        .to_db_connection()
+                        .map(|c| {
+                            external_driver_icon_for_config_with_registry(
+                                &c,
+                                px(24.0),
+                                &self.external_driver_registry,
+                            )
+                            .unwrap_or_else(|| c.database_type.as_icon())
+                        })
+                        .unwrap_or_else(|_| IconName::Database.color());
+                    icon.with_size(px(24.0)).flex_shrink_0()
+                }
+                ConnectionType::SshSftp => IconName::TerminalColor
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::rgb(0x8b5cf6))
+                    .flex_shrink_0(),
+                ConnectionType::Redis => IconName::Redis
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+                ConnectionType::MongoDB => IconName::MongoDB
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+                ConnectionType::Serial => IconName::SerialPort
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+                ConnectionType::PortForwarding => IconName::PortForwardingColor
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+                ConnectionType::Rdp => IconName::Rdp
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+                ConnectionType::Vnc => IconName::Vnc
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+                _ => IconName::Server
+                    .color()
+                    .with_size(px(24.0))
+                    .text_color(gpui::white())
+                    .flex_shrink_0(),
+            })
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().foreground)
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(conn.name.clone()),
+                            )
+                            .child({
+                                h_flex()
+                                    .gap_1()
+                                    .w(HOME_CONNECTION_LIST_ACTIONS_WIDTH)
+                                    .flex_shrink_0()
+                                    .justify_end()
+                                    .group_hover("", |style| style.opacity(1.0))
+                                    .opacity(0.0)
+                                    .when(conn.connection_type == ConnectionType::SshSftp, |this| {
+                                        this.child({
+                                            let sftp_conn = sftp_hover_conn.clone();
+                                            Button::new(SharedString::from(format!(
+                                                "sftp-list-conn-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .icon(IconName::Folder1.color())
+                                            .with_size(Size::Small)
+                                            .primary()
+                                            .tooltip(t!("Home.open_sftp"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.open_sftp_view(sftp_conn.clone(), window, cx);
+                                            }))
+                                        })
+                                    })
+                                    .when(can_edit, |this| {
+                                        this.child({
+                                            let dup_conn = duplicate_conn.clone();
+                                            Button::new(SharedString::from(format!(
+                                                "duplicate-list-conn-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .icon(IconName::Copy)
+                                            .with_size(Size::Small)
+                                            .primary()
+                                            .tooltip(t!("Home.duplicate_connection"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.duplicate_connection(
+                                                    dup_conn.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                        })
+                                        .child({
+                                            let edit_id = edit_conn.id;
+                                            let edit_name = edit_conn_name.clone();
+                                            let edit_type = edit_conn_type;
+                                            let edit_data = edit_conn.clone();
+                                            Button::new(SharedString::from(format!(
+                                                "edit-list-conn-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .icon(IconName::Edit)
+                                            .with_size(Size::Small)
+                                            .primary()
+                                            .tooltip(t!("Home.edit_connection"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(conn_id) = edit_id {
+                                                    let conn_name = edit_name.clone();
+                                                    match edit_type {
+                                                        ConnectionType::SshSftp => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_ssh_form(window, cx);
+                                                        }
+                                                        ConnectionType::Database => {
+                                                            let db_type = edit_data
+                                                                .to_db_connection()
+                                                                .ok()
+                                                                .map(|p| p.database_type);
+                                                            this.confirm_edit_connection(
+                                                                conn_id, conn_name, db_type,
+                                                                window, cx,
+                                                            );
+                                                        }
+                                                        ConnectionType::Redis => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_redis_form(window, cx);
+                                                        }
+                                                        ConnectionType::MongoDB => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_mongodb_form(window, cx);
+                                                        }
+                                                        ConnectionType::Serial => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_serial_form(window, cx);
+                                                        }
+                                                        ConnectionType::PortForwarding => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_port_forwarding_form(
+                                                                window, cx,
+                                                            );
+                                                        }
+                                                        ConnectionType::Rdp => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_remote_desktop_form(
+                                                                StoredRemoteDesktopProtocol::Rdp,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                        ConnectionType::Vnc => {
+                                                            this.editing_connection_id =
+                                                                Some(conn_id);
+                                                            this.show_remote_desktop_form(
+                                                                StoredRemoteDesktopProtocol::Vnc,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }))
+                                        })
+                                        .child({
+                                            let del_id = delete_conn_id;
+                                            let del_name = delete_conn_name.clone();
+                                            Button::new(SharedString::from(format!(
+                                                "delete-list-conn-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .icon(IconName::Remove)
+                                            .with_size(Size::Small)
+                                            .danger()
+                                            .tooltip(t!("Home.delete_connection"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(conn_id) = del_id {
+                                                    let conn_name = del_name.clone();
+                                                    this.confirm_delete_connection(
+                                                        conn_id, conn_name, window, cx,
+                                                    );
+                                                }
+                                            }))
+                                        })
+                                    })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .w_full()
+                            .min_w_0()
+                            .child(self.connection_info_text(&conn)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn connection_info_text(&self, conn: &StoredConnection) -> String {
+        match conn.connection_type {
+            ConnectionType::Database => conn
+                .to_db_connection()
+                .map(|params| {
+                    if matches!(
+                        params.database_type,
+                        DatabaseType::SQLite | DatabaseType::DuckDB
+                    ) {
+                        params.host.clone()
+                    } else {
+                        let database = params
+                            .database
+                            .map(|db| format!("/{}", db))
+                            .unwrap_or_default();
+                        format!(
+                            "{}@{}:{}{}",
+                            params.username, params.host, params.port, database
+                        )
+                    }
+                })
+                .unwrap_or_default(),
+            ConnectionType::SshSftp => conn
+                .to_ssh_params()
+                .map(|params| format!("{}@{}:{}", params.username, params.host, params.port))
+                .unwrap_or_default(),
+            ConnectionType::Redis => conn
+                .to_redis_params()
+                .map(|params| format!("{}:{}/{}", params.host, params.port, params.db_index))
+                .unwrap_or_default(),
+            ConnectionType::MongoDB => conn
+                .to_mongodb_params()
+                .map(|params| {
+                    if !params.host.is_empty() {
+                        if let Some(port) = params.port {
+                            format!("{}:{}", params.host, port)
+                        } else {
+                            params.host
+                        }
+                    } else if !params.connection_string.is_empty() {
+                        params.connection_string
+                    } else {
+                        "MongoDB".to_string()
+                    }
+                })
+                .unwrap_or_default(),
+            ConnectionType::Serial => conn
+                .to_serial_params()
+                .map(|params| {
+                    let parity_char = match params.parity {
+                        one_core::storage::models::SerialParity::None => 'N',
+                        one_core::storage::models::SerialParity::Odd => 'O',
+                        one_core::storage::models::SerialParity::Even => 'E',
+                    };
+                    format!(
+                        "{} ({}, {}{}{})",
+                        params.port_name,
+                        params.baud_rate,
+                        params.data_bits,
+                        parity_char,
+                        params.stop_bits
+                    )
+                })
+                .unwrap_or_default(),
+            ConnectionType::Rdp | ConnectionType::Vnc => conn
+                .to_remote_desktop_params()
+                .map(|params| match params.username.as_deref() {
+                    Some(username) => format!("{}@{}:{}", username, params.host, params.port),
+                    None => format!("{}:{}", params.host, params.port),
+                })
+                .unwrap_or_default(),
+            ConnectionType::PortForwarding => conn
+                .to_port_forwarding_params()
+                .map(|params| match params.kind {
+                    one_core::storage::PortForwardingKind::Local => format!(
+                        "{}:{} -> {}:{}",
+                        params.bind_host, params.bind_port, params.target_host, params.target_port
+                    ),
+                    one_core::storage::PortForwardingKind::Dynamic => {
+                        format!("SOCKS {}:{}", params.bind_host, params.bind_port)
+                    }
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn drag_connection(&self, conn: &StoredConnection, index: usize) -> DragConnection {
+        DragConnection {
+            source_index: index,
+            source_id: conn.id,
+            name: conn.name.clone(),
+            info: self.connection_info_text(conn),
+            connection_type: conn.connection_type,
+        }
+    }
+
+    fn render_connection_card(
+        &self,
+        conn: StoredConnection,
+        selected_id: Option<i64>,
+        _index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let conn_id = conn.id;
+        let clone_conn = conn.clone();
+        let sftp_hover_conn = conn.clone();
+        let edit_conn = conn.clone();
+        let edit_conn_type = conn.connection_type;
+        let edit_conn_name = conn.name.clone();
+        let duplicate_conn = conn.clone();
+        let delete_conn_id = conn.id;
+        let delete_conn_name = conn.name.clone();
+        let is_selected = selected_id == conn.id;
+
+        let is_active = conn
+            .id
+            .map_or(false, |id| cx.global::<ActiveConnections>().is_active(id));
+
+        let can_edit = can_edit_connection(&conn, cx);
+        let has_team = conn.team_id.is_some();
+        let card = v_flex()
+            .justify_center()
+            .id(SharedString::from(format!(
+                "conn-card-{}",
+                conn.id.unwrap_or(0)
+            )))
+            .w_full()
+            .h(px(90.))
+            .rounded(px(8.0))
+            .bg(cx.theme().background)
+            .p_3()
+            .border_1()
+            .rounded_lg()
+            .relative()
+            .overflow_hidden()
+            .shadow_sm()
+            .group("")
+            .when(is_selected, |this| {
+                this.border_color(cx.theme().list_active_border)
+                    .shadow_lg()
+                    .border_l_3()
+            })
+            .when(!is_selected, |this| this.border_color(cx.theme().border))
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .shadow_lg()
+                    .border_color(cx.theme().list_active_border)
+            })
+            .on_double_click(cx.listener(move |this, _, w, cx| {
+                this.open_connection_from_quick(&clone_conn, w, cx);
+                cx.notify()
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_connection_id = conn_id;
+                cx.notify();
+            }))
+            .when(is_active, |this| {
+                // card version
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(6.0))
+                        .left(px(6.0))
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .rounded_full()
+                        .bg(cx.theme().success)
+                        .shadow_lg(),
+                )
+            })
+            .child(
+                // hover时显示的编辑和删除按钮
+                h_flex()
+                    .absolute()
+                    .top_2()
+                    .right_2()
+                    .gap_1()
+                    .group_hover("", |style| style.opacity(1.0))
+                    .opacity(0.0)
+                    .when(conn.connection_type == ConnectionType::SshSftp, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!(
+                                "sftp-conn-{}",
+                                conn.id.unwrap_or(0)
+                            )))
+                            .icon(IconName::Folder1.color())
+                            .with_size(Size::Small)
+                            .primary()
+                            .tooltip(t!("Home.open_sftp"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_sftp_view(sftp_hover_conn.clone(), window, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .when(can_edit, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!(
+                                "duplicate-conn-{}",
+                                conn.id.unwrap_or(0)
+                            )))
+                            .icon(IconName::Copy)
+                            .with_size(Size::Small)
+                            .primary()
+                            .tooltip(t!("Home.duplicate_connection"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.duplicate_connection(duplicate_conn.clone(), window, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "edit-conn-{}",
+                                conn.id.unwrap_or(0)
+                            )))
+                            .icon(IconName::Edit)
+                            .with_size(Size::Small)
+                            .primary()
+                            .tooltip(t!("Home.edit_connection"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(conn_id) = edit_conn.id {
+                                        let conn_name = edit_conn_name.clone();
+                                        match edit_conn_type {
+                                            ConnectionType::SshSftp => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_ssh_form(window, cx);
+                                            }
+                                            ConnectionType::Database => {
+                                                let db_type = edit_conn
+                                                    .to_db_connection()
+                                                    .ok()
+                                                    .map(|p| p.database_type);
+                                                this.confirm_edit_connection(
+                                                    conn_id, conn_name, db_type, window, cx,
+                                                );
+                                            }
+                                            ConnectionType::Redis => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_redis_form(window, cx);
+                                            }
+                                            ConnectionType::MongoDB => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_mongodb_form(window, cx);
+                                            }
+                                            ConnectionType::Serial => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_serial_form(window, cx);
+                                            }
+                                            ConnectionType::PortForwarding => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_port_forwarding_form(window, cx);
+                                            }
+                                            ConnectionType::Rdp => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_remote_desktop_form(
+                                                    StoredRemoteDesktopProtocol::Rdp,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            ConnectionType::Vnc => {
+                                                this.editing_connection_id = Some(conn_id);
+                                                this.show_remote_desktop_form(
+                                                    StoredRemoteDesktopProtocol::Vnc,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "delete-conn-{}",
+                                conn.id.unwrap_or(0)
+                            )))
+                            .icon(IconName::Remove)
+                            .with_size(Size::Small)
+                            .danger()
+                            .tooltip(t!("Home.delete_connection"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(conn_id) = delete_conn_id {
+                                        let conn_name = delete_conn_name.clone();
+                                        this.confirm_delete_connection(
+                                            conn_id, conn_name, window, cx,
+                                        );
+                                    }
+                                },
+                            )),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .child(
+                        div()
+                            .h(px(48.0))
+                            .rounded(px(8.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(match conn.connection_type {
+                                ConnectionType::Database => {
+                                    let icon = conn
+                                        .to_db_connection()
+                                        .map(|c| {
+                                            external_driver_icon_for_config_with_registry(
+                                                &c,
+                                                px(40.0),
+                                                &self.external_driver_registry,
+                                            )
+                                            .unwrap_or_else(|| c.database_type.as_icon())
+                                        })
+                                        .unwrap_or_else(|_| IconName::Database.color());
+                                    icon.with_size(px(40.0))
+                                }
+                                ConnectionType::SshSftp => IconName::TerminalColor
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::rgb(0x8b5cf6)),
+                                ConnectionType::Redis => IconName::Redis
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                                ConnectionType::MongoDB => IconName::MongoDB
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                                ConnectionType::Serial => IconName::SerialPort
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                                ConnectionType::PortForwarding => IconName::PortForwardingColor
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                                ConnectionType::Rdp => IconName::Rdp
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                                ConnectionType::Vnc => IconName::Vnc
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                                _ => IconName::Server
+                                    .color()
+                                    .with_size(px(40.0))
+                                    .text_color(gpui::white()),
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .overflow_hidden()
+                            .child({
+                                let name_tooltip: SharedString = conn.name.clone().into();
+                                h_flex()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "conn-name-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(cx.theme().foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .flex_shrink()
+                                            .min_w_0()
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(name_tooltip.clone()).build(window, cx)
+                                            })
+                                            .child(conn.name.clone()),
+                                    )
+                                    .when(has_team, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .px_1()
+                                                .rounded(px(3.0))
+                                                .bg(cx.theme().accent.opacity(0.15))
+                                                .text_color(cx.theme().accent)
+                                                .text_xs()
+                                                .child(t!("Home.team_badge").to_string()),
+                                        )
+                                    })
+                            })
+                            .when(conn.connection_type == ConnectionType::Database, |this| {
+                                if let Ok(params) = conn.to_db_connection() {
+                                    let conn_info = if matches!(
+                                        params.database_type,
+                                        DatabaseType::SQLite | DatabaseType::DuckDB
+                                    ) {
+                                        params.host.clone()
+                                    } else {
+                                        let database = match params.database {
+                                            Some(database) => format!("/{}", database),
+                                            None => "".to_string(),
+                                        };
+                                        format!(
+                                            "{}@{}:{}{}",
+                                            params.username, params.host, params.port, database
+                                        )
+                                    };
+                                    let tooltip_text: SharedString = conn_info.clone().into();
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "conn-info-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .max_w_full()
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                            })
+                                            .child(conn_info),
+                                    )
+                                } else {
+                                    this
+                                }
+                            })
+                            .when(conn.connection_type == ConnectionType::SshSftp, |this| {
+                                if let Ok(params) = conn.to_ssh_params() {
+                                    let conn_info = format!(
+                                        "{}@{}:{}",
+                                        params.username, params.host, params.port
+                                    );
+                                    let tooltip_text: SharedString = conn_info.clone().into();
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "conn-info-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .max_w_full()
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                            })
+                                            .child(conn_info),
+                                    )
+                                } else {
+                                    this
+                                }
+                            })
+                            .when(
+                                matches!(
+                                    conn.connection_type,
+                                    ConnectionType::Rdp | ConnectionType::Vnc
+                                ),
+                                |this| {
+                                    if let Ok(params) = conn.to_remote_desktop_params() {
+                                        let conn_info = remote_desktop_connection_info(&params);
+                                        let tooltip_text: SharedString = conn_info.clone().into();
+                                        this.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "conn-info-{}",
+                                                    conn.id.unwrap_or(0)
+                                                )))
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .max_w_full()
+                                                .tooltip(move |window, cx| {
+                                                    Tooltip::new(tooltip_text.clone())
+                                                        .build(window, cx)
+                                                })
+                                                .child(conn_info),
+                                        )
+                                    } else {
+                                        this
+                                    }
+                                },
+                            )
+                            .when(conn.connection_type == ConnectionType::Redis, |this| {
+                                if let Ok(params) = conn.to_redis_params() {
+                                    let conn_info = match params.mode {
+                                        RedisMode::Standalone => {
+                                            format!(
+                                                "{}:{}/{}",
+                                                params.host, params.port, params.db_index
+                                            )
+                                        }
+                                        RedisMode::Sentinel => {
+                                            let (master_name, sentinel_count) = params
+                                                .sentinel
+                                                .as_ref()
+                                                .map(|sentinel| {
+                                                    (
+                                                        sentinel.master_name.as_str(),
+                                                        sentinel.sentinels.len(),
+                                                    )
+                                                })
+                                                .unwrap_or(("sentinel", 0));
+                                            format!("{} (sentinel:{})", master_name, sentinel_count)
+                                        }
+                                        RedisMode::Cluster => {
+                                            let node_count = params
+                                                .cluster
+                                                .as_ref()
+                                                .map(|cluster| cluster.nodes.len())
+                                                .unwrap_or(0);
+                                            format!("cluster ({} nodes)", node_count)
+                                        }
+                                    };
+                                    let tooltip_text: SharedString = conn_info.clone().into();
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "conn-info-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .max_w_full()
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                            })
+                                            .child(conn_info),
+                                    )
+                                } else {
+                                    this
+                                }
+                            })
+                            .when(conn.connection_type == ConnectionType::MongoDB, |this| {
+                                if let Ok(params) = conn.to_mongodb_params() {
+                                    let conn_info = if !params.host.is_empty() {
+                                        if let Some(port) = params.port {
+                                            format!("{}:{}", params.host, port)
+                                        } else {
+                                            params.host
+                                        }
+                                    } else if !params.connection_string.is_empty() {
+                                        params.connection_string
+                                    } else {
+                                        "MongoDB".to_string()
+                                    };
+                                    let tooltip_text: SharedString = conn_info.clone().into();
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "conn-info-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .max_w_full()
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                            })
+                                            .child(conn_info),
+                                    )
+                                } else {
+                                    this
+                                }
+                            })
+                            .when(conn.connection_type == ConnectionType::Serial, |this| {
+                                if let Ok(params) = conn.to_serial_params() {
+                                    // 格式：/dev/ttyUSB0 (115200, 8N1)
+                                    let parity_char = match params.parity {
+                                        one_core::storage::models::SerialParity::None => 'N',
+                                        one_core::storage::models::SerialParity::Odd => 'O',
+                                        one_core::storage::models::SerialParity::Even => 'E',
+                                    };
+                                    let conn_info = format!(
+                                        "{} ({}, {}{}{})",
+                                        params.port_name,
+                                        params.baud_rate,
+                                        params.data_bits,
+                                        parity_char,
+                                        params.stop_bits,
+                                    );
+                                    let tooltip_text: SharedString = conn_info.clone().into();
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "conn-info-{}",
+                                                conn.id.unwrap_or(0)
+                                            )))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .max_w_full()
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                            })
+                                            .child(conn_info),
+                                    )
+                                } else {
+                                    this
+                                }
+                            })
+                            .when(
+                                conn.connection_type == ConnectionType::PortForwarding,
+                                |this| {
+                                    if let Ok(params) = conn.to_port_forwarding_params() {
+                                        let conn_info = port_forwarding_connection_info(&params);
+                                        let tooltip_text: SharedString = conn_info.clone().into();
+                                        this.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "conn-info-{}",
+                                                    conn.id.unwrap_or(0)
+                                                )))
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .max_w_full()
+                                                .tooltip(move |window, cx| {
+                                                    Tooltip::new(tooltip_text.clone())
+                                                        .build(window, cx)
+                                                })
+                                                .child(conn_info),
+                                        )
+                                    } else {
+                                        this
+                                    }
+                                },
+                            ),
+                    ),
+            );
+
+        card.into_any_element()
+    }
 }
 
 fn remote_desktop_connection_info(params: &RemoteDesktopParams) -> String {
@@ -2497,28 +4794,35 @@ impl Render for HomePage {
             });
         }
 
-        div().size_full().track_focus(&self.focus_handle).child(
-            h_flex()
-                .size_full()
-                .child(self.render_home_navigation(window, cx))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .bg(cx.theme().background)
-                        .child(self.render_toolbar(window, cx))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .w_full()
-                                .overflow_hidden()
-                                .bg(cx.theme().muted)
-                                .child(self.render_content_area(window, cx)),
-                        ),
-                ),
-        )
+        div()
+            .size_full()
+            .min_w_0()
+            .track_focus(&self.focus_handle)
+            .child(
+                h_flex()
+                    .size_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(self.render_sidebar(window, cx))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .bg(cx.theme().background)
+                            .child(self.render_toolbar(window, cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .bg(cx.theme().muted)
+                                    .child(self.render_content_area(cx)),
+                            ),
+                    ),
+            )
     }
 }
 

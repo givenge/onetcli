@@ -221,6 +221,50 @@ ConnectionForm:
     en: Database
     zh-CN: 数据库
     zh-HK: 資料庫
+  default_schema:
+    en: Default Schema
+    zh-CN: 默认 Schema
+    zh-HK: 預設 Schema
+  default_schema_placeholder:
+    en: Leave empty to use the database default
+    zh-CN: 留空则使用数据库默认值
+    zh-HK: 留空則使用資料庫預設值
+  schema_filter_mode:
+    en: Schema Filter
+    zh-CN: Schema 过滤
+    zh-HK: Schema 過濾
+  schema_filter_mode_auto:
+    en: Auto hide system schemas
+    zh-CN: 自动隐藏系统 Schema
+    zh-HK: 自動隱藏系統 Schema
+  schema_filter_mode_include:
+    en: Show only listed schemas
+    zh-CN: 仅显示指定 Schema
+    zh-HK: 僅顯示指定 Schema
+  schema_filter_mode_exclude:
+    en: Hide listed schemas
+    zh-CN: 隐藏指定 Schema
+    zh-HK: 隱藏指定 Schema
+  schema_filter_mode_all:
+    en: Show all schemas
+    zh-CN: 显示全部 Schema
+    zh-HK: 顯示全部 Schema
+  schema_filter_include:
+    en: Include Schemas
+    zh-CN: 包含 Schema
+    zh-HK: 包含 Schema
+  schema_filter_include_placeholder:
+    en: app, audit_*
+    zh-CN: app, audit_*
+    zh-HK: app, audit_*
+  schema_filter_exclude:
+    en: Exclude Schemas
+    zh-CN: 排除 Schema
+    zh-HK: 排除 Schema
+  schema_filter_exclude_placeholder:
+    en: tmp_*, scratch
+    zh-CN: tmp_*, scratch
+    zh-HK: tmp_*, scratch
   schema:
     en: Scheme
     zh-CN: 协议
@@ -1075,6 +1119,70 @@ Query:
     en: Show results
     zh-CN: 显示结果
     zh-HK: 顯示結果
+  transaction_auto:
+    en: Auto
+    zh-CN: 自动
+    zh-HK: 自動
+  transaction_manual:
+    en: Manual
+    zh-CN: 手动
+    zh-HK: 手動
+  transaction_mode_prefix:
+    en: "Txn: "
+    zh-CN: "事务："
+    zh-HK: "交易："
+  transaction_commit:
+    en: Commit
+    zh-CN: 提交
+    zh-HK: 提交
+  transaction_rollback:
+    en: Rollback
+    zh-CN: 回滚
+    zh-HK: 回滾
+  transaction_not_supported:
+    en: Manual transactions are not supported by this database
+    zh-CN: 当前数据库不支持手动事务
+    zh-HK: 目前資料庫不支援手動交易
+  transaction_started:
+    en: Manual transaction started
+    zh-CN: 手动事务已开始
+    zh-HK: 手動交易已開始
+  transaction_committed:
+    en: Transaction committed
+    zh-CN: 事务已提交
+    zh-HK: 交易已提交
+  transaction_rolled_back:
+    en: Transaction rolled back
+    zh-CN: 事务已回滚
+    zh-HK: 交易已回滾
+  transaction_not_started:
+    en: No manual transaction is active
+    zh-CN: 当前没有活动的手动事务
+    zh-HK: 目前沒有作用中的手動交易
+  transaction_scope_changed:
+    en: Commit or rollback the current transaction before changing database or schema
+    zh-CN: 请先提交或回滚当前事务，再切换数据库或模式
+    zh-HK: 請先提交或回滾目前交易，再切換資料庫或模式
+  transaction_start_failed:
+    en: "Failed to start transaction: %{error}"
+    zh-CN: "启动事务失败：%{error}"
+    zh-HK: "啟動交易失敗：%{error}"
+  transaction_control_failed:
+    en: Transaction command failed
+    zh-CN: 事务控制命令执行失败
+    zh-HK: 交易控制命令執行失敗
+  transaction_control_unavailable:
+    en: Transaction command is unavailable for this database
+    zh-CN: 当前数据库不支持该事务控制命令
+    zh-HK: 目前資料庫不支援該交易控制命令
+  transaction_finish_before_switch:
+    en: Commit or rollback the current transaction before switching transaction mode
+    zh-CN: 请先提交或回滚当前事务，再切换事务模式
+    zh-HK: 請先提交或回滾目前交易，再切換交易模式
+  transaction_finish_before_close:
+    en: Commit or rollback the current transaction before closing this editor
+    zh-CN: 请先提交或回滚当前事务，再关闭编辑器
+    zh-HK: 請先提交或回滾目前交易，再關閉編輯器
   summary:
     en: Summary
     zh-CN: 摘要
@@ -2419,225 +2527,6 @@ DbTreeView:
     en: Locate active tab in tree
     zh-CN: 在树中定位当前标签
     zh-HK: 在樹中定位目前標籤
-ChatDbSelector:
-  select_source:
-    en: Select data source
-    zh-CN: 选择数据源
-    zh-HK: 選擇資料來源
-  select_database:
-    en: Select database
-    zh-CN: 选择数据库
-    zh-HK: 選擇資料庫
-  select_schema:
-    en: Select schema
-    zh-CN: 选择架构
-    zh-HK: 選擇架構
-  no_data:
-    en: No data
-    zh-CN: 暂无数据
-    zh-HK: 暫無資料
-  connection_title:
-    en: Connection
-    zh-CN: 连接
-    zh-HK: 連線
-  database_title:
-    en: Database
-    zh-CN: 数据库
-    zh-HK: 資料庫
-  schema_title:
-    en: Schema
-    zh-CN: 架构
-    zh-HK: 架構
-  clear_selection:
-    en: Clear selection
-    zh-CN: 清除选择
-    zh-HK: 清除選擇
-ChatMessageList:
-  load_more:
-    en: "Load earlier messages (%{hidden_count} remaining)"
-    zh-CN: "加载更早消息（剩余 %{hidden_count} 条）"
-    zh-HK: "載入更早訊息（剩餘 %{hidden_count} 條）"
-  collapse_history:
-    en: Collapse history
-    zh-CN: 收起历史消息
-    zh-HK: 收起歷史訊息
-  loading:
-    en: Loading...
-    zh-CN: 加载中...
-    zh-HK: 載入中...
-ChatSqlResult:
-  rows_info:
-    en: "%{rows} rows"
-    zh-CN: "%{rows} 行"
-    zh-HK: "%{rows} 行"
-  success_count:
-    en: "%{count} success"
-    zh-CN: "%{count} 成功"
-    zh-HK: "%{count} 成功"
-  error_count:
-    en: "%{count} error"
-    zh-CN: "%{count} 错误"
-    zh-HK: "%{count} 錯誤"
-  exec_success_rows:
-    en: "Execution succeeded, affected %{rows} rows"
-    zh-CN: "执行成功，影响 %{rows} 行"
-    zh-HK: "執行成功，影響 %{rows} 行"
-  elapsed_ms:
-    en: "Elapsed %{ms}ms"
-    zh-CN: "耗时 %{ms}ms"
-    zh-HK: "耗時 %{ms}ms"
-  exec_failed:
-    en: Execution failed
-    zh-CN: 执行失败
-    zh-HK: 執行失敗
-  result_tab:
-    en: "Result %{index}"
-    zh-CN: "结果 %{index}"
-    zh-HK: "結果 %{index}"
-AIInput:
-  send:
-    en: Send
-    zh-CN: 发送
-    zh-HK: 傳送
-  cancel:
-    en: Cancel
-    zh-CN: 终止
-    zh-HK: 終止
-  execute:
-    en: Execute
-    zh-CN: 执行
-    zh-HK: 執行
-  placeholder_agent:
-    en: Enter to send, Shift+Enter for newline, @ to select table
-    zh-CN: 回车发送，Shift+Enter 换行，@ 选择表格
-    zh-HK: 按 Enter 送出，Shift+Enter 換行，@ 選擇表格
-  placeholder_sql:
-    en: Enter SQL... (Enter to run, Shift+Enter for newline)
-    zh-CN: 请输入 SQL...（回车执行，Shift+Enter 换行）
-    zh-HK: 請輸入 SQL...（按 Enter 執行，Shift+Enter 換行）
-ChatSqlBlock:
-  run:
-    en: Run
-    zh-CN: 运行
-    zh-HK: 執行
-  confirm_run_non_query_message:
-    en: This SQL may modify data. Continue execution?
-    zh-CN: 该 SQL 可能修改数据，是否继续执行？
-    zh-HK: 該 SQL 可能修改資料，是否繼續執行？
-  confirm_run_non_query_desc:
-    en: Please confirm the statement scope and target database before running.
-    zh-CN: 执行前请确认语句影响范围和目标数据库。
-    zh-HK: 執行前請確認語句影響範圍和目標資料庫。
-  summary_success_error:
-    en: "%{success} success, %{error} failed"
-    zh-CN: "%{success} 成功, %{error} 失败"
-    zh-HK: "%{success} 成功, %{error} 失敗"
-  summary_rows:
-    en: "%{rows} rows"
-    zh-CN: "%{rows} 行结果"
-    zh-HK: "%{rows} 行結果"
-ChatSession:
-  history_title:
-    en: Session History
-    zh-CN: 历史会话
-    zh-HK: 歷史會話
-  time_just_now:
-    en: Just now
-    zh-CN: 刚刚
-    zh-HK: 剛剛
-  time_minutes_ago:
-    en: "%{minutes} minutes ago"
-    zh-CN: "%{minutes} 分钟前"
-    zh-HK: "%{minutes} 分鐘前"
-  time_hours_ago:
-    en: "%{hours} hours ago"
-    zh-CN: "%{hours} 小时前"
-    zh-HK: "%{hours} 小時前"
-  time_days_ago:
-    en: "%{days} days ago"
-    zh-CN: "%{days} 天前"
-    zh-HK: "%{days} 天前"
-  time_weeks_ago:
-    en: "%{weeks} weeks ago"
-    zh-CN: "%{weeks} 周前"
-    zh-HK: "%{weeks} 週前"
-ChatPanel:
-  title:
-    en: SQL Assistant
-    zh-CN: SQL 助手
-    zh-HK: SQL 助手
-  session_name_placeholder:
-    en: Session name
-    zh-CN: 会话名称
-    zh-HK: 會話名稱
-  rename_session_title:
-    en: Rename Session
-    zh-CN: 重命名会话
-    zh-HK: 重新命名會話
-  rename_session_prompt:
-    en: "Enter a new session name:"
-    zh-CN: 请输入新的会话名称：
-    zh-HK: 請輸入新的會話名稱：
-  action_cancelled:
-    en: Operation cancelled
-    zh-CN: 操作已取消
-    zh-HK: 操作已取消
-  select_ai_model_first:
-    en: Please select an AI model first
-    zh-CN: 请先选择 AI 模型
-    zh-HK: 請先選擇 AI 模型
-  invalid_model_id:
-    en: Invalid model ID
-    zh-CN: 无效的模型 ID
-    zh-HK: 無效的模型 ID
-  sql_session_name:
-    en: SQL Session
-    zh-CN: SQL 会话
-    zh-HK: SQL 會話
-  session_error:
-    en: "Session error: %{error}"
-    zh-CN: "会话错误: %{error}"
-    zh-HK: "會話錯誤: %{error}"
-  error_message:
-    en: "Error: %{message}"
-    zh-CN: "错误: %{message}"
-    zh-HK: "錯誤: %{message}"
-  executing:
-    en: Executing...
-    zh-CN: 执行中...
-    zh-HK: 執行中...
-  execution_error:
-    en: "Execution error: %{error}"
-    zh-CN: "执行错误: %{error}"
-    zh-HK: "執行錯誤: %{error}"
-  select_database_or_schema_first:
-    en: Please select a database or schema first
-    zh-CN: 请先选择数据库或架构
-    zh-HK: 請先選擇資料庫或架構
-  retry:
-    en: Retry
-    zh-CN: 重试
-    zh-HK: 重試
-  thinking:
-    en: Thinking...
-    zh-CN: 思考中...
-    zh-HK: 思考中...
-  view_result:
-    en: View result
-    zh-CN: 查看结果
-    zh-HK: 檢視結果
-  collapse_result:
-    en: Collapse result
-    zh-CN: 收起结果
-    zh-HK: 收起結果
-  error_keyword:
-    en: Error
-    zh-CN: 错误
-    zh-HK: 錯誤
-  failed_keyword:
-    en: Failed
-    zh-CN: 失败
-    zh-HK: 失敗
 EditorView:
   form_tab:
     en: Form
@@ -2647,6 +2536,144 @@ EditorView:
     en: SQL Preview
     zh-CN: SQL 预览
     zh-HK: SQL 預覽
+DatabaseToolbar:
+  show_objects:
+    en: Show
+    zh-CN: 显示
+    zh-HK: 顯示
+  create_query:
+    en: New Query
+    zh-CN: 新建查询
+    zh-HK: 新建查詢
+  users:
+    en: Users
+    zh-CN: 用户
+    zh-HK: 使用者
+  compare_schema:
+    en: Compare Schema
+    zh-CN: 比较结构
+    zh-HK: 比較結構
+  compare_data:
+    en: Compare Data
+    zh-CN: 比较数据
+    zh-HK: 比較資料
+  data_generator:
+    en: Data Generator
+    zh-CN: 数据生成
+    zh-HK: 資料生成
+  backup:
+    en: Backup
+    zh-CN: 备份
+    zh-HK: 備份
+  automation:
+    en: Automation
+    zh-CN: 自动运行
+    zh-HK: 自動執行
+  model:
+    en: Model
+    zh-CN: 模型
+    zh-HK: 模型
+  bi:
+    en: BI
+    zh-CN: BI
+    zh-HK: BI
+DatabaseUsers:
+  title:
+    en: Users
+    zh-CN: 用户
+    zh-HK: 使用者
+  toolbar_add:
+    en: Add
+    zh-CN: 新增
+    zh-HK: 新增
+  toolbar_edit:
+    en: Edit
+    zh-CN: 编辑
+    zh-HK: 編輯
+  toolbar_delete:
+    en: Delete
+    zh-CN: 删除
+    zh-HK: 刪除
+  toolbar_privileges:
+    en: Privileges
+    zh-CN: 权限
+    zh-HK: 權限
+  toolbar_refresh:
+    en: Refresh
+    zh-CN: 刷新
+    zh-HK: 重新整理
+  select_edit_user:
+    en: Select a user before editing.
+    zh-CN: 请先选择要编辑的用户。
+    zh-HK: 請先選擇要編輯的使用者。
+  select_delete_user:
+    en: Select a user before deleting.
+    zh-CN: 请先选择要删除的用户。
+    zh-HK: 請先選擇要刪除的使用者。
+  select_privilege_user:
+    en: Select a user before changing privileges.
+    zh-CN: 请先选择要授权的用户。
+    zh-HK: 請先選擇要授權的使用者。
+  unsupported_operation:
+    en: This database type does not support this user operation.
+    zh-CN: 当前数据库类型暂不支持该用户操作。
+    zh-HK: 目前資料庫類型暫不支援此使用者操作。
+  unsupported_database:
+    en: This database type does not support user management.
+    zh-CN: 当前数据库类型暂不支持用户管理。
+    zh-HK: 目前資料庫類型暫不支援使用者管理。
+  no_available_connection:
+    en: No available database connection to view users.
+    zh-CN: 没有可用的数据库连接，无法查看用户。
+    zh-HK: 沒有可用的資料庫連線，無法檢視使用者。
+  execute:
+    en: Execute
+    zh-CN: 执行
+    zh-HK: 執行
+  empty_operation_sql:
+    en: No executable user operation SQL.
+    zh-CN: 没有可执行的用户操作 SQL。
+    zh-HK: 沒有可執行的使用者操作 SQL。
+  create_title:
+    en: Add User
+    zh-CN: 新增用户
+    zh-HK: 新增使用者
+  edit_title:
+    en: Edit User
+    zh-CN: 编辑用户
+    zh-HK: 編輯使用者
+  delete_title:
+    en: Delete User
+    zh-CN: 删除用户
+    zh-HK: 刪除使用者
+  privileges_title:
+    en: User Privileges
+    zh-CN: 用户权限
+    zh-HK: 使用者權限
+  operation_title:
+    en: User Operation
+    zh-CN: 用户操作
+    zh-HK: 使用者操作
+  operation_success:
+    en: User operation executed.
+    zh-CN: 用户操作已执行。
+    zh-HK: 使用者操作已執行。
+  operation_failed:
+    en: "User operation failed: %{error}"
+    zh-CN: "用户操作失败:%{error}"
+    zh-HK: "使用者操作失敗:%{error}"
+  loading:
+    en: Loading users...
+    zh-CN: 正在加载用户...
+    zh-HK: 正在載入使用者...
+  empty:
+    en: No users
+    zh-CN: 暂无用户
+    zh-HK: 暫無使用者
+  unsupported_sql_preview:
+    en: -- This database type does not support this user operation.
+    zh-CN: -- 当前数据库类型暂不支持该用户操作。
+    zh-HK: -- 目前資料庫類型暫不支援此使用者操作。
 DatabaseObjects:
   title:
     en: Objects
@@ -3026,6 +3053,18 @@ Compare:
     en: Result
     zh-CN: 结果
     zh-HK: 結果
+  step_objects:
+    en: Objects
+    zh-CN: 对象
+    zh-HK: 物件
+  step_sql_preview:
+    en: SQL Preview
+    zh-CN: SQL 预览
+    zh-HK: SQL 預覽
+  step_sql_execute:
+    en: SQL Execute
+    zh-CN: SQL 执行
+    zh-HK: SQL 執行
   data_compare:
     en: Data Compare
     zh-CN: 数据比较
@@ -3046,6 +3085,70 @@ Compare:
     en: Key Columns
     zh-CN: 主键列
     zh-HK: 主鍵欄位
+  source_tables:
+    en: Source Tables
+    zh-CN: 源表
+    zh-HK: 來源表
+  target_tables:
+    en: Target Tables
+    zh-CN: 目标表
+    zh-HK: 目標表
+  no_tables:
+    en: No tables
+    zh-CN: 暂无表
+    zh-HK: 暫無表
+  ignore_identifier_case:
+    en: Ignore identifier case
+    zh-CN: 忽略标识符大小写
+    zh-HK: 忽略識別符大小寫
+  object_types:
+    en: Object types
+    zh-CN: 对象类型
+    zh-HK: 物件類型
+  object_tables:
+    en: Tables
+    zh-CN: 表
+    zh-HK: 表
+  object_indexes:
+    en: Indexes
+    zh-CN: 索引
+    zh-HK: 索引
+  object_foreign_keys:
+    en: Foreign keys
+    zh-CN: 外键
+    zh-HK: 外鍵
+  object_views:
+    en: Views
+    zh-CN: 视图
+    zh-HK: 檢視
+  object_routines:
+    en: Routines
+    zh-CN: 函数/过程
+    zh-HK: 函數/程序
+  object_triggers:
+    en: Triggers
+    zh-CN: 触发器
+    zh-HK: 觸發器
+  compare_rules:
+    en: Compare rules
+    zh-CN: 比较规则
+    zh-HK: 比較規則
+  ignore_auto_increment:
+    en: Ignore auto increment
+    zh-CN: 忽略 AUTO_INCREMENT
+    zh-HK: 忽略 AUTO_INCREMENT
+  ignore_charset_collation:
+    en: Ignore charset/collation
+    zh-CN: 忽略字符集/排序规则
+    zh-HK: 忽略字元集/排序規則
+  ignore_table_options:
+    en: Ignore table options
+    zh-CN: 忽略表选项
+    zh-HK: 忽略表選項
+  ignore_comments:
+    en: Ignore comments
+    zh-CN: 忽略注释
+    zh-HK: 忽略註解
   swap_source_target:
     en: Swap source and target
     zh-CN: 交换源和目标
@@ -3082,6 +3185,10 @@ Compare:
     en: Data compare complete
     zh-CN: 数据比较完成
     zh-HK: 資料比較完成
+  data_compare_truncated_no_sql:
+    en: Data compare result was truncated; sync SQL generation and execution are disabled.
+    zh-CN: 数据比较结果已截断，已禁止生成和执行同步 SQL
+    zh-HK: 資料比較結果已截斷，已禁止產生和執行同步 SQL
   schema_compare_complete:
     en: Schema compare complete
     zh-CN: 结构比较完成
@@ -3166,6 +3273,22 @@ Compare:
     en: Destructive
     zh-CN: 破坏性
     zh-HK: 破壞性
+  destructive_sql_confirm_title:
+    en: Destructive Sync SQL Detected
+    zh-CN: 检测到可能导致数据丢失的同步 SQL
+    zh-HK: 檢測到可能導致資料遺失的同步 SQL
+  destructive_sql_confirm_message:
+    en: The sync SQL contains DELETE, TRUNCATE, or DROP statements and may remove data or database objects.
+    zh-CN: 当前同步 SQL 包含 DELETE、TRUNCATE 或 DROP 语句，可能会删除数据或数据库对象。
+    zh-HK: 當前同步 SQL 包含 DELETE、TRUNCATE 或 DROP 語句，可能會刪除資料或資料庫物件。
+  destructive_sql_confirm_desc:
+    en: Review the SQL preview carefully before continuing.
+    zh-CN: 继续执行前，请仔细确认 SQL 预览内容。
+    zh-HK: 繼續執行前，請仔細確認 SQL 預覽內容。
+  destructive_sql_confirm_execute:
+    en: Execute Anyway
+    zh-CN: 继续执行
+    zh-HK: 繼續執行
   unnamed_object:
     en: Unnamed object
     zh-CN: 未命名对象
@@ -3214,6 +3337,22 @@ Compare:
     en: Sync SQL
     zh-CN: 同步 SQL
     zh-HK: 同步 SQL
+  sync_sql_execution_log:
+    en: SQL Execution Log
+    zh-CN: SQL 执行日志
+    zh-HK: SQL 執行日誌
+  use_transaction:
+    en: Use transaction
+    zh-CN: 使用事务
+    zh-HK: 使用事務
+  continue_on_error:
+    en: Continue on error
+    zh-CN: 遇到错误继续
+    zh-HK: 遇到錯誤繼續
+  sync_sql_execution_ready:
+    en: "Ready to execute %{count} SQL statement(s)"
+    zh-CN: "准备执行 %{count} 条 SQL 语句"
+    zh-HK: "準備執行 %{count} 條 SQL 語句"
   sync_sql_placeholder:
     en: Selected sync statements will be generated here after compare finishes. You can edit them before executing.
     zh-CN: 比较完成后,选中的同步语句将在此生成,可手动编辑后执行
@@ -3234,6 +3373,22 @@ Compare:
     en: "Sync SQL executed: %{count} result(s)"
     zh-CN: "同步 SQL 执行完成:%{count} 条结果"
     zh-HK: "同步 SQL 執行完成:%{count} 條結果"
+  sync_sql_finished_with_errors:
+    en: "Sync SQL finished with errors: %{success} succeeded, %{error} failed"
+    zh-CN: "同步 SQL 执行完成：%{success} 条成功，%{error} 条失败"
+    zh-HK: "同步 SQL 執行完成：%{success} 條成功，%{error} 條失敗"
+  sync_sql_stopped_on_error:
+    en: "Sync SQL stopped after error: %{success} succeeded, %{error} failed"
+    zh-CN: "同步 SQL 遇错停止：%{success} 条成功，%{error} 条失败"
+    zh-HK: "同步 SQL 遇錯停止：%{success} 條成功，%{error} 條失敗"
+  sync_sql_statement_progress:
+    en: "Executed statement %{statement} (%{progress}%)"
+    zh-CN: "已执行第 %{statement} 条语句 (%{progress}%)"
+    zh-HK: "已執行第 %{statement} 條語句 (%{progress}%)"
+  sync_sql_statement_failed:
+    en: "Statement %{statement} failed: %{error}"
+    zh-CN: "第 %{statement} 条语句执行失败:%{error}"
+    zh-HK: "第 %{statement} 條語句執行失敗:%{error}"
   execution_failed:
     en: "Execution failed: %{error}"
     zh-CN: "执行失败:%{error}"

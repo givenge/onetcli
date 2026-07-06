@@ -114,7 +114,18 @@ fn connection_node(id: String, name: String, config: &DbConnectionConfig) -> DbN
 }
 
 fn external_driver_metadata(config: &DbConnectionConfig) -> HashMap<String, String> {
-    let registry = db::ipc::IpcDriverRegistry::load_default();
+    external_driver_metadata_with_registry_loader(config, db::ipc::IpcDriverRegistry::load_default)
+}
+
+fn external_driver_metadata_with_registry_loader(
+    config: &DbConnectionConfig,
+    load_registry: impl FnOnce() -> db::ipc::IpcDriverRegistry,
+) -> HashMap<String, String> {
+    if !config.database_type.is_external() {
+        return HashMap::new();
+    }
+
+    let registry = load_registry();
     external_driver_metadata_from_registry(config, &registry)
 }
 
@@ -462,10 +473,8 @@ pub enum DbTreeViewEvent {
     RunSqlFile { node_id: String },
     /// 转储SQL文件（导出结构和/或数据）
     DumpSqlFile { node_id: String, mode: SqlDumpMode },
-    #[cfg(feature = "compare")]
     /// 数据比较
     CompareData { node_id: String },
-    #[cfg(feature = "compare")]
     /// 结构比较
     CompareSchema { node_id: String },
 }
@@ -803,6 +812,46 @@ impl DbTreeView {
             .collect()
     }
 
+    pub fn selected_or_first_node_id(&self) -> Option<String> {
+        self.selected_node_id
+            .clone()
+            .or_else(|| self.flat_entries.first().map(|entry| entry.node_id.clone()))
+    }
+
+    pub fn selected_or_first_connection_id(&self) -> Option<String> {
+        if let Some(node_id) = self.selected_node_id.as_ref()
+            && let Some(node) = self.db_nodes.get(node_id)
+        {
+            return Some(node.connection_id.clone());
+        }
+
+        self.flat_entries.iter().find_map(|entry| {
+            self.db_nodes
+                .get(&entry.node_id)
+                .map(|node| node.connection_id.clone())
+        })
+    }
+
+    pub fn selected_or_first_node_id_for_types(&self, node_types: &[DbNodeType]) -> Option<String> {
+        if let Some(node_id) = self.selected_node_id_for_types(node_types) {
+            return Some(node_id);
+        }
+        self.flat_entries.iter().find_map(|entry| {
+            self.db_nodes
+                .get(&entry.node_id)
+                .filter(|node| node_types.contains(&node.node_type))
+                .map(|_| entry.node_id.clone())
+        })
+    }
+
+    fn selected_node_id_for_types(&self, node_types: &[DbNodeType]) -> Option<String> {
+        let node_id = self.selected_node_id.as_ref()?;
+        self.db_nodes
+            .get(node_id)
+            .filter(|node| node_types.contains(&node.node_type))
+            .map(|_| node_id.clone())
+    }
+
     /// 处理全局连接数据变更事件
     fn handle_connection_data_event(
         &mut self,
@@ -811,7 +860,7 @@ impl DbTreeView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnectionDataEvent::ConnectionDeleted { connection_id } => {
+            ConnectionDataEvent::ConnectionDeleted { connection_id, .. } => {
                 if self.tracked_connection_ids.contains(connection_id) {
                     self.remove_connection(&connection_id.to_string(), cx);
                 }
@@ -828,7 +877,7 @@ impl DbTreeView {
                     self.add_connection(connection, cx);
                 }
             }
-            ConnectionDataEvent::WorkspaceDeleted { workspace_id } => {
+            ConnectionDataEvent::WorkspaceDeleted { workspace_id, .. } => {
                 if self.workspace_id == Some(*workspace_id) {
                     info!(
                         "Workspace {} deleted, tree view may need to be closed",
@@ -1598,7 +1647,7 @@ impl DbTreeView {
                             parent_node.children = children.clone();
                             parent_node.children_loaded = true;
                             // 子节点加载完成后，如果该节点是当前选中节点，重新触发选中事件以刷新对象页签
-                            if this.selected_node_id.as_deref() == Some(&clone_node_id) {
+                            if this.selected_node_id.as_ref().is_some_and(|id| id == &clone_node_id) {
                                 cx.emit(DbTreeViewEvent::NodeSelected{node_id: clone_node_id.clone()})
                             }
                         }
@@ -2394,6 +2443,19 @@ impl DbTreeView {
         }
         None
     }
+
+    /// 返回节点对应的 AI 数据库作用域:连接 ID、数据库名、schema 名。
+    pub fn ai_scope_for_node(
+        &self,
+        node_id: &str,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        let node = self.db_nodes.get(node_id)?;
+        Some((
+            node.connection_id.clone(),
+            node.get_database_name(),
+            node.get_schema_name(),
+        ))
+    }
 }
 
 impl Render for DbTreeView {
@@ -3021,6 +3083,7 @@ mod tests {
             cloud_id: None,
             last_synced_at: None,
             last_used_at: None,
+            sort_order: None,
             created_at: None,
             updated_at: None,
             team_id: None,
@@ -3077,6 +3140,18 @@ mod tests {
             Some(&"icons/duckdb.svg".to_string()),
             metadata.get(EXTERNAL_DRIVER_ICON_METADATA)
         );
+    }
+
+    #[test]
+    fn builtin_connection_metadata_does_not_load_external_display() {
+        let mut config = external_config("demo");
+        config.database_type = DatabaseType::MySQL;
+
+        let metadata = external_driver_metadata_with_registry_loader(&config, || {
+            panic!("builtin database metadata should not load external driver registry")
+        });
+
+        assert!(metadata.is_empty());
     }
 
     #[test]
@@ -3242,10 +3317,10 @@ mod tests {
             "users",
             &[("database", "analytics"), ("schema", "public")],
         );
-        let mut registry = crate::extension_menu::DbTreeExtensionMenuRegistry::default();
+        let mut registry = DbTreeExtensionMenuRegistry::default();
         registry.add(
             "db.tree.table",
-            crate::extension_menu::DbTreeExtensionMenuItem {
+            DbTreeExtensionMenuItem {
                 extension_id: "com.example.tools".to_string(),
                 command_id: "example.sync_table".to_string(),
                 label: "同步表".to_string(),
@@ -3256,7 +3331,7 @@ mod tests {
         );
         registry.add(
             "db.tree.table",
-            crate::extension_menu::DbTreeExtensionMenuItem {
+            DbTreeExtensionMenuItem {
                 extension_id: "com.example.tools".to_string(),
                 command_id: "example.hidden".to_string(),
                 label: "Hidden".to_string(),
